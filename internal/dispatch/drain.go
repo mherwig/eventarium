@@ -1,0 +1,208 @@
+package dispatch
+
+import (
+	"context"
+	"log/slog"
+	"sort"
+	"time"
+
+	"pubsub/internal/delivery"
+	"pubsub/internal/store"
+)
+
+// drainLoop is the inbox handover of spec 6.6: every 500ms it looks for
+// subscriptions that are healthy again (breaker closed or probe due, no queue,
+// nothing in flight, not paused) and drains their parked rows in (partition,
+// offset) order at drain_rate_per_s. Expired rows are swept every 5 minutes.
+func (d *Dispatcher) drainLoop() {
+	tick := time.NewTicker(drainInterval)
+	defer tick.Stop()
+	expiry := time.NewTicker(expiryInterval)
+	defer expiry.Stop()
+	refresh := time.NewTicker(knownRefresh)
+	defer refresh.Stop()
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-refresh.C:
+			d.refreshKnown()
+		case <-expiry.C:
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), 30*time.Second)
+			if n, err := d.st.DeleteExpiredParked(ctx); err != nil {
+				slog.Warn("dispatcher: deleting expired parked rows failed", "err", err)
+			} else if n > 0 {
+				slog.Info("dispatcher: expired parked rows deleted", "rows", n)
+			}
+			cancel()
+		case <-tick.C:
+			d.prune()
+			d.drainOnce()
+		}
+	}
+}
+
+// refreshKnown snapshots the webhook subscription IDs from PostgreSQL. The
+// shared registry only offers lookup by ID, so the drainer keeps its own set;
+// it must know every subscription that can have parked rows, including ones
+// with no live traffic since a restart.
+func (d *Dispatcher) refreshKnown() {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), 15*time.Second)
+	defer cancel()
+	subs, err := d.st.Subscriptions(ctx)
+	if err != nil {
+		slog.Warn("dispatcher: loading subscription ids for the drainer failed", "err", err)
+		return
+	}
+	known := make(map[string]struct{}, len(subs))
+	for _, s := range subs {
+		if s.Channel == delivery.ChannelWebhook {
+			known[s.ID] = struct{}{}
+		}
+	}
+	d.mu.Lock()
+	d.known, d.knownAt = known, time.Now()
+	d.mu.Unlock()
+}
+
+// candidateIDs returns the webhook subscriptions the drainer has to inspect.
+func (d *Dispatcher) candidateIDs() []string {
+	d.mu.Lock()
+	ids := make(map[string]struct{}, len(d.known)+len(d.subs))
+	for id := range d.known {
+		ids[id] = struct{}{}
+	}
+	for id := range d.subs {
+		ids[id] = struct{}{}
+	}
+	d.mu.Unlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	return out
+}
+
+// drainOnce drains one batch per eligible subscription.
+func (d *Dispatcher) drainOnce() {
+	d.refreshKnownIfStale()
+	ids := d.candidateIDs()
+	if len(ids) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), 15*time.Second)
+	defer cancel()
+	counts, err := d.st.CountParked(ctx, ids)
+	if err != nil {
+		slog.Warn("dispatcher: counting parked rows failed", "err", err)
+		return
+	}
+	var withRows []string
+	for _, id := range ids {
+		if counts[id] > 0 {
+			withRows = append(withRows, id)
+		}
+	}
+	if len(withRows) == 0 {
+		return
+	}
+	rows, err := d.st.FetchParked(ctx, withRows, drainBatch)
+	if err != nil {
+		slog.Warn("dispatcher: fetching parked rows failed", "err", err)
+		return
+	}
+	bySub := map[string][]store.InboxRow{}
+	for _, r := range rows {
+		bySub[r.SubscriptionID] = append(bySub[r.SubscriptionID], r)
+	}
+	for id, rs := range bySub {
+		entry, ok := d.reg.Subscription(id)
+		if !ok || entry.Sub == nil || entry.Sub.Channel != delivery.ChannelWebhook {
+			continue // deleted subscription; its rows expire
+		}
+		s := d.stateFor(entry.Sub)
+		if !s.breaker.canAttempt() || s.pauseFor() > 0 || s.inFlight.Load() > 0 {
+			continue
+		}
+		busy := false
+		for _, q := range s.qs {
+			if len(q) > 0 {
+				busy = true
+				break
+			}
+		}
+		if busy {
+			continue
+		}
+		if s.draining.Swap(true) {
+			continue // already draining
+		}
+		d.drainSub(ctx, s, rs)
+		s.draining.Store(false)
+	}
+}
+
+func (d *Dispatcher) refreshKnownIfStale() {
+	d.mu.Lock()
+	stale := time.Since(d.knownAt) > knownRefresh
+	d.mu.Unlock()
+	if stale {
+		d.refreshKnown()
+	}
+}
+
+// drainSub delivers the rows of one subscription in (partition, offset) order
+// through the drain token bucket. A terminal outcome acks the row; an aborted
+// attempt (shutdown, breaker still refusing, 429 mid-drain) leaves the row and
+// the rest of the batch for the next round, so order is never overtaken.
+func (d *Dispatcher) drainSub(ctx context.Context, s *subState, rows []store.InboxRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Part != rows[j].Part {
+			return rows[i].Part < rows[j].Part
+		}
+		return rows[i].Offset < rows[j].Offset
+	})
+	for _, row := range rows {
+		if d.ctx.Err() != nil {
+			return
+		}
+		msg, err := delivery.Decode(row.Payload)
+		if err != nil {
+			// A poison row would block the inbox forever; ack it away.
+			slog.Warn("dispatcher: undecodable parked row dropped",
+				"subscription", s.id, "part", row.Part, "offset", row.Offset, "err", err)
+			d.ackRow(ctx, row)
+			continue
+		}
+		ok, err := s.drainBucket.Wait(d.ctx, 0)
+		if err != nil || !ok {
+			return
+		}
+		it := &item{
+			msg:       msg,
+			seq:       delivery.Seq{Partition: row.Part, Offset: row.Offset},
+			fromInbox: true,
+		}
+		out := s.attemptLoop(d.ctx, it, true)
+		switch out {
+		case outcomeAborted:
+			return
+		default:
+			// delivered, dead-lettered, dropped or expired: the row has seen
+			// its final outcome, remove it from the inbox.
+			d.ackRow(ctx, row)
+		}
+	}
+}
+
+func (d *Dispatcher) ackRow(ctx context.Context, row store.InboxRow) {
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := d.st.AckParked(actx, []store.InboxRow{row}); err != nil {
+		slog.Warn("dispatcher: acking parked row failed",
+			"subscription", row.SubscriptionID, "part", row.Part, "offset", row.Offset, "err", err)
+	}
+}
