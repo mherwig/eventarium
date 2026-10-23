@@ -32,9 +32,9 @@ import (
 )
 
 const (
-	// Consumer group over delivery-status (SPIKE.md).
+	// Consumer group over delivery-status (docs/SPIKE.md).
 	consumerGroup = "status-writer"
-	// Flush triggers (SPIKE.md, spec section 9): one second or 10k records.
+	// Flush triggers (docs/SPIKE.md, spec section 9): one second or 10k records.
 	flushInterval = time.Second
 	flushRows     = 10_000
 	// pollBatch is the upper bound of one PollRecords call.
@@ -340,7 +340,7 @@ func backoff(failures int) (int, time.Time) {
 	return failures, time.Now().Add(d)
 }
 
-// setupLogging sends slog to stderr at the configured level (SPIKE.md).
+// setupLogging sends slog to stderr at the configured level (docs/SPIKE.md).
 func setupLogging() {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(strings.ToUpper(config.Str("LOG_LEVEL", "info")))); err != nil {

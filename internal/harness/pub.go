@@ -464,7 +464,7 @@ func (p *publisher) buildRequest(ctx context.Context, evs []*cloudevents.Event) 
 }
 
 // parsePublishRefs extracts the event references from the 201 response: one
-// object per publish, a list for batches (SPIKE.md, publish-api).
+// object per publish, a list for batches (docs/SPIKE.md, publish-api).
 func parsePublishRefs(body []byte, want int) ([]string, error) {
 	var list []struct {
 		EventRef string `json:"event_ref"`

@@ -58,7 +58,7 @@ func main() {
 	defer stop()
 
 	// Control data: the registry polls PostgreSQL (spike deviation from the
-	// compacted config topic of section 6.1, see SPIKE.md).
+	// compacted config topic of section 6.1, see docs/SPIKE.md).
 	st, err := store.Open(ctx, config.Str("PG_DSN", "postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable"))
 	if err != nil {
 		slog.Error("router: opening store", "err", err)

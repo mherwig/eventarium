@@ -1,11 +1,13 @@
 # Event platform spike
 
-A working end-to-end spike of the platform described in [spec.md](spec.md):
-CloudEvents over REST in, filtered and projected per subscription, delivered
-over webhooks and SSE with tracked, guaranteed delivery, on Kafka, PostgreSQL
-and ClickHouse. The interfaces between the services (topics, record shapes,
-endpoints) are fixed in [SPIKE.md](SPIKE.md) — read it before changing anything
-that crosses a service boundary.
+A working end-to-end spike of the platform described in
+[docs/spec.md](docs/spec.md): CloudEvents over REST in, filtered and
+projected per subscription, delivered over webhooks and SSE with tracked,
+guaranteed delivery, on Kafka, PostgreSQL and ClickHouse. The interfaces
+between the services (topics, record shapes, endpoints) are fixed in
+[docs/SPIKE.md](docs/SPIKE.md) — read it before changing anything that
+crosses a service boundary. Deviations from the spec and the open points are
+tracked in [docs/deviations-and-open-points.md](docs/deviations-and-open-points.md).
 
 ```
 publish-api ─► Kafka events-<class> ─► router ─► Kafka deliveries ─┬─► dispatcher ─► webhook URLs
@@ -403,12 +405,10 @@ paths:
 
 ## Deviations from the spec, on purpose
 
-- The registry polls PostgreSQL every second instead of reading a compacted
-  Kafka config topic (6.1). The interface is the same, only the source changes.
-- Inbox rows are deleted in batches instead of keeping a per-subscription
-  watermark (6.6).
-- Authentication is HS256 with a shared secret instead of JWKS (6.7).
-- Replay service and the inbox state machine are not part of the spike
-  (spec 17, steps 4 and 5).
-- Cross-node SSE connection assignment uses presence with a node ID rather
-  than rendezvous hashing (6.5, 7).
+Tracked, with reasons, in
+[docs/deviations-and-open-points.md](docs/deviations-and-open-points.md)
+together with the spec's open decisions and what this spike did or did not
+answer. Short version: registry polls PostgreSQL instead of a compacted
+config topic, inbox rows are deleted in batches instead of by watermark,
+HS256 dev auth instead of JWKS, no replay service yet, and SSE multi-node
+routing uses presence with a node ID rather than rendezvous hashing.

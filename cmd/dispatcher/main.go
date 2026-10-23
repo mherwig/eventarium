@@ -44,7 +44,7 @@ func main() {
 	}
 	defer producer.Close()
 
-	// Spike deviation per SPIKE.md: the registry polls PostgreSQL; the
+	// Spike deviation per docs/SPIKE.md: the registry polls PostgreSQL; the
 	// dispatcher wants a fresh policy, so poll every second.
 	reg := registry.New(st, time.Second)
 	go reg.Run(ctx)
@@ -59,7 +59,7 @@ func main() {
 		Store:       st,
 		Status:      producer,
 		MaxAttempts: config.Int("DISPATCHER_MAX_ATTEMPTS", 10),
-		// Empty secret: no signature header (SPIKE.md).
+		// Empty secret: no signature header (docs/SPIKE.md).
 		SigningSecret: config.Str("WEBHOOK_SIGNING_SECRET", ""),
 		// ALLOW_PRIVATE_WEBHOOKS defaults to true because the local test
 		// harness (harness recv) listens on loopback; set it to 0 in real

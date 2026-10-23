@@ -120,7 +120,7 @@ func envFloat(name string, def float64) float64 {
 	return f
 }
 
-// apiDefault is the base URL of the publish and registry API (SPIKE.md:
+// apiDefault is the base URL of the publish and registry API (docs/SPIKE.md:
 // HTTP_ADDR :8080 for both).
 func apiDefault() string { return config.Str("API", "http://localhost:8080") }
 
