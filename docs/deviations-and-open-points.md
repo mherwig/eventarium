@@ -55,7 +55,11 @@ From §16, minus what the spike answered:
 
 - **Hot/cold handover and failover with ordering** — the spec itself calls
   this the most error-prone part: specify as state machines, test with fault
-  injection. Not started; this is §17 step 4-5 territory alongside replay.
+  injection. The dispatcher side of the fault injection is done (see the
+  results below: breaker recovery, kill/restart rejoin, parked backlog
+  survival); the state-machine specification, the SSE gateway restart with
+  reconnecting clients and failover across nodes are still open — §17 step
+  4-5 territory alongside replay.
 - **Backlog limit per subscription** — without one storage grows unbounded
   during outages; with one, `dropped` appears and conflicts with guaranteed
   delivery. Unresolved product decision.
@@ -81,12 +85,47 @@ From §16, minus what the spike answered:
 - **Per-target-host/tenant rate limits** — explicitly out of scope for v1
   (needs a shared counter), per §6.
 
-## Not exercised yet (§17 test plan)
+## Fault injection: three dispatcher scenarios (§17 test plan)
 
-- Fault injection (the spec's top risk, see handover above).
-- The soak test.
-- The multi-day offline scenario.
+Run against the live stack on subscription `73d5d2d2` (webhook, unordered,
+`fault.cb` events), receiver = `harness recv` with its fault flags, verdict =
+`harness verify` (independent oracle). All three passed: **zero missing,
+zero unexpected deliveries** in every scenario.
 
-Suggested next step: fault injection around the dispatcher/gateway
-restart-and-rejoin paths — both the spec's top risk and the cheapest way to
-start closing the handover question.
+1. **Circuit breaker, receiver offline 60 s** (450 events at 5 ev/s).
+   Breaker opened 5 s after the receiver went down (`failures=5`,
+   `probe_interval=5m0s`); 410 deliveries parked into the PostgreSQL inbox
+   (`queue_depth=0` — nothing even queued while open). The receiver returned
+   60 s later, but the breaker correctly held it off until the probe fired
+   **exactly 5 min** after opening (`closed after successful probe`); the
+   backlog then drained and the oracle confirmed `450/450, missing=0,
+   duplicates=0`.
+2. **Dispatcher hard-killed (SIGKILL) mid-stream, then restarted** (600
+   events at 20 ev/s). Zero loss; **75 duplicates** — the at-least-once
+   contract made visible: franz-go's autocommit interval is 5 s, so
+   deliveries accepted in the ~5 s before the kill were received but their
+   offset marks were not yet committed, and the restarted consumer
+   re-delivered them from the last committed offset. Rejoin took ~40 s
+   (franz-go's default 45 s group session timeout bounds it: the dead
+   member's session must expire before the group reassigns).
+3. **SIGKILL while a parked backlog exists and the endpoint is still down**
+   (30 parked rows). The inbox survived the restart (it is PostgreSQL, not
+   memory); the restarted dispatcher re-attempted the rows, re-opened the
+   breaker after 5 fresh failures, and drained everything after the next
+   probe: `30/30, missing=0, duplicates=0`.
+
+Two behaviours worth knowing, both by design but visible here:
+
+- **Breaker state is in-memory and resets on restart.** A restarted
+  dispatcher briefly re-attempts a parked backlog even though the endpoint
+  is still down (one round of ≤ threshold failures, then the breaker
+  re-opens). Bounded and harmless in test 3, but a restart storms a dead
+  endpoint once.
+- **Duplicates, not losses, on restart** — receivers must be idempotent
+  (spec §8's at-least-once). The duplicate window is bounded by the
+  autocommit interval (5 s by default).
+
+Not exercised yet (§17 test plan): the soak test, the multi-day offline
+scenario, SSE gateway restart with reconnecting clients (`Last-Event-ID`
+backlog fetch), and PG/Kafka/CH outages beyond the receiver-level faults
+above.

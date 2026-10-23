@@ -344,9 +344,13 @@ go test ./...                                       # unit tests for chquery and
 A full harness run verifies with zero missing, zero unexpected and zero
 duplicate deliveries across both channels and all three delivery modes, with
 attribute filters, data filters and projections — at 50 events/s (p50 22 ms /
-p99 28 ms) and at the 1,000 events/s N1 target (see the next section). Not
-exercised yet: fault injection, the soak test, replay (spec 17 step 4) and the
-multi-day offline scenario.
+p99 28 ms) and at the 1,000 events/s N1 target (see the next section).
+Fault injection on the dispatcher is covered too (circuit breaker with
+receiver outage, hard kill and restart, restart with a parked backlog — all
+zero loss, results in
+[docs/deviations-and-open-points.md](docs/deviations-and-open-points.md)).
+Not exercised yet: the soak test, replay (spec 17 step 4), the multi-day
+offline scenario and SSE gateway restarts with reconnecting clients.
 
 ## Load test at 1,000 events/s (spec 15.2, targets N1/N3)
 
