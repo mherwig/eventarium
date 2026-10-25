@@ -36,8 +36,9 @@ func (g *Gateway) runLive(ctx context.Context) {
 			// The connection must still be local: the presence record may have
 			// been tombstoned in the meantime (client gone, node rebalancing).
 			// Spike limitation: such a message is dropped here; the client
-			// recovers through Last-Event-ID and the inbox like after any
-			// unacked delivery (section 8).
+			// recovers through Last-Event-ID, which makes the gateway fetch the
+			// missed deliveries from the deliveries topic on reconnect
+			// (section 8).
 			c := g.localConnection(lm.TargetConnectionID)
 			if c == nil || lm.Message == nil || c.subID != lm.Message.SubscriptionID {
 				continue
@@ -46,9 +47,9 @@ func (g *Gateway) runLive(ctx context.Context) {
 			case c.out <- outbound{seq: lm.Sequence, msg: lm.Message}:
 			default:
 				// Overflow: close the connection instead of buffering without
-				// bound. The client reconnects with Last-Event-ID and fetches
-				// the backlog from the inbox, which is the recovery path of
-				// section 8.
+				// bound. The client reconnects with Last-Event-ID and the
+				// gateway serves the backlog it missed from the deliveries
+				// topic, which is the recovery path of section 8.
 				c.close("delivery queue overflow, reconnect with Last-Event-ID")
 			}
 		}

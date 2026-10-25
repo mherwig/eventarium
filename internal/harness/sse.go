@@ -19,6 +19,12 @@ import (
 	"pubsub/internal/auth"
 )
 
+// reconnectDelay is the pause between two connection attempts of one SSE
+// client. There is no attempt limit: -duration (or Ctrl-C) stays the only
+// bound of the run, so a client keeps reconnecting for as long as the test
+// says (section 15.2).
+const reconnectDelay = time.Second
+
 // sseRecord is one event received on the SSE stream, appended as a JSON line
 // to -out.
 type sseRecord struct {
@@ -36,6 +42,13 @@ type sseRecord struct {
 // It opens GET /sse, parses the event stream (id:/event:/data: lines),
 // records every event and, when -ack is set, acknowledges each event with the
 // Last-Event-ID (docs/SPIKE.md: only an ack turns sent into delivered).
+//
+// It behaves like a browser that recovers from an outage (section 8): when
+// the stream ends before -duration elapsed, it reconnects automatically with
+// Last-Event-ID set to the id of the last event it actually received, and it
+// deduplicates by event reference across those reconnects, so an event that
+// arrives again — through the backlog fetch and a racing drainer, for example
+// — is counted instead of written to -out a second time.
 func runSSE(ctx context.Context, args []string) int {
 	fs := newFlagSet("sse")
 	sub := fs.String("sub", envStr("SUB", ""), "subscription id to consume (env HARNESS_SUB)")
@@ -44,6 +57,7 @@ func runSSE(ctx context.Context, args []string) int {
 	out := fs.String("out", envStr("OUT", ""), "append one JSON line per received event (env HARNESS_OUT)")
 	ack := fs.Bool("ack", envBool("ACK", true), "acknowledge every event with Last-Event-ID (env HARNESS_ACK)")
 	duration := fs.Duration("duration", envDur("DURATION", 0), "stop after this long, 0 runs until Ctrl-C (env HARNESS_DURATION)")
+	lastEventID := fs.String("last-event-id", envStr("LAST_EVENT_ID", ""), "cursor sent as Last-Event-ID on the first connect (env HARNESS_LAST_EVENT_ID)")
 	if code, done := parseResult(fs.Parse(args)); done {
 		return code
 	}
@@ -73,35 +87,21 @@ func runSSE(ctx context.Context, args []string) int {
 	}
 
 	fmt.Fprintf(os.Stderr, "harness sse: consuming %s as %s (ack=%v)\n", *sub, consumerID, *ack)
-	// No client timeout: the stream is long-lived, the context bounds it.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "harness sse:", err)
-		return 1
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "text/event-stream")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			fmt.Fprintln(os.Stderr, "harness sse: cancelled before connect")
-			return 0
-		}
-		fmt.Fprintln(os.Stderr, "harness sse:", err)
-		return 1
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		fmt.Fprintf(os.Stderr, "harness sse: HTTP %d: %s\n", resp.StatusCode, errorBody(b))
-		return 1
+	if cursor := strings.TrimSpace(*lastEventID); cursor != "" {
+		fmt.Fprintf(os.Stderr, "harness sse: initial Last-Event-ID %s\n", cursor)
 	}
 
 	start := time.Now()
-	var events, acks, ackErrs atomic.Uint64
-	seen := map[string]int{}
+	var events, acks, ackErrs, reconnects, deduped atomic.Uint64
+	seen := map[string]int{} // event references received, across all connects
+	// cursor is the id of the last event actually received (or the
+	// -last-event-id flag before anything arrived); it becomes the
+	// Last-Event-ID of the next connect, so the gateway resumes the backlog
+	// exactly after it (section 8).
+	cursor := strings.TrimSpace(*lastEventID)
 	var sseID, event string
 	var data []string
+
 	flush := func() {
 		if len(data) == 0 {
 			return
@@ -131,10 +131,20 @@ func runSSE(ctx context.Context, args []string) int {
 		if rec.EventRef == "" {
 			rec.EventRef = sseID
 		}
-		events.Add(1)
-		seen[rec.EventRef]++
-		if werr := lw.Write(rec); werr != nil {
-			fmt.Fprintln(os.Stderr, "harness sse: writing -out:", werr)
+		if sseID != "" {
+			cursor = sseID // this is where a reconnect has to continue
+		}
+		if _, dup := seen[rec.EventRef]; dup {
+			// Section 8's client-side dedup: the same event reference is
+			// never written to -out twice, no matter how many reconnects or
+			// delivery paths produced it; it is counted instead.
+			deduped.Add(1)
+		} else {
+			seen[rec.EventRef]++
+			events.Add(1)
+			if werr := lw.Write(rec); werr != nil {
+				fmt.Fprintln(os.Stderr, "harness sse: writing -out:", werr)
+			}
 		}
 		if *ack && sseID != "" {
 			if aerr := ackEvent(ctx, base, token, *sub, sseID); aerr != nil {
@@ -147,31 +157,98 @@ func runSSE(ctx context.Context, args []string) int {
 		sseID, event, data = "", "", nil
 	}
 
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64<<10), 16<<20)
-	for sc.Scan() {
-		line := sc.Text()
-		switch {
-		case line == "": // end of one event
-			flush()
-		case strings.HasPrefix(line, ":"): // heartbeat or comment
-		default:
-			field, value := line, ""
-			if i := strings.IndexByte(line, ':'); i >= 0 {
-				field, value = line[:i], strings.TrimPrefix(line[i+1:], " ")
-			}
-			switch field {
-			case "id":
-				sseID = value
-			case "event":
-				event = value
-			case "data":
-				data = append(data, value)
+	// connect performs one connection attempt and consumes the stream until it
+	// ends. The bool result marks a client-side HTTP error that retrying
+	// cannot fix (a 4xx other than 429), which ends the run; everything else —
+	// clean close, EOF, reset, refused, 5xx — is a reconnect case as long as
+	// the duration has not elapsed.
+	connect := func() (error, bool) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
+		if err != nil {
+			return err, true
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "text/event-stream")
+		if cursor != "" {
+			// The gateway starts fetching the backlog at this id + 1 and
+			// merges it with the live stream (section 8). Without events
+			// received so far there is no cursor and no header.
+			req.Header.Set("Last-Event-ID", cursor)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err, false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			err := fmt.Errorf("HTTP %d: %s", resp.StatusCode, errorBody(b))
+			fatal := resp.StatusCode/100 == 4 && resp.StatusCode != http.StatusTooManyRequests
+			return err, fatal
+		}
+
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 64<<10), 16<<20)
+		for sc.Scan() {
+			line := sc.Text()
+			switch {
+			case line == "": // end of one event
+				flush()
+			case strings.HasPrefix(line, ":"): // heartbeat or comment
+			default:
+				field, value := line, ""
+				if i := strings.IndexByte(line, ':'); i >= 0 {
+					field, value = line[:i], strings.TrimPrefix(line[i+1:], " ")
+				}
+				switch field {
+				case "id":
+					sseID = value
+				case "event":
+					event = value
+				case "data":
+					data = append(data, value)
+				}
 			}
 		}
+		flush()
+		return sc.Err(), false
 	}
-	flush()
 
+	var fatal error
+	for {
+		err, isFatal := connect()
+		if ctx.Err() != nil {
+			break // duration elapsed or cancelled: the bound of the run
+		}
+		if isFatal {
+			fatal = err
+			break
+		}
+		switch {
+		case err == nil:
+			fmt.Fprintln(os.Stderr, "harness sse: stream ended by the server")
+		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+			fmt.Fprintln(os.Stderr, "harness sse: stream closed unexpectedly (EOF)")
+		default:
+			fmt.Fprintln(os.Stderr, "harness sse: stream error:", err)
+		}
+		reconnects.Add(1)
+		if cursor != "" {
+			fmt.Fprintf(os.Stderr, "harness sse: reconnecting with Last-Event-ID %s\n", cursor)
+		} else {
+			fmt.Fprintln(os.Stderr, "harness sse: reconnecting without a cursor")
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(reconnectDelay):
+		}
+	}
+
+	if fatal != nil {
+		fmt.Fprintln(os.Stderr, "harness sse:", fatal)
+	} else {
+		fmt.Fprintln(os.Stderr, "harness sse: stream closed (cancelled or duration reached)")
+	}
 	dups := 0
 	for _, n := range seen {
 		if n > 1 {
@@ -179,16 +256,11 @@ func runSSE(ctx context.Context, args []string) int {
 		}
 	}
 	elapsed := time.Since(start).Seconds()
-	switch {
-	case errors.Is(sc.Err(), context.Canceled) || errors.Is(sc.Err(), context.DeadlineExceeded) || ctx.Err() != nil:
-		fmt.Fprintln(os.Stderr, "harness sse: stream closed (cancelled or duration reached)")
-	case sc.Err() != nil:
-		fmt.Fprintln(os.Stderr, "harness sse: stream error:", sc.Err())
-	default:
-		fmt.Fprintln(os.Stderr, "harness sse: stream ended")
+	fmt.Printf("harness sse: events=%d unique=%d duplicates=%d acks=%d ack_errors=%d reconnects=%d deduped=%d elapsed=%.1fs\n",
+		events.Load(), len(seen), dups, acks.Load(), ackErrs.Load(), reconnects.Load(), deduped.Load(), elapsed)
+	if fatal != nil {
+		return 1
 	}
-	fmt.Printf("harness sse: events=%d unique=%d duplicates=%d acks=%d ack_errors=%d elapsed=%.1fs\n",
-		events.Load(), len(seen), dups, acks.Load(), ackErrs.Load(), elapsed)
 	return 0
 }
 

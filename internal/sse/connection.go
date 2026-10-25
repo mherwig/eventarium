@@ -13,8 +13,9 @@ import (
 
 // maxQueue is the bound of the per-connection delivery queue (section 6.5
 // connection hygiene). When it overflows the connection is closed: the client
-// reconnects with Last-Event-ID and fetches the backlog from the inbox, which
-// is the recovery path of section 8. Events are never silently discarded.
+// reconnects with Last-Event-ID and the gateway fetches the backlog it missed
+// from the deliveries topic, which is the recovery path of section 8. Events
+// are never silently discarded.
 const maxQueue = 1000
 
 // maxSentLog bounds the per-connection memory used for ack bookkeeping. Only
@@ -70,7 +71,8 @@ type connection struct {
 
 	mu     sync.Mutex
 	reason string
-	sent   []outbound // deliveries written to the wire, for cumulative acks
+	sent   []outbound                // deliveries written to the wire, for cumulative acks
+	served map[delivery.Seq]struct{} // sequences the backlog phase already wrote (section 8)
 }
 
 func newConnection(subID, consumerID, owner string) *connection {
@@ -82,6 +84,7 @@ func newConnection(subID, consumerID, owner string) *connection {
 		openedAt:   time.Now().UTC(),
 		out:        make(chan outbound, maxQueue),
 		done:       make(chan struct{}),
+		served:     make(map[delivery.Seq]struct{}),
 	}
 }
 
@@ -130,4 +133,30 @@ func (c *connection) ackUpTo(seq delivery.Seq) []outbound {
 	}
 	c.sent = kept
 	return acked
+}
+
+// markServed remembers that the backlog phase wrote seq to this connection
+// (section 8). Only the backlog phase fills the map, so it grows with one
+// served backlog at most (backlog_max, section 7) and stays empty — a cheap
+// miss — for a connection that connected without a cursor. It is deliberately
+// separate from the sent log: that log is trimmed at maxSentLog and entries
+// leave it on every ack, while a queued duplicate can surface at any time.
+func (c *connection) markServed(seq delivery.Seq) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.served[seq] = struct{}{}
+}
+
+// alreadyServed reports whether the event loop has already written seq through
+// the backlog phase. The loop checks it before writing an outbound from
+// out, so a delivery that is both served from Kafka and pushed again by the
+// drainer (still-parked row) or by the live hop reaches the client only once;
+// the drainer's gateway-side ack and status bookkeeping is not affected. The
+// client-side dedup by event reference remains the safety net for anything
+// this map cannot see (section 8).
+func (c *connection) alreadyServed(seq delivery.Seq) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.served[seq]
+	return ok
 }

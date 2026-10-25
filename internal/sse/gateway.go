@@ -322,6 +322,30 @@ func (g *Gateway) handleSSE(w http.ResponseWriter, r *http.Request) {
 		consumerID = "default"
 	}
 
+	// The reconnect cursor of section 8 arrives as Last-Event-ID header (what
+	// a browser EventSource echoes back) or as last_event_id query parameter
+	// for clients that cannot set headers; the header wins when both are
+	// given. It is parsed before register() and before any header is written,
+	// so a present but malformed cursor is answered with a plain 400 and never
+	// half-opens a stream.
+	cursorText := requestCursor(r)
+	var cursor delivery.Seq
+	hasCursor := cursorText != ""
+	if hasCursor {
+		c, err := parseSeq(cursorText)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if c.Partition >= kafkautil.DeliveryPartitions {
+			// The sequence names a partition of the deliveries topic (6.3), so
+			// an out-of-range partition is a broken cursor, not a gap.
+			httpx.Error(w, http.StatusBadRequest, "sse: sequence partition out of range")
+			return
+		}
+		cursor = c
+	}
+
 	// Unknown and foreign subscriptions answer the same 404: the existence of
 	// a subscription is never leaked across owners (section 6.7).
 	entry, found := g.reg.Subscription(subID)
@@ -413,6 +437,17 @@ func (g *Gateway) handleSSE(w http.ResponseWriter, r *http.Request) {
 			"subscription", subID, "consumer", consumerID, "connection", conn.id)
 	}()
 
+	if hasCursor {
+		// The backlog phase of section 8: fetch everything the client missed
+		// since the cursor from the deliveries topic while live events buffer
+		// in conn.out, then merge both in the event loop below. A failed write
+		// ends the handler: the client reconnects with its own cursor and the
+		// next attempt resumes exactly where this one stopped.
+		if g.serveBacklog(r.Context(), conn, subID, cursor, write) {
+			return
+		}
+	}
+
 	heartbeat := time.NewTicker(g.opts.Heartbeat)
 	defer heartbeat.Stop()
 	expiry := time.NewTimer(time.Until(exp))
@@ -424,8 +459,9 @@ func (g *Gateway) handleSSE(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-g.shutdown:
 			// Final comment, then the handler returns and net/http closes the
-			// stream; the client reconnects immediately and is served from the
-			// inbox if anything was parked meanwhile.
+			// stream; the client reconnects immediately and is served from
+			// its Last-Event-ID cursor if it kept one, otherwise the drainer
+			// serves whatever was parked meanwhile.
 			_ = write(": gateway shutting down, reconnect shortly\n\n")
 			return
 		case <-conn.done:
@@ -442,6 +478,20 @@ func (g *Gateway) handleSSE(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case out := <-conn.out:
+			// Dedup against the backlog phase (section 8): a row that was
+			// still parked can be served from Kafka by the backlog and pushed
+			// by the drainer a tick later, and the delivery stage can have
+			// routed an event inside the fetched range live while we were
+			// fetching. Only the backlog phase marks entries here, so the map
+			// is empty for a connection without a cursor and this costs one
+			// lookup; the drainer's own ack and status side effects run
+			// gateway-side and are not affected. The check covers what the
+			// backlog wrote (bounded by backlog_max, section 7) — beyond that,
+			// the client-side dedup by event reference is the safety net that
+			// section 8 mandates anyway.
+			if conn.alreadyServed(out.seq) {
+				continue
+			}
 			frame, err := out.frame()
 			if err != nil {
 				g.log.Error("rendering sse event", "err", err, "connection", conn.id)
@@ -512,14 +562,18 @@ func (g *Gateway) handleAck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// acknowledge answers a cumulative ack (sections 6.5 and 9): every delivery
-// this node has written to a connection of the subscription up to and including
-// seq becomes delivered, carrying the ID of the connection that wrote it.
-// Without an ack the status stays honestly at "sent".
-//
-// Inbox rows are deliberately not touched here: the drainer deletes them after
-// it has emitted them, so an ack can never delete a delivery that was never
-// sent.
+// requestCursor returns the reconnect cursor of the request (section 8): the
+// Last-Event-ID header a client echoes back, or the last_event_id query
+// parameter for clients that cannot set headers. The header wins when both
+// are present. An empty string means "no cursor" and keeps the historical
+// behaviour of serving the connection from the live path only.
+func requestCursor(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get("Last-Event-ID")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(r.URL.Query().Get("last_event_id"))
+}
+
 // parseSeq parses an ack handle of the form "<partition>:<offset>", which is
 // the id the gateway puts on the wire (sections 6.3 and 6.5).
 func parseSeq(s string) (delivery.Seq, error) {
@@ -539,6 +593,14 @@ func parseSeq(s string) (delivery.Seq, error) {
 	return delivery.Seq{Partition: int32(part), Offset: offset}, nil
 }
 
+// acknowledge answers a cumulative ack (sections 6.5 and 9): every delivery
+// this node has written to a connection of the subscription up to and
+// including seq becomes delivered, carrying the ID of the connection that
+// wrote it. Without an ack the status stays honestly at "sent".
+//
+// Inbox rows are deliberately not touched here: the drainer deletes them after
+// it has emitted them, so an ack can never delete a delivery that was never
+// sent. The backlog phase (backlog.go) deletes the rows it wrote itself.
 func (g *Gateway) acknowledge(ctx context.Context, subID string, seq delivery.Seq) int {
 	var recs []status.Record
 	for _, c := range g.connections(subID) {
