@@ -32,20 +32,27 @@ type recvRecord struct {
 	SubscriptionID string    `json:"subscription_id"`
 	Seq            int64     `json:"seq"`
 	Attempt        int       `json:"attempt"`
+	// ReplayID is the pubsub-replay-id header of section 11: set when the
+	// delivery was enqueued by a replay job, so tests can tell the receipts
+	// of a replay from the live ones.
+	ReplayID string `json:"replay_id,omitempty"`
 }
 
 // receiver is the simulated webhook receiver of section 15.2: configurable
-// latency, error rate, occasional 429 and an offline window.
+// latency, error rate, occasional 429, an offline window and a 410 mode that
+// dead-letters every delivery deterministically.
 type receiver struct {
 	latency   time.Duration
 	errorRate float64
 	flaky     bool
+	gone      bool // answer every request 410 Gone without recording it
 	lw        *lineWriter
 
 	total   atomic.Uint64 // valid CloudEvents accepted
 	ok      atomic.Uint64 // answered 200
 	err500  atomic.Uint64 // answered 500 on purpose
 	r429    atomic.Uint64 // answered 429 on purpose
+	gone410 atomic.Uint64 // answered 410 on purpose
 	reject  atomic.Uint64 // answered 400 (not a CloudEvent)
 	n       atomic.Uint64 // request counter, drives -flaky429
 	mu      sync.Mutex
@@ -77,6 +84,20 @@ func (rc *receiver) handler() http.Handler {
 				subID = deliveryID[i+1:]
 			}
 		}
+		if rc.gone {
+			// -gone410: answer every otherwise valid delivery with 410 and do
+			// not record it. The dispatcher treats a 410 as a permanent
+			// failure and dead-letters the delivery (section 7), which is how
+			// a test produces the dead-lettered records that a section 11
+			// replay selects; the receipts of those failed attempts must not
+			// show up in -out, only the replayed ones later.
+			if !rc.pause(r) {
+				return
+			}
+			rc.gone410.Add(1)
+			http.Error(w, "gone", http.StatusGone)
+			return
+		}
 		eventRef := r.Header.Get("pubsub-event-ref")
 		if eventRef == "" {
 			eventRef = strings.SplitN(deliveryID, "/", 2)[0]
@@ -101,18 +122,13 @@ func (rc *receiver) handler() http.Handler {
 			SubscriptionID: subID,
 			Seq:            payload.Seq,
 			Attempt:        attempt,
+			ReplayID:       r.Header.Get("pubsub-replay-id"),
 		}); werr != nil {
 			fmt.Fprintln(os.Stderr, "harness recv: writing -out:", werr)
 		}
 
-		if rc.latency > 0 {
-			t := time.NewTimer(rc.latency)
-			select {
-			case <-r.Context().Done():
-				t.Stop()
-				return
-			case <-t.C:
-			}
+		if !rc.pause(r) {
+			return
 		}
 		switch {
 		case rc.flaky && rc.n.Load()%flaky429Every == 0:
@@ -129,13 +145,33 @@ func (rc *receiver) handler() http.Handler {
 	})
 }
 
+// pause holds a request for -latency before it is answered and reports whether
+// the client is still there. Every answer goes through it, including the 410
+// of -gone410: without it the dispatcher would write in_flight and
+// dead_lettered inside the same millisecond, and the status store judges a
+// delivery by argMax(status, ts) (section 9), which would keep in_flight
+// instead of the dead_lettered the test wants to replay.
+func (rc *receiver) pause(r *http.Request) bool {
+	if rc.latency <= 0 {
+		return true
+	}
+	t := time.NewTimer(rc.latency)
+	defer t.Stop()
+	select {
+	case <-r.Context().Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 func (rc *receiver) summary() {
 	rc.mu.Lock()
 	subs := len(rc.perSub)
 	rc.mu.Unlock()
-	fmt.Printf("harness recv: total=%d ok=%d 5xx=%d 429=%d rejected=%d subscriptions=%d elapsed=%.1fs\n",
-		rc.total.Load(), rc.ok.Load(), rc.err500.Load(), rc.r429.Load(), rc.reject.Load(),
-		subs, time.Since(rc.started).Seconds())
+	fmt.Printf("harness recv: total=%d ok=%d 5xx=%d 429=%d 410=%d rejected=%d subscriptions=%d elapsed=%.1fs\n",
+		rc.total.Load(), rc.ok.Load(), rc.err500.Load(), rc.r429.Load(), rc.gone410.Load(),
+		rc.reject.Load(), subs, time.Since(rc.started).Seconds())
 }
 
 // runRecv implements `harness recv`: the simulated webhook receiver of section
@@ -144,6 +180,9 @@ func (rc *receiver) summary() {
 // 429 + Retry-After when -flaky429 is set. With -offline it takes itself down
 // for -offline duration after -offline-after and then comes back on the same
 // address, which exercises parking, circuit breaking and draining (section 7).
+// With -gone410 it answers every otherwise valid delivery with 410 and records
+// nothing, which turns each delivery into a section 7 dead-letter that a
+// section 11 replay can select and re-deliver.
 func runRecv(ctx context.Context, args []string) int {
 	fs := newFlagSet("recv")
 	addr := fs.String("addr", envStr("ADDR", ":9090"), "listen address (env HARNESS_ADDR)")
@@ -153,6 +192,7 @@ func runRecv(ctx context.Context, args []string) int {
 	offlineAfter := fs.Duration("offline-after", envDur("OFFLINE_AFTER", 0), "go down this long after start (env HARNESS_OFFLINE_AFTER)")
 	out := fs.String("out", envStr("OUT", ""), "append one JSON line per received delivery (env HARNESS_OUT)")
 	flaky := fs.Bool("flaky429", envBool("FLAKY429", false), "occasionally answer 429 with Retry-After (env HARNESS_FLAKY429)")
+	gone410 := fs.Bool("gone410", envBool("GONE410", false), "answer every delivery 410 Gone and record nothing (env HARNESS_GONE410)")
 	if code, done := parseResult(fs.Parse(args)); done {
 		return code
 	}
@@ -167,7 +207,7 @@ func runRecv(ctx context.Context, args []string) int {
 	}
 	defer lw.Close()
 
-	rc := &receiver{latency: *latency, errorRate: *errorRate, flaky: *flaky, lw: lw, started: time.Now()}
+	rc := &receiver{latency: *latency, errorRate: *errorRate, flaky: *flaky, gone: *gone410, lw: lw, started: time.Now()}
 	srv := &http.Server{Handler: rc.handler()}
 	serveErr := make(chan error, 1)
 	start := func() error {
@@ -183,8 +223,8 @@ func runRecv(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "harness recv:", err)
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "harness recv: listening on %s (latency=%v error-rate=%g flaky429=%v)\n",
-		*addr, *latency, *errorRate, *flaky)
+	fmt.Fprintf(os.Stderr, "harness recv: listening on %s (latency=%v error-rate=%g flaky429=%v gone410=%v)\n",
+		*addr, *latency, *errorRate, *flaky, *gone410)
 
 	// Optional offline window: close the listener after -offline-after, sleep
 	// -offline, then listen again on the same address. This simulates a dead

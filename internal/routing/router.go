@@ -121,7 +121,7 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 
 	// Section 6.2: the ordering key is computed before any projection,
 	// because the projection may remove the field it reads.
-	orderingKey := r.orderingKey(rec, e, owner, decode)
+	orderingKey := OrderingKey(r.reg, rec, e, owner, decode)
 
 	out := make([]*kgo.Record, 0, 2*len(entries))
 	for _, entry := range entries {
@@ -231,16 +231,21 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 	return out
 }
 
-// orderingKey resolves the ordering key definition of the event type
+// OrderingKey resolves the ordering key definition of the event type
 // (section 6.2). "" falls back to the partition key the publish API chose,
 // "subject" to the subject attribute, "ext:<name>" to an extension attribute
 // and "json:<path>" to a dotted path in the decoded JSON data. Non-string
 // JSON values are stringified. An unresolvable key stays empty; every empty
 // key still hashes to one deliveries partition, order is just not guaranteed
 // across different keys.
-func (r *Router) orderingKey(rec *kgo.Record, e *cloudevents.Event, owner string, decode func() map[string]any) string {
+//
+// It is exported because the replay service stamps the very same key onto a
+// replayed delivery (section 11: a replay uses the normal delivery path, so
+// key_ordered subscriptions must not see a different key than for the
+// original delivery).
+func OrderingKey(reg *registry.Registry, rec *kgo.Record, e *cloudevents.Event, owner string, decode func() map[string]any) string {
 	def := ""
-	if et, ok := r.reg.EventType(owner, e.Type); ok {
+	if et, ok := reg.EventType(owner, e.Type); ok {
 		def = et.OrderingKeyDef
 	}
 	switch {
