@@ -177,6 +177,16 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   `status:read`), keyset pagination on the subscription list.
 - Current status is `argMax(status, ts)` per delivery; the history stays
   queryable.
+- The status values of section 9 are defined once in `internal/status` and
+  are the contract for `?status=` filtering, the replay selector and the
+  status summary: `pending`, `in_flight`, `retrying`, `paused`, `sent` (SSE:
+  written, not acknowledged), `delivered`, `dead_lettered`, `dropped`,
+  `expired`, `failed`. Terminal: `delivered`, `dead_lettered`, `dropped`,
+  `expired`, `failed`. `failed` is reserved by the spec ("failed or
+  dead_lettered") but no emitter writes it — exhausted retries become
+  `dead_lettered` — so it is accepted by every filter and never present in
+  the data. The Status API does not validate `?status=` (an unknown value
+  simply matches no rows); the replay selector rejects one with a 400.
 
 ### replay-api (port 8084)
 
@@ -194,6 +204,10 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - Job store: `replay_jobs` in PostgreSQL (migration 002). Partial unique
   indexes enforce one active job per subscription (API maps a violation to
   409) and per-owner idempotency keys (a repeat returns the existing job).
+- Job states (the CHECK of migration 002, unrelated to the delivery statuses
+  above): `pending → running → done`, plus `cancel_requested → cancelled` on
+  a cancel and `failed` on an error; the one-active-job index covers the
+  first three.
 - Worker (single goroutine): resolve in ClickHouse → re-read each event from
   `events-<class>` by stored `(class, partition, offset)` headers →
   `not_replayable` when the record is pruned or `expires_at` passed → apply

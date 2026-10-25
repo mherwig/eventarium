@@ -292,6 +292,10 @@ T=$(./bin/minttoken -owner team-a -scopes status:read)
 curl -s localhost:8081/v1/subscriptions/<id>/deliveries -H "Authorization: Bearer $T"
 ```
 
+**Delivery statuses** — every transition is one append-only row in
+ClickHouse; the complete list of the ten values, who writes them and which
+are terminal is in [Delivery statuses](#delivery-statuses) below.
+
 **Replay deliveries** — resend what a subscription already matched, selected
 by current status, by time frame, or both (`replay` scope, `:8084`, spec §11):
 
@@ -311,9 +315,10 @@ curl -s -X POST localhost:8084/v1/replays/55d3ce5d-.../cancel -H "Authorization:
 curl -s localhost:8084/v1/subscriptions/<id>/replays -H "Authorization: Bearer $T"
 ```
 
-The selector takes `statuses` (current status: `failed`, `dead_lettered`,
-`dropped`, `delivered`, …), `from`/`to` (RFC3339, by ingestion time) and
-`event_refs` — at least one. `"dry_run": true` reports `matched` and
+The selector takes `statuses` (current status: `delivered`, `dead_lettered`,
+`dropped`, `failed`, … — the full list is in
+[Delivery statuses](#delivery-statuses)), `from`/`to` (RFC3339, by ingestion
+time) and `event_refs` — at least one. `"dry_run": true` reports `matched` and
 `not_replayable` without enqueuing anything. Replayed events keep their event
 reference, are flagged as a replay on the wire (`pubsub-replay-id` header,
 `"replay":true` in the SSE payload), travel the normal delivery path (rate
@@ -371,6 +376,39 @@ Reset everything Kafka/PostgreSQL/ClickHouse-specific without touching the
 code: `docker compose down -v`, then `go run ./cmd/admin all`. To reset only
 the data, `TRUNCATE inbox;` in PostgreSQL and `TRUNCATE TABLE delivery_status;`
 in ClickHouse.
+
+## Delivery statuses
+
+Every transition of a delivery is one append-only row in ClickHouse
+(`delivery_status`, §9); a delivery's *current* status is the newest row for
+its ID (`argMax(status, ts)`), the older rows stay as the history. These ten
+values are the contract — defined once in `internal/status` and accepted
+verbatim by the Status API `?status=` filter, by the replay selector's
+`statuses` and by the status-summary counts:
+
+| Status | Meaning | Written by | Terminal |
+| --- | --- | --- | --- |
+| `pending` | The router created it (in the same Kafka transaction as the delivery, reason `router`), or it is parked in the inbox — the `reason` says why: `circuit_open`, `draining`, `rate_limited`, `queue_full` (dispatcher), `no_connection` (SSE gateway), `replay` (replay worker) | router, dispatcher, SSE gateway, replay worker | – |
+| `in_flight` | A webhook delivery attempt is running | dispatcher | – |
+| `retrying` | The attempt failed, a later one is scheduled; carries `attempt`, `http_code`, `latency_ms` and a reason (`http_error`, `transport_error`, `http_429`) | dispatcher | – |
+| `paused` | The circuit breaker is open (`circuit_open`); the delivery waits for the probe | dispatcher | – |
+| `sent` | SSE only: written to the connection but not acknowledged yet | SSE gateway | – |
+| `delivered` | Webhook: 2xx received. SSE: the client acknowledged the sequence | dispatcher, SSE gateway | ✓ |
+| `dead_lettered` | Retries exhausted (`max_attempts`), or the receiver answered `410 Gone` (`gone`) | dispatcher | ✓ |
+| `dropped` | Discarded on purpose: inbox overflow (`backlog_max`), full queue of a live-class delivery (`queue_full`), retries exhausted while live (`max_attempts`), live-class with no connection (`live_class`), unknown subscription (`unknown_subscription`), inbox write failed (`park_failed`) | dispatcher, SSE gateway | ✓ |
+| `expired` | `expires_at` passed before the delivery went out | dispatcher, SSE gateway | ✓ |
+| `failed` | Reserved by the spec ("failed *or* dead_lettered"); **no emitter writes it in the spike** — exhausted retries become `dead_lettered`, so every filter accepts the value but it never appears in the data | – | ✓ |
+
+The record also carries `reason`, `attempt`, `http_code`, `latency_ms`,
+`connection_id`, the replay ID and the event's retention class — never a
+payload (§9). Statuses lag the real world by 1–5 s because `status-writer`
+batch-inserts them. An unknown `?status=` value on the Status API is not
+validated: it simply matches no rows (the replay selector rejects the same
+mistake with a 400).
+
+Replay *jobs* are a different, unrelated state machine in `replay_jobs`:
+`pending → running → done`, plus `cancel_requested → cancelled` on a cancel
+and `failed` on an error.
 
 ## Checks
 

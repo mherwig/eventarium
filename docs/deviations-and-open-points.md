@@ -33,6 +33,13 @@ endpoint (§10, endpoint 4 — optional in the spec) gained an optional `since`
 parameter, because the status table is cumulative across runs and the oracle
 needed to scope counts to one run.
 
+One smaller gap on the same page: §9's "`failed` *or* `dead_lettered` —
+retries exhausted" is implemented as `dead_lettered` only. `failed` is part
+of the contract (the Status API filter and the replay selector both accept
+it) but the dispatcher never writes it, so it never appears in the data. All
+ten status values are documented in the
+[README](../README.md#delivery-statuses).
+
 ## Open points — answered by the spike
 
 - *Load figures are estimates and must be measured early* (§16) — done:
