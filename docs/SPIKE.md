@@ -9,7 +9,8 @@ records what is already decided in code and what each service must implement.
 - Module name: `pubsub`. Go 1.26. Single module, one binary per service under
   `cmd/<name>`, shared code under `internal/<package>`.
 - Services: `admin`, `minttoken`, `publish-api`, `registry-api`, `router`,
-  `dispatcher`, `sse-gateway`, `status-writer`, `status-api`, `harness`.
+  `dispatcher`, `sse-gateway`, `status-writer`, `status-api`, `replay-api`,
+  `harness`.
 - Logging: `log/slog` to stderr. HTTP helpers: `internal/httpx`.
 - Do not add third-party dependencies without asking. The allowed set is:
   franz-go (Kafka), cel-go (`cel.dev/cel-go/cel`), pgx v5, clickhouse-go v2,
@@ -20,14 +21,15 @@ records what is already decided in code and what each service must implement.
 | Variable | Default | Used by |
 | --- | --- | --- |
 | `KAFKA_BROKERS` | `localhost:9092` | everything |
-| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, router, dispatcher, sse-gateway |
-| `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api |
+| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, router, dispatcher, sse-gateway, replay-api |
+| `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api, replay-api |
 | `JWT_SECRET` | `dev-secret` | every API service, harness |
 | `JWT_ISSUER` | `dev` | same |
 | `JWT_AUDIENCE` | `pubsub` | same |
-| `HTTP_ADDR` | `:8080` (publish-api, registry-api), `:8081` (status-api), `:8082` (sse-gateway) | the API services |
+| `HTTP_ADDR` | `:8080` (publish-api, registry-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api) | the API services |
 | `WEBHOOK_SIGNING_SECRET` | unset (no signature) | dispatcher |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
+| `REPLAY_MAX_EVENTS` | `10000` | replay-api (upper bound for `max_events`) |
 | `LOG_LEVEL` | `info` | everything |
 
 Use `internal/config` for all reads. Never read the environment directly.
@@ -132,7 +134,8 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - Delivers to the callback URL in the CloudEvents binary or structured binding
   (per subscription), with `X-Pubsub-Signature: sha256=<hex>` when
   `WEBHOOK_SIGNING_SECRET` is set, plus the delivery metadata headers
-  `pubsub-delivery-id`, `pubsub-event-ref`, `pubsub-attempt`, `pubsub-seq`.
+  `pubsub-delivery-id`, `pubsub-event-ref`, `pubsub-attempt`, `pubsub-seq`
+  and `pubsub-replay-id` (only for replayed deliveries, section 11).
 - Retry with exponential backoff and jitter, a circuit breaker, a token bucket
   rate limit, `max_in_flight` per delivery mode (section 7).
 - On circuit-open, rate-limit overflow or queue overflow: park in the inbox and
@@ -151,6 +154,15 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   at the owning node, otherwise it parks in the inbox.
 - Live consumer: one consumer group per node, starts at latest, drops messages
   without a local connection.
+- `Last-Event-ID` on `GET /sse` (header, or `?last_event_id=`): the gateway
+  replays the deliveries topic from cursor+1 to the high watermark with a
+  throwaway groupless consumer (section 8), writes them before the event
+  loop, then emits `sent` and deletes the inbox rows it served. Live-class
+  records are skipped (section 12), expired ones get their status, a cursor
+  behind retention answers a `: backlog gap:` comment, a malformed cursor is
+  a 400 before the stream opens. A per-connection served set drops the
+  overlap with the drainer. Fetches are best-effort (15 s bound); on failure
+  the event loop continues and the client's next reconnect retries.
 - `POST /sse/ack` acknowledges deliveries (Last-Event-ID or body); only an ack
   turns `sent` into `delivered` (section 9).
 
@@ -166,12 +178,45 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - Current status is `argMax(status, ts)` per delivery; the history stays
   queryable.
 
+### replay-api (port 8084)
+
+- The four endpoints of section 11, all on scope `replay`, owner scoped
+  (unknown and foreign answer the same 404):
+  `POST /v1/subscriptions/{id}/replays` (202 + `replay_id`; `Idempotency-Key`,
+  `dry_run`, at least one selector criterion), `GET /v1/replays/{id}`
+  (progress: persisted matched/enqueued/not_replayable plus `delivered` and
+  `failed` computed live from ClickHouse by replay ID), `POST
+  /v1/replays/{id}/cancel`, `GET /v1/subscriptions/{id}/replays`.
+- Selector: `statuses` (current status, `argMax` per delivery), `from`/`to`
+  (RFC3339, by ingestion time = first status record), `event_refs`. Order:
+  original ingestion order (section 11). `event_types` is rejected with 400
+  (section 9: status records carry no event type).
+- Job store: `replay_jobs` in PostgreSQL (migration 002). Partial unique
+  indexes enforce one active job per subscription (API maps a violation to
+  409) and per-owner idempotency keys (a repeat returns the existing job).
+- Worker (single goroutine): resolve in ClickHouse → re-read each event from
+  `events-<class>` by stored `(class, partition, offset)` headers →
+  `not_replayable` when the record is pruned or `expires_at` passed → apply
+  the subscription's current projection (no filter re-evaluation, section 11)
+  → produce delivery + pending status in one transaction per batch of 200,
+  keyed by subscription ID, marked `Replay`/`ReplayID`. Cancellation is
+  observed at batch boundaries. On startup `running → pending` (re-executes;
+  duplicates acceptable, losses not), `cancel_requested → cancelled`.
+- Transactional ID `replay-<host>-<pid>` so the replayer never fences the
+  router's producer.
+
 ### harness
 
 - `harness pub` – open-loop publisher at a configurable rate.
 - `harness recv` – simulated webhook receiver with configurable latency, error
-  rate and offline windows.
-- `harness sse` – simulated SSE consumer.
+  rate, offline windows and `-gone410` (answers every delivery 410 Gone and
+  records nothing, which turns each delivery into a deterministic
+  dead-letter for replay tests). Receipts record `replay_id` when the
+  `pubsub-replay-id` header is present.
+- `harness sse` – simulated SSE consumer. Behaves like a browser EventSource:
+  it reconnects automatically with `Last-Event-ID` of the last event received
+  (initial cursor via `-last-event-id`), deduplicates by event reference
+  across reconnects and acks every event.
 - `harness verify` – the oracle: compares what receivers got with what the
   Status API reports and with the expected match set (section 15.1).
 
@@ -182,5 +227,8 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   `sse-live` message reaches the node that holds the connection. No message is
   dropped because the connection lives elsewhere.
 - Inbox deletion: batched deletes instead of a watermark table.
-- Replay service: not part of the spike (section 17, step 4 comes later).
+- Replay selector field `event_types`: rejected with 400 instead of
+  implemented (section 9: status records carry no event type). `statuses`,
+  the time range and `event_refs` work; the replay service itself is built
+  (`replay-api`, section 11).
 - Authentication: HS256 with a shared secret instead of JWKS.

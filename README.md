@@ -37,6 +37,7 @@ publish-api ─► Kafka events-<class> ─► router ─► Kafka deliveries �
 | `sse-gateway` | SSE connections with heartbeats and acks, presence topic, per-node live delivery, inbox parking and draining | HTTP `:8082` | 6.5 |
 | `status-writer` | Consumes `delivery-status`, batch-inserts into ClickHouse (1 s / 10k rows) | – | 9 |
 | `status-api` | The four delivery-status query endpoints, owner scoped | HTTP `:8081` | 10 |
+| `replay-api` | Replay jobs: resolve a status/time-range selector against ClickHouse, re-read the original events from their `events-<class>` topic, re-enqueue deliveries marked with the replay ID | HTTP `:8084` | 11 |
 | `admin` | Provisions Kafka topics, applies PostgreSQL migrations, creates the ClickHouse table | – | 12, 6.6, 9 |
 | `minttoken` | Mints development JWTs (production uses an OIDC provider) | – | 6.7 |
 | `harness` | Seed, open-loop publisher, simulated webhook receiver, simulated SSE consumer, independent oracle | – | 15 |
@@ -53,7 +54,7 @@ live in Kafka, and both stores are read/written off that path.
 | Store | Holds | Why there |
 | --- | --- | --- |
 | **Kafka** | `events-<class>` (the events themselves), `deliveries` (one record per subscription per event), `delivery-status`, `sse-live`, `sse-presence` | The data plane: buffering, fan-out, ordering per key, at-least-once replay from offsets |
-| **PostgreSQL** | `event_types` + `subscriptions` (the registry, §5/§7), `inbox` (parked deliveries, §6.6) | Small, transactional, mutated: CRUD with constraints, and the inbox needs ordered per-subscription scans, batched deletes and partition drop at expiry |
+| **PostgreSQL** | `event_types` + `subscriptions` (the registry, §5/§7), `inbox` (parked deliveries, §6.6), `replay_jobs` (replay job metadata, §11) | Small, transactional, mutated: CRUD with constraints, and the inbox needs ordered per-subscription scans, batched deletes and partition drop at expiry |
 | **ClickHouse** | `delivery_status`: one append-only row per status transition (`pending → sent → delivered/failed/parked`) with attempt, HTTP code, latency, reason (§9/§10) | High-volume append plus analytical reads (current status via `argMax`, counts, keyset pagination), cheap expiry via partition TTL — the shape MergeTree is built for |
 
 The status table grows with traffic × fan-out × attempts (~20k rows/s at the
@@ -79,7 +80,7 @@ internal/
   auth/               JWT validation, scopes, dev token minting
   httpx/              JSON responses, access log
   config/             environment access
-  routing/, dispatch/, sse/, harness/   service-internal logic
+  routing/, dispatch/, sse/, replay/, harness/   service-internal logic
 migrations/           embedded PostgreSQL migrations
 docker-compose.yaml   Kafka (KRaft), PostgreSQL 16, ClickHouse 24.8
 ```
@@ -98,11 +99,12 @@ Every service reads its configuration from the environment
 | Variable | Default | Used by |
 | --- | --- | --- |
 | `KAFKA_BROKERS` | `localhost:9092` | everything |
-| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, router, dispatcher, sse-gateway |
-| `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api |
+| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, router, dispatcher, sse-gateway, replay-api |
+| `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api, replay-api |
 | `JWT_SECRET` / `JWT_ISSUER` / `JWT_AUDIENCE` | `dev-secret` / `dev` / `pubsub` | every API service, harness, minttoken |
-| `HTTP_ADDR` | `:8080` (publish-api), `:8081` (status-api), `:8082` (sse-gateway), set `:8083` for registry-api | the API services |
+| `HTTP_ADDR` | `:8080` (publish-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api), set `:8083` for registry-api | the API services |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
+| `REPLAY_MAX_EVENTS` | `10000` | replay-api |
 | `WEBHOOK_SIGNING_SECRET` | unset (no HMAC) | dispatcher |
 | `ALLOW_PRIVATE_WEBHOOKS` | true in the spike; set `0` for real deployments | dispatcher |
 | `DISPATCHER_MAX_ATTEMPTS` | `10` | dispatcher |
@@ -143,6 +145,7 @@ HTTP_ADDR=:8083 ./bin/registry-api       # control plane, :8083
 ./bin/sse-gateway                        # :8082
 ./bin/status-writer                      # needs ClickHouse
 ./bin/status-api                         # :8081
+./bin/replay-api                         # :8084, needs PostgreSQL + ClickHouse + Kafka
 ```
 
 All of them expose `/healthz` without authentication. A restart is safe: Kafka
@@ -265,15 +268,20 @@ data: {"delivery_id":"...","event_ref":"...","sequence":"7:1904",
 
 `sent` becomes `delivered` only when the client acknowledges the sequence —
 either `POST /sse/ack` with `{"subscription_id":...,"sequence":"7:1904"}`, or
-implicitly by receiving an event it then acks. (The spike does **not** yet
-fetch a backlog via `Last-Event-ID` on reconnect — see §6.5/§8; recovery
-after a gateway restart or client reconnect works through the parked inbox
-and its drainer, which was fault-injection-tested end-to-end.) The
-`harness sse` subcommand acks each event and logs what it saw:
+implicitly by receiving an event it then acks. On reconnect, echo the last
+received `id` back as a `Last-Event-ID` header (or `?last_event_id=`): the
+gateway then replays everything after that cursor straight from the
+`deliveries` topic — covering parked rows *and* deliveries that died with the
+old connection — merges it with the live stream, and deduplicates. The
+`harness sse` subcommand does exactly that: it acks each event, reconnects
+automatically with the cursor of the last event it received, deduplicates by
+event reference, and logs what it saw:
 
 ```sh
 ./bin/harness sse -sub <id> -owner team-a -addr http://localhost:8082 \
   -out sse.jsonl -duration 60s
+# resume a stored cursor explicitly on first connect:
+./bin/harness sse -sub <id> -owner team-a -last-event-id 7:1904 ...
 ```
 
 **Query the outcome** — the delivery's status history
@@ -283,6 +291,35 @@ and its drainer, which was fault-injection-tested end-to-end.) The
 T=$(./bin/minttoken -owner team-a -scopes status:read)
 curl -s localhost:8081/v1/subscriptions/<id>/deliveries -H "Authorization: Bearer $T"
 ```
+
+**Replay deliveries** — resend what a subscription already matched, selected
+by current status, by time frame, or both (`replay` scope, `:8084`, spec §11):
+
+```sh
+T=$(./bin/minttoken -owner team-a -scopes replay)
+
+# e.g. everything that dead-lettered, or everything delivered in a window
+curl -s -X POST localhost:8084/v1/subscriptions/<id>/replays \
+  -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: fix-2026-10-25-1' \
+  -d '{"statuses":["dead_lettered"]}'
+
+# → 202 {"replay_id":"55d3ce5d-...","status":"pending","dry_run":false}
+curl -s localhost:8084/v1/replays/55d3ce5d-... -H "Authorization: Bearer $T"
+# → matched/enqueued/not_replayable + live delivered/failed; "status":"done" when finished
+curl -s -X POST localhost:8084/v1/replays/55d3ce5d-.../cancel -H "Authorization: Bearer $T"
+curl -s localhost:8084/v1/subscriptions/<id>/replays -H "Authorization: Bearer $T"
+```
+
+The selector takes `statuses` (current status: `failed`, `dead_lettered`,
+`dropped`, `delivered`, …), `from`/`to` (RFC3339, by ingestion time) and
+`event_refs` — at least one. `"dry_run": true` reports `matched` and
+`not_replayable` without enqueuing anything. Replayed events keep their event
+reference, are flagged as a replay on the wire (`pubsub-replay-id` header,
+`"replay":true` in the SSE payload), travel the normal delivery path (rate
+limits, breaker, delivery mode) and must be handled idempotently by the
+consumer. Only one job per subscription runs at a time (a second POST answers
+409).
 
 ### 5. Load test with the harness
 
@@ -349,14 +386,20 @@ duplicate deliveries across both channels and all three delivery modes, with
 attribute filters, data filters and projections — at 50 events/s (p50 22 ms /
 p99 28 ms) and at the 1,000 events/s N1 target (see the next section).
 Fault injection on the dispatcher is covered too (circuit breaker with
-receiver outage, hard kill and restart, restart with a parked backlog), and
-so are SSE gateway restarts — graceful SIGTERM and hard SIGKILL with a live
-client that reconnects: every scenario ended with zero loss and zero
-duplicates client-side, via the park-while-disconnected inbox and its
-drainer. Full results in
+receiver outage, hard kill and restart, restart with a parked backlog), and so
+is the SSE gateway's restart path — graceful SIGTERM and hard SIGKILL with a
+live client — every scenario ending with zero loss and zero duplicates
+client-side. The `Last-Event-ID` backlog fetch is implemented and tested: a
+client reconnected by cursor after its gateway was SIGKILLed received all
+1,200 events (100 through the cursor path), `missing=0, duplicates=0`, and a
+cursor reconnect after a client-side kill recovered a 119-row parked backlog
+instantly. The replay API (spec §11) is built and tested end to end: 30
+dead-lettered events replayed to 30 delivered, a time-frame replay of 20,
+dry-run, idempotency, cancel-at-batch-boundary and the not_replayable paths —
+full results in
 [docs/deviations-and-open-points.md](docs/deviations-and-open-points.md).
-Not exercised yet: the soak test, replay (spec 17 step 4), the multi-day
-offline scenario and multi-node SSE gateway failover.
+Not exercised yet: the soak test, restart-mid-job recovery of the replay
+worker, the multi-day offline scenario and multi-node SSE gateway failover.
 
 ## Load test at 1,000 events/s (spec 15.2, targets N1/N3)
 
@@ -429,5 +472,7 @@ Tracked, with reasons, in
 together with the spec's open decisions and what this spike did or did not
 answer. Short version: registry polls PostgreSQL instead of a compacted
 config topic, inbox rows are deleted in batches instead of by watermark,
-HS256 dev auth instead of JWKS, no replay service yet, and SSE multi-node
-routing uses presence with a node ID rather than rendezvous hashing.
+HS256 dev auth instead of JWKS, the replay selector rejects `event_types`
+(status records carry no event type) instead of implementing it, and SSE
+multi-node routing uses presence with a node ID rather than rendezvous
+hashing.
