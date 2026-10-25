@@ -265,8 +265,11 @@ data: {"delivery_id":"...","event_ref":"...","sequence":"7:1904",
 
 `sent` becomes `delivered` only when the client acknowledges the sequence —
 either `POST /sse/ack` with `{"subscription_id":...,"sequence":"7:1904"}`, or
-`Last-Event-ID` on reconnect to fetch the parked backlog (§6.5/§8). The
-`harness sse` subcommand does both and logs what it saw:
+implicitly by receiving an event it then acks. (The spike does **not** yet
+fetch a backlog via `Last-Event-ID` on reconnect — see §6.5/§8; recovery
+after a gateway restart or client reconnect works through the parked inbox
+and its drainer, which was fault-injection-tested end-to-end.) The
+`harness sse` subcommand acks each event and logs what it saw:
 
 ```sh
 ./bin/harness sse -sub <id> -owner team-a -addr http://localhost:8082 \
@@ -346,11 +349,14 @@ duplicate deliveries across both channels and all three delivery modes, with
 attribute filters, data filters and projections — at 50 events/s (p50 22 ms /
 p99 28 ms) and at the 1,000 events/s N1 target (see the next section).
 Fault injection on the dispatcher is covered too (circuit breaker with
-receiver outage, hard kill and restart, restart with a parked backlog — all
-zero loss, results in
-[docs/deviations-and-open-points.md](docs/deviations-and-open-points.md)).
+receiver outage, hard kill and restart, restart with a parked backlog), and
+so are SSE gateway restarts — graceful SIGTERM and hard SIGKILL with a live
+client that reconnects: every scenario ended with zero loss and zero
+duplicates client-side, via the park-while-disconnected inbox and its
+drainer. Full results in
+[docs/deviations-and-open-points.md](docs/deviations-and-open-points.md).
 Not exercised yet: the soak test, replay (spec 17 step 4), the multi-day
-offline scenario and SSE gateway restarts with reconnecting clients.
+offline scenario and multi-node SSE gateway failover.
 
 ## Load test at 1,000 events/s (spec 15.2, targets N1/N3)
 

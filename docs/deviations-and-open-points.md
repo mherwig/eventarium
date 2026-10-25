@@ -55,11 +55,12 @@ From §16, minus what the spike answered:
 
 - **Hot/cold handover and failover with ordering** — the spec itself calls
   this the most error-prone part: specify as state machines, test with fault
-  injection. The dispatcher side of the fault injection is done (see the
-  results below: breaker recovery, kill/restart rejoin, parked backlog
-  survival); the state-machine specification, the SSE gateway restart with
-  reconnecting clients and failover across nodes are still open — §17 step
-  4-5 territory alongside replay.
+  injection. The fault injection is done for the dispatcher (breaker
+  recovery, kill/restart rejoin, parked backlog survival) and for a
+  single-node SSE gateway restart with reconnecting clients (see the
+  results below); the state-machine specification and failover **across
+  nodes** — a second gateway node taking over a dead node's connections —
+  are still open, §17 step 4-5 territory alongside replay.
 - **Backlog limit per subscription** — without one storage grows unbounded
   during outages; with one, `dropped` appears and conflicts with guaranteed
   delivery. Unresolved product decision.
@@ -113,6 +114,29 @@ zero unexpected deliveries** in every scenario.
    memory); the restarted dispatcher re-attempted the rows, re-opened the
    breaker after 5 fresh failures, and drained everything after the next
    probe: `30/30, missing=0, duplicates=0`.
+4. **SSE gateway graceful shutdown (SIGTERM) with a connected, acking
+   client** (400 events at 10 ev/s). All four in-process roles stopped in
+   order, disconnect tombstones published, clean exit; restarted in 3 s.
+   51 events reached the client live before the shutdown; the remaining 349
+   parked into the PostgreSQL inbox while no client was connected, and the
+   reconnecting client drained them **instantly** (inbox 349 → 0): client-side
+   accounting `400/400, missing=0, duplicates=0`, oracle
+   `delivered=400, missing=0`.
+5. **SSE gateway hard-killed (SIGKILL) mid-stream with a live client, then
+   restarted** (1,200 events at 20 ev/s). The client saw `unexpected EOF`
+   after 201 events; the gateway restarted 4 s later. The consumer groups
+   (`sse-delivery`, the presence view, `sse-live-<node>`) re-joined only
+   after the dead member's ~45 s session expired; during that window
+   deliveries parked (999 rows, no client connected), and the reconnecting
+   client drained all of them: client-side accounting `1200/1200,
+   missing=0, duplicates=0`, oracle `delivered=1200, missing=0`. Notably
+   **zero loss in the theoretically lossy window** — deliveries already
+   written to the `sse-live` hop toward the dying connection: because the
+   batch-level offset commit did not survive the kill, those deliveries
+   replayed after rejoin, by which point the connection no longer existed,
+   so they parked instead of being dropped. The window exists (a
+   sub-millisecond race between live-write and commit would lose it) but did
+   not materialise.
 
 Two behaviours worth knowing, both by design but visible here:
 
@@ -123,9 +147,21 @@ Two behaviours worth knowing, both by design but visible here:
   endpoint once.
 - **Duplicates, not losses, on restart** — receivers must be idempotent
   (spec §8's at-least-once). The duplicate window is bounded by the
-  autocommit interval (5 s by default).
+  autocommit interval (5 s by default). The SSE tests measured *zero*
+  duplicates: the killed gateway had not committed the batch it was
+  delivering, and the parked-row path (inbox + drainer) hands each row over
+  exactly once per connection.
+- **SSE recovery is drainer-only in the spike.** On reconnect the gateway
+  does not fetch a backlog via `Last-Event-ID`; recovery works because the
+  delivery stage parks every delivery while no connection exists, and the
+  drainer flushes the inbox the moment a connection appears. A client that
+  disconnects briefly can therefore miss nothing only because parking starts
+  the instant its disconnect is noticed (presence tombstone on graceful
+  close; delivery-stage fallback otherwise). A production implementation
+  would add the `Last-Event-ID` backlog fetch (open point below).
 
 Not exercised yet (§17 test plan): the soak test, the multi-day offline
-scenario, SSE gateway restart with reconnecting clients (`Last-Event-ID`
-backlog fetch), and PG/Kafka/CH outages beyond the receiver-level faults
-above.
+scenario, and PG/Kafka/CH outages beyond the receiver-level faults above.
+The SSE gateway's multi-node behaviour (a second gateway node taking over a
+dead node's connections) was also not exercised — single-node restarts
+only.
