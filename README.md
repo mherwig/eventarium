@@ -43,8 +43,33 @@ publish-api ─► Kafka events-<class> ─► router ─► Kafka deliveries �
 | `harness` | Seed, open-loop publisher, simulated webhook receiver, simulated SSE consumer, independent oracle | – | 15 |
 
 Kafka consumer groups: `router` (events-\*), `dispatcher` and `sse-delivery`
-(both on `deliveries`, by channel), `sse-presence-view`, one
-`sse-live-<NODE_ID>` per gateway node, `status-writer`.
+(both on `deliveries`, by channel), one `sse-live-<NODE_ID>` per gateway node,
+`status-writer`. The presence view joins no group: every gateway node folds the
+whole `sse-presence` topic itself, because `pick()` has to know the connections
+of *all* nodes and a group would hand each node only its slice of them.
+
+### More than one replica
+
+Every component runs with any number of replicas. Work Kafka splits by
+partition (consuming `events-*`, `deliveries`, `delivery-status`, the live
+topic) needs no coordination - the group does it. Two pieces of work are *not*
+partition-scoped, and both are handled:
+
+- **The inbox duty of the dispatcher** (draining parked rows, sweeping expired
+  ones) runs under a PostgreSQL advisory-lock lease, so exactly one dispatcher
+  of the fleet does it while the others stay out of the inbox entirely. A
+  standby takes over on its next 500 ms tick when the holder dies, and a
+  rolling restart hands the lease over on shutdown. Without this, N replicas
+  would each `SELECT ... LIMIT` the same parked rows and deliver the backlog N
+  times, exactly when a receiver has just recovered. Everything else in the
+  dispatcher - parking, counting, acking - is per record and runs on every node.
+- **The presence view of the gateway** consumes groupless (above), so each node
+  sees the connections of every node instead of its own slice.
+
+Verified live with two dispatchers and two gateways: one lock row in
+`pg_locks`, takeover in one tick, both gateways reporting the same `presence`
+count while hosting different connections, and 40 parked rows drained to 40
+receipts - not 80.
 
 ## Storage responsibilities
 

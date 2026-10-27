@@ -133,6 +133,14 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 ### dispatcher (health port 8086)
 
 - Consumer group `dispatcher` over `deliveries`, webhook subscriptions only.
+- Inbox duty - draining and the expiry sweep - runs under a PostgreSQL
+  advisory-lock lease (`internal/dispatch/lease.go`): the key is
+  `fnv64a("pubsub:dispatcher:drain")`, pinned by a test, taken once on a
+  pinned connection and re-proved against `pg_locks` on every 500 ms tick, so
+  of N replicas exactly one drains. Park/count/ack are partition-scoped and run
+  on every node; the standby takes over within one tick when the holder dies.
+  The lock needs no schema and dies with its session, so a crashed replica
+  cannot leave the inbox parked in nobody's hands.
 - Delivers to the callback URL in the CloudEvents binary or structured binding
   (per subscription), with `X-Pubsub-Signature: sha256=<hex>` when
   `WEBHOOK_SIGNING_SECRET` is set, plus the delivery metadata headers
@@ -154,6 +162,12 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - `GET /sse?subscription_id=..&consumer_id=..` (scope `subscribe`), heartbeats,
   at most `max_connections` per subscription.
 - Publishes presence to `sse-presence` (tombstone on disconnect).
+- Presence view: consumes that topic **without a consumer group** (a plain
+  `ConsumeTopics` + `AtStart` client, nothing committed), so every node folds
+  all partitions from the beginning and rebuilds the full connection map -
+  including connections opened on other nodes while this one was down. A group
+  would give each node only its slice, and `pick()` (section 7) would then park
+  deliveries another node could have taken live.
 - Delivery stage: consumer group `sse-delivery` over `deliveries`, sse
   subscriptions only. With a live connection it writes to `sse-live` targeted
   at the owning node, otherwise it parks in the inbox.
