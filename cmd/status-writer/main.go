@@ -27,6 +27,7 @@ import (
 
 	"pubsub/internal/chstore"
 	"pubsub/internal/config"
+	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
 	"pubsub/internal/status"
 )
@@ -96,8 +97,15 @@ func main() {
 	}
 	defer cl.Close()
 
+	// Liveness immediately, readiness only once the table exists and the
+	// consumer is set up; the check pings ClickHouse, because a writer that
+	// cannot insert is not ready however alive it looks.
+	health := httpx.NewHealth(func(ctx context.Context) error { return conn.Ping(ctx) })
+	go health.Serve(ctx, config.Str("HTTP_ADDR", ":8087"))
+
 	slog.Info("status-writer: started", "group", consumerGroup, "topic", kafkautil.TopicStatus)
 	w := &writer{conn: conn, cl: cl}
+	health.SetReady(true)
 	if err := w.run(ctx); err != nil {
 		slog.Error("status-writer: exiting with error", "err", err)
 		os.Exit(1)

@@ -32,10 +32,10 @@ publish-api ─► Kafka events-<class> ─► router ─► Kafka deliveries �
 | --- | --- | --- | --- |
 | `publish-api` | Accepts CloudEvents (binary, structured, batch), validates against the registry, stamps `expires_at` and the owner, writes to `events-<class>` | HTTP `:8080` | 6.1 |
 | `registry-api` | CRUD for event types and subscriptions (the control plane) | HTTP `:8083` | 5, 7 |
-| `router` | Consumes all event topics; CEL attribute + data filters, ordering key, projection, fan-out. Writes the delivery and its pending status in one Kafka transaction | – | 6.2, 9 |
-| `dispatcher` | Webhook delivery: per-mode concurrency, retry with backoff + jitter, circuit breaker, token-bucket rate limit, HMAC signatures, SSRF guard, inbox parking and draining | – | 6.4 |
+| `router` | Consumes all event topics; CEL attribute + data filters, ordering key, projection, fan-out. Writes the delivery and its pending status in one Kafka transaction | HTTP `:8085` (health only) | 6.2, 9 |
+| `dispatcher` | Webhook delivery: per-mode concurrency, retry with backoff + jitter, circuit breaker, token-bucket rate limit, HMAC signatures, SSRF guard, inbox parking and draining | HTTP `:8086` (health only) | 6.4 |
 | `sse-gateway` | SSE connections with heartbeats and acks, presence topic, per-node live delivery, inbox parking and draining | HTTP `:8082` | 6.5 |
-| `status-writer` | Consumes `delivery-status`, batch-inserts into ClickHouse (1 s / 10k rows) | – | 9 |
+| `status-writer` | Consumes `delivery-status`, batch-inserts into ClickHouse (1 s / 10k rows) | HTTP `:8087` (health only) | 9 |
 | `status-api` | The four delivery-status query endpoints, owner scoped | HTTP `:8081` | 10 |
 | `replay-api` | Replay jobs: resolve a status/time-range selector against ClickHouse, re-read the original events from their `events-<class>` topic, re-enqueue deliveries marked with the replay ID | HTTP `:8084` | 11 |
 | `admin` | Provisions Kafka topics, applies PostgreSQL migrations, creates the ClickHouse table | – | 12, 6.6, 9 |
@@ -102,7 +102,7 @@ Every service reads its configuration from the environment
 | `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, router, dispatcher, sse-gateway, replay-api |
 | `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api, replay-api |
 | `JWT_SECRET` / `JWT_ISSUER` / `JWT_AUDIENCE` | `dev-secret` / `dev` / `pubsub` | every API service, harness, minttoken |
-| `HTTP_ADDR` | `:8080` (publish-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api), set `:8083` for registry-api | the API services |
+| `HTTP_ADDR` | `:8080` (publish-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api), set `:8083` for registry-api; `:8085` (router), `:8086` (dispatcher), `:8087` (status-writer) — health endpoints only | every service |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api |
 | `WEBHOOK_SIGNING_SECRET` | unset (no HMAC) | dispatcher |
@@ -140,16 +140,20 @@ they die with your shell). In order:
 ```sh
 ./bin/publish-api                        # data plane, :8080
 HTTP_ADDR=:8083 ./bin/registry-api       # control plane, :8083
-./bin/router                             # needs PostgreSQL for the registry
-./bin/dispatcher                         # needs PostgreSQL for the inbox
+./bin/router                             # health :8085, needs PostgreSQL for the registry
+./bin/dispatcher                         # health :8086, needs PostgreSQL for the inbox
 ./bin/sse-gateway                        # :8082
-./bin/status-writer                      # needs ClickHouse
+./bin/status-writer                      # health :8087, needs ClickHouse
 ./bin/status-api                         # :8081
 ./bin/replay-api                         # :8084, needs PostgreSQL + ClickHouse + Kafka
 ```
 
-All of them expose `/healthz` without authentication. A restart is safe: Kafka
-offsets and the inbox hold the state, and consumers rejoin their groups.
+All of them expose `/healthz` (liveness) and `/readyz` (readiness) without
+authentication; the three workers serve only those two. Liveness never fails
+because a database is down — restarting a consumer would gain nothing — while
+readiness does: it also reports `starting` until the registry, the inbox
+partitions and the Kafka client are set up. A restart is safe: Kafka offsets
+and the inbox hold the state, and consumers rejoin their groups.
 
 ### 4. Register, subscribe, publish, receive
 

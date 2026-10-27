@@ -26,7 +26,7 @@ records what is already decided in code and what each service must implement.
 | `JWT_SECRET` | `dev-secret` | every API service, harness |
 | `JWT_ISSUER` | `dev` | same |
 | `JWT_AUDIENCE` | `pubsub` | same |
-| `HTTP_ADDR` | `:8080` (publish-api, registry-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api) | the API services |
+| `HTTP_ADDR` | `:8080` (publish-api, registry-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api); `:8085` (router), `:8086` (dispatcher), `:8087` (status-writer), health only | every service |
 | `WEBHOOK_SIGNING_SECRET` | unset (no signature) | dispatcher |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api (upper bound for `max_events`) |
@@ -113,7 +113,7 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   types (section 5), validates CEL and projection paths, applies the defaults
   of the delivery policy table (section 7).
 
-### router
+### router (health port 8085)
 
 - Consumer group `router` over all four `events-*` topics.
 - For each event: match subscriptions of the same owner and type, evaluate the
@@ -127,8 +127,10 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - Ordering: one source partition is processed serially; the key of the
   delivery record is the subscription ID, so per-key order survives because one
   router instance owns the source partition.
+- `GET /healthz` (liveness) and `GET /readyz` (readiness: PostgreSQL reachable
+  and the initial registry load done) are the router's only endpoints; no auth.
 
-### dispatcher
+### dispatcher (health port 8086)
 
 - Consumer group `dispatcher` over `deliveries`, webhook subscriptions only.
 - Delivers to the callback URL in the CloudEvents binary or structured binding
@@ -143,6 +145,9 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - Drains the inbox at `drain_rate_per_s` when the subscription is healthy
   again; while draining, new events go to the inbox so that order holds.
 - Emits in_flight, retrying, delivered, dead_lettered, paused, dropped.
+- `GET /healthz` (liveness) and `GET /readyz` (readiness: PostgreSQL reachable,
+  inbox partitions created, consume loop started) are the dispatcher's only
+  endpoints; no auth.
 
 ### sse-gateway (port 8082)
 
@@ -166,10 +171,12 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - `POST /sse/ack` acknowledges deliveries (Last-Event-ID or body); only an ack
   turns `sent` into `delivered` (section 9).
 
-### status-writer
+### status-writer (health port 8087)
 
 - Consumer group `status-writer` over `delivery-status`, batch inserts into
   ClickHouse (`internal/chstore`), every 1 s or 10k rows.
+- `GET /healthz` (liveness) and `GET /readyz` (readiness: ClickHouse reachable,
+  table created) are the status-writer's only endpoints; no auth.
 
 ### status-api (port 8081)
 

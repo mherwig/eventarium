@@ -15,6 +15,7 @@ import (
 
 	"pubsub/internal/config"
 	"pubsub/internal/dispatch"
+	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
 	"pubsub/internal/registry"
 	"pubsub/internal/status"
@@ -37,6 +38,12 @@ func main() {
 		fail("connecting to postgres", err)
 	}
 	defer st.Close()
+
+	// Liveness immediately, readiness only after the inbox partitions exist
+	// and the consume loop has started: a dispatcher that has not joined the
+	// group delivers nothing, however healthy PostgreSQL looks.
+	health := httpx.NewHealth(func(ctx context.Context) error { return st.Pool.Ping(ctx) })
+	go health.Serve(ctx, config.Str("HTTP_ADDR", ":8086"))
 
 	producer, err := status.NewProducer(kafkautil.Bootstrap())
 	if err != nil {
@@ -71,6 +78,7 @@ func main() {
 	}
 
 	go d.Run(ctx)
+	health.SetReady(true)
 	<-ctx.Done()
 	slog.Info("dispatcher: shutting down")
 	// Graceful shutdown: stop consuming, wait (max 10s) for in-flight

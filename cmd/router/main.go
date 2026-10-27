@@ -38,6 +38,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"pubsub/internal/config"
+	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
 	"pubsub/internal/registry"
 	"pubsub/internal/routing"
@@ -65,6 +66,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	// Liveness from the first second - a PostgreSQL outage must not look like
+	// a dead process - readiness only once the registry has been loaded and
+	// the transactional session exists, because before that first reload the
+	// router has no subscription index and would commit events it cannot
+	// match anything for.
+	health := httpx.NewHealth(func(ctx context.Context) error { return st.Pool.Ping(ctx) })
+	go health.Serve(ctx, config.Str("HTTP_ADDR", ":8085"))
 	reg := registry.New(st, registryEvery)
 
 	// Do not join the group before the first successful reload: otherwise
@@ -95,6 +104,7 @@ func main() {
 	}
 	defer sess.Close()
 
+	health.SetReady(true)
 	run(ctx, sess, routing.New(reg))
 	slog.Info("router: stopped")
 }
