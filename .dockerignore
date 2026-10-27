@@ -1,0 +1,6 @@
+# Build output and VCS data are not part of the build context: bin/ would
+# be copied into the image layer for nothing, .git is ~the whole history.
+bin/
+.git/
+*.log
+*:Zone.Identifier
