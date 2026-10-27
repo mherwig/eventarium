@@ -410,6 +410,125 @@ Replay *jobs* are a different, unrelated state machine in `replay_jobs`:
 `pending → running → done`, plus `cancel_requested → cancelled` on a cancel
 and `failed` on an error.
 
+## Circuit breaker and dead letters
+
+Two independent mechanisms that both deal with a failing receiver. The
+**circuit breaker** decides *whether to attempt at all* — a gate on the
+endpoint. The **dead letter** is the verdict *after* attempting and giving up
+— a terminal status on one delivery. The breaker never dead-letters anything,
+and a dead letter never trips the breaker.
+
+### The breaker: a traffic light per subscription
+
+State machine of `internal/dispatch/breaker.go`, in memory and per
+subscription (it resets on a dispatcher restart: one bounded storm of a dead
+endpoint per restart is the documented cost):
+
+```
+CLOSED ──(5 consecutive failures)──► OPEN ──(probe interval elapsed)──► HALF-OPEN
+   ▲                                  ▲                                  │
+   └────(probe answers 2xx or 410)────┴──────(probe fails: re-open)──────┘
+```
+
+- **Failure**: 5xx, any other 4xx, connection refused, timeout, DNS error.
+- **Success**: 2xx **and 410** — the receiver answered, so it is healthy.
+- **Neither**: `429` pauses the subscription for `Retry-After`, consumes no
+  attempt and counts no failure (spec §6.4).
+- Defaults: `cb_failure_threshold=5` **consecutive** failures (any success
+  resets the counter), `probe_interval_s=300`, clamped to 5–15 minutes.
+- A failed probe re-opens for the **full** interval, so an endpoint that stays
+  down costs exactly **one request per probe interval** — the open/close loop
+  is bounded by design, never a storm.
+
+What each state actually does:
+
+| State | New delivery from Kafka | Parked row (drain) | HTTP sent |
+| --- | --- | --- | --- |
+| `closed` | attempted: `in_flight` → `delivered` / `retrying` / `dead_lettered` | drained at `drain_rate_per_s` | yes |
+| `half-open` | the first one becomes the probe, every other is refused and parks (live class retries in memory) | the first row is the probe, the rest wait | exactly 1 |
+| `open` | refused: `paused (circuit_open)` → inbox → `pending (circuit_open)` | skipped — except at probe time, when the first row *is* the probe | none |
+
+Two rules follow: *open means don't try* (protect the receiver from us) and
+*park means don't lose* (the delivery waits in PostgreSQL, bounded by
+`backlog_max`, beyond which `dropped` appears — the spec's
+guaranteed-delivery-vs-storage trade-off, §16). The drain runs through its own
+token bucket and is gated by the breaker, and while a drain batch runs new
+non-live deliveries park (`reason=draining`), so drain and live traffic never
+overlap on one subscription.
+
+**Live-class deliveries (§12) are the exception**: no inbox duty, so while the
+breaker is open they retry in memory with backoff and end as `dropped
+(max_attempts)` — never parked, never dead-lettered.
+
+### The dead letter: a delivery that ran out of chances
+
+`dead_lettered` is a terminal status, **not a queue**: there is no DLQ table
+and no DLQ topic, only the ClickHouse row that says "finished,
+unsuccessfully". Two ways in:
+
+| Door | Trigger | Cost |
+| --- | --- | --- |
+| `gone` | the receiver answered **410 Gone** | one attempt — the receiver's own decision (see below) |
+| `max_attempts` | all `DISPATCHER_MAX_ATTEMPTS` (10) attempts failed | ten attempts with exponential backoff (0.5 s → 60 s, jittered) |
+
+After either door: no retry, no parking, no breaker involvement, ever. The
+only way back is a **replay** (`{"statuses":["dead_lettered"]}`), which
+re-emits `pending` for the same delivery ID and runs the whole lifecycle
+again — that is this spike's DLQ.
+
+**Why a receiver would answer 410**: HTTP's permanent "gone", used as an
+opt-out — tenant deleted, endpoint decommissioned, subscription cancelled
+downstream. It turns "keep hammering a receiver that told you to stop" into
+one clean decision: no retry budget burned, no breaker noise (it counts as a
+*success*), and a status the replay API selects on. It is a spike extension:
+§9 only defines `failed or dead_lettered = retries exhausted`.
+
+### How they interact (barely)
+
+| Situation | The breaker does | The dead letter does |
+| --- | --- | --- |
+| Receiver totally down | opens after 5 failures, everything parks | almost nothing arrives here — attempt 6 is already refused |
+| Receiver alive, one payload keeps failing | never opens (successes reset the counter) | `dead_lettered (max_attempts)` on attempt 10 |
+| Receiver answers 410 | counts as success, stays closed | `dead_lettered (gone)` at once |
+| Breaker open | emits `paused`, delivery parks | irrelevant — no attempt is made |
+| Already `dead_lettered` | never sees it again | terminal until a replay |
+
+The two answer different questions: the breaker detects *"the endpoint is
+broken"* (stop trying, park, wait for recovery), the dead letter detects *"the
+endpoint is fine but this delivery won't make it"* (give up, make it
+replayable).
+
+### Timeline: receiver hard down
+
+```
+events 1-5    in_flight → retrying (transport_error), backoff 0.5s 1s 2s 4s
+              5th consecutive failure → breaker OPEN
+events 6-∞    paused (circuit_open) → pending (circuit_open)   no HTTP at all
+t+300s        drain: row 1 is the probe → refused → re-OPEN     one request
+              row 2: allow() is false → paused → row stays parked
+...           one request per probe interval until the receiver returns
+probe 200     breaker CLOSED (failures=0) → rows drain at drain_rate_per_s
+              every parked delivery ends delivered
+```
+
+With an *intermittently* failing receiver the breaker never opens, and one
+unlucky delivery instead reaches `dead_lettered (max_attempts)`.
+
+### Watching it
+
+```sh
+grep "circuit breaker" dispatcher.log   # opened / closed after successful probe / re-opened after failed probe
+docker compose exec -T clickhouse clickhouse-client -u pubsub --password pubsub -d pubsub \
+  -q "SELECT status, count() FROM delivery_status GROUP BY status FORMAT PrettyCompact"
+docker compose exec -T postgres psql -U pubsub -d pubsub \
+  -c "SELECT subscription_id, reason, count(*) FROM inbox GROUP BY 1, 2;"
+```
+
+Breaker cycles add status rows every time (`paused`, `pending`, `retrying`) —
+`delivery_status` is append-only — but they never produce new deliveries or
+new events: the router writes one delivery record per event and subscription,
+forever.
+
 ## Checks
 
 ```sh
