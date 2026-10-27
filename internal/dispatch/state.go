@@ -46,6 +46,7 @@ type subState struct {
 	bucket      *tokenBucket // rate_limit_per_s, shared by the workers
 	drainBucket *tokenBucket // drain_rate_per_s, used while draining the inbox
 	breaker     *breaker
+	parked      parkCounter // cached inbox row count behind backlog_max
 
 	mu         sync.Mutex
 	pauseUntil time.Time

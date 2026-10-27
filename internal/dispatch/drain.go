@@ -86,6 +86,32 @@ func (d *Dispatcher) candidateIDs() []string {
 	return out
 }
 
+// stateIDs returns the subscriptions that currently have a state object, i.e.
+// the ones whose cached backlog cap can be refreshed. States are deliberately
+// not created here: an idle subscription must stay prunable.
+func (d *Dispatcher) stateIDs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]string, 0, len(d.subs))
+	for id := range d.subs {
+		out = append(out, id)
+	}
+	return out
+}
+
+// seedParked refreshes the cached inbox counts of the given states from one
+// count(*). A missing key means zero rows: the subscription was drained, its
+// rows expired or they were never there.
+func (d *Dispatcher) seedParked(ids []string, counts map[string]int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, id := range ids {
+		if s, ok := d.subs[id]; ok {
+			s.parked.seed(counts[id])
+		}
+	}
+}
+
 // drainOnce drains one batch per eligible subscription.
 func (d *Dispatcher) drainOnce() {
 	d.refreshKnownIfStale()
@@ -95,11 +121,20 @@ func (d *Dispatcher) drainOnce() {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), 15*time.Second)
 	defer cancel()
+	// Snapshot the states before counting: a state created after this point
+	// seeds itself, while these are the ones whose cached cap this count may
+	// replace.
+	stateIDs := d.stateIDs()
 	counts, err := d.st.CountParked(ctx, ids)
 	if err != nil {
 		slog.Warn("dispatcher: counting parked rows failed", "err", err)
 		return
 	}
+	// This count runs anyway (it selects the subscriptions with rows) and is
+	// also what keeps the cached backlog caps honest: it picks up rows parked
+	// by an earlier process, rows acked since the last tick and rows the
+	// expiry sweep deleted, without a single extra query.
+	d.seedParked(stateIDs, counts)
 	var withRows []string
 	for _, id := range ids {
 		if counts[id] == 0 {
@@ -204,7 +239,7 @@ func (d *Dispatcher) drainSub(ctx context.Context, s *subState, rows []store.Inb
 			// A poison row would block the inbox forever; ack it away.
 			slog.Warn("dispatcher: undecodable parked row dropped",
 				"subscription", s.id, "part", row.Part, "offset", row.Offset, "err", err)
-			d.ackRow(ctx, row)
+			d.ackRow(ctx, s, row)
 			continue
 		}
 		ok, err := s.drainBucket.Wait(d.ctx, 0)
@@ -223,16 +258,20 @@ func (d *Dispatcher) drainSub(ctx context.Context, s *subState, rows []store.Inb
 		default:
 			// delivered, dead-lettered, dropped or expired: the row has seen
 			// its final outcome, remove it from the inbox.
-			d.ackRow(ctx, row)
+			d.ackRow(ctx, s, row)
 		}
 	}
 }
 
-func (d *Dispatcher) ackRow(ctx context.Context, row store.InboxRow) {
+// ackRow removes a row whose outcome is final. The cached backlog cap is
+// lowered with it, so the subscription can park again between two counts.
+func (d *Dispatcher) ackRow(ctx context.Context, s *subState, row store.InboxRow) {
 	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := d.st.AckParked(actx, []store.InboxRow{row}); err != nil {
 		slog.Warn("dispatcher: acking parked row failed",
 			"subscription", row.SubscriptionID, "part", row.Part, "offset", row.Offset, "err", err)
+		return
 	}
+	s.parked.add(-1)
 }

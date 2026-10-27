@@ -297,10 +297,11 @@ func (d *Dispatcher) park(ctx context.Context, s *subState, it *item, reason str
 	defer cancel()
 	// Spec 16: the backlog cap trades guaranteed delivery for bounded storage;
 	// without it the inbox grows without bound, with it dropped appears.
-	counts, err := d.st.CountParked(pctx, []string{s.id})
-	if err != nil {
-		slog.Warn("dispatcher: counting parked rows failed", "subscription", s.id, "err", err)
-	} else if counts[s.id] >= int64(s.policy().backlogMax) {
+	// The check reads the cached counter (parkCounter) instead of counting the
+	// inbox per delivery: a count over a full inbox costs about 10 ms, and
+	// parking runs at ingestion speed for as long as the endpoint is down.
+	s.parked.ensure(pctx, d.st, s.id)
+	if s.parked.overCap(int64(s.policy().backlogMax)) {
 		d.emitStatus(it, status.Dropped, reasonBacklogMax, 0, 0, 0)
 		d.count.dropped.Add(1)
 		return true
@@ -325,6 +326,7 @@ func (d *Dispatcher) park(ctx context.Context, s *subState, it *item, reason str
 			"subscription", s.id, "seq", it.seq.String(), "err", err)
 		return false
 	}
+	s.parked.add(1) // local delta until the drainer's next count replaces it
 	d.emitStatus(it, status.Pending, reason, 0, 0, 0)
 	d.count.parked.Add(1)
 	return true
