@@ -102,9 +102,18 @@ func (d *Dispatcher) drainOnce() {
 	}
 	var withRows []string
 	for _, id := range ids {
-		if counts[id] > 0 {
-			withRows = append(withRows, id)
+		if counts[id] == 0 {
+			continue
 		}
+		// Gate before the read (section 6.6). FetchParked selects payloads,
+		// so a subscription whose breaker is open, that is paused by a 429 or
+		// that is busy with live work would otherwise cost up to drainBatch
+		// rows read twice a second only to be thrown away below - exactly
+		// while an endpoint is down, when the drainer should be quietest.
+		if s, ok := d.drainState(id); !ok || !drainEligible(s) {
+			continue
+		}
+		withRows = append(withRows, id)
 	}
 	if len(withRows) == 0 {
 		return
@@ -119,22 +128,13 @@ func (d *Dispatcher) drainOnce() {
 		bySub[r.SubscriptionID] = append(bySub[r.SubscriptionID], r)
 	}
 	for id, rs := range bySub {
-		entry, ok := d.reg.Subscription(id)
-		if !ok || entry.Sub == nil || entry.Sub.Channel != delivery.ChannelWebhook {
+		s, ok := d.drainState(id)
+		if !ok {
 			continue // deleted subscription; its rows expire
 		}
-		s := d.stateFor(entry.Sub)
-		if !s.breaker.canAttempt() || s.pauseFor() > 0 || s.inFlight.Load() > 0 {
-			continue
-		}
-		busy := false
-		for _, q := range s.qs {
-			if len(q) > 0 {
-				busy = true
-				break
-			}
-		}
-		if busy {
+		// Checked again here, right before the batch: the live workers change
+		// the breaker, the pause and the queue depth while the inbox was read.
+		if !drainEligible(s) {
 			continue
 		}
 		if s.draining.Swap(true) {
@@ -143,6 +143,36 @@ func (d *Dispatcher) drainOnce() {
 		d.drainSub(ctx, s, rs)
 		s.draining.Store(false)
 	}
+}
+
+// drainState resolves the state of a drain candidate. Only a webhook
+// subscription that still exists in the registry may be drained, and its
+// state carries the breaker, the 429 pause and the live-work counters the
+// drainer has to respect.
+func (d *Dispatcher) drainState(id string) (*subState, bool) {
+	entry, ok := d.reg.Subscription(id)
+	if !ok || entry.Sub == nil || entry.Sub.Channel != delivery.ChannelWebhook {
+		return nil, false
+	}
+	return d.stateFor(entry.Sub), true
+}
+
+// drainEligible reports whether a subscription may start a drain round: the
+// breaker is closed or its probe is due, no 429 pause is running, nothing is
+// in flight and no delivery is queued (spec 6.6 - drain only what the hot
+// path is not already doing). drainOnce calls it twice, before reading the
+// inbox and again before the batch; both reads are needed because the second
+// one sees the state the live workers produced meanwhile.
+func drainEligible(s *subState) bool {
+	if !s.breaker.canAttempt() || s.pauseFor() > 0 || s.inFlight.Load() > 0 {
+		return false
+	}
+	for _, q := range s.qs {
+		if len(q) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Dispatcher) refreshKnownIfStale() {
