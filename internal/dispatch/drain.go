@@ -14,6 +14,12 @@ import (
 // subscriptions that are healthy again (breaker closed or probe due, no queue,
 // nothing in flight, not paused) and drains their parked rows in (partition,
 // offset) order at drain_rate_per_s. Expired rows are swept every 5 minutes.
+//
+// Draining and the expiry sweep are the dispatcher's only work that Kafka does
+// not scope to one replica, so they run under the inbox lease (lease.go): of N
+// dispatcher pods exactly one performs them, and the others stay out of the
+// inbox entirely. Everything else - pruning local state and refreshing the
+// subscription set - runs on every node, so a takeover is immediate.
 func (d *Dispatcher) drainLoop() {
 	tick := time.NewTicker(drainInterval)
 	defer tick.Stop()
@@ -21,6 +27,38 @@ func (d *Dispatcher) drainLoop() {
 	defer expiry.Stop()
 	refresh := time.NewTicker(knownRefresh)
 	defer refresh.Stop()
+	lease := newDrainLease(d.st.Pool)
+	defer lease.close()
+
+	leader, lastErr := false, ""
+	// hold runs before each piece of inbox duty and reports whether this node
+	// may perform it. Transitions are logged once each: leadership is
+	// interesting, the 500ms heartbeat that confirms it is not.
+	hold := func() bool {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), leaseTimeout)
+		defer cancel()
+		held, err := lease.hold(ctx)
+		if err != nil {
+			// One line per distinct failure - this runs twice a second and a
+			// PostgreSQL outage would otherwise drown the log.
+			if err.Error() != lastErr {
+				slog.Warn("dispatcher: inbox lease check failed", "err", err)
+				lastErr = err.Error()
+			}
+			held = false // unverifiable is not leading: better skip a drain
+		} else {
+			lastErr = ""
+		}
+		switch {
+		case held && !leader:
+			slog.Info("dispatcher: inbox lease acquired, this node drains the inbox")
+		case !held && leader:
+			slog.Info("dispatcher: inbox lease lost, another node drains the inbox")
+		}
+		leader = held
+		return held
+	}
+
 	for {
 		select {
 		case <-d.ctx.Done():
@@ -28,6 +66,9 @@ func (d *Dispatcher) drainLoop() {
 		case <-refresh.C:
 			d.refreshKnown()
 		case <-expiry.C:
+			if !hold() {
+				continue
+			}
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), 30*time.Second)
 			if n, err := d.st.DeleteExpiredParked(ctx); err != nil {
 				slog.Warn("dispatcher: deleting expired parked rows failed", "err", err)
@@ -37,6 +78,9 @@ func (d *Dispatcher) drainLoop() {
 			cancel()
 		case <-tick.C:
 			d.prune()
+			if !hold() {
+				continue
+			}
 			d.drainOnce()
 		}
 	}
