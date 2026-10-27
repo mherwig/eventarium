@@ -147,10 +147,12 @@ func (rc *receiver) handler() http.Handler {
 
 // pause holds a request for -latency before it is answered and reports whether
 // the client is still there. Every answer goes through it, including the 410
-// of -gone410: without it the dispatcher would write in_flight and
-// dead_lettered inside the same millisecond, and the status store judges a
-// delivery by argMax(status, ts) (section 9), which would keep in_flight
-// instead of the dead_lettered the test wants to replay.
+// of -gone410: without it the dispatcher writes in_flight and dead_lettered
+// inside the same millisecond, and the test that wants to observe a delivery
+// *while* it is in flight has nothing to catch. (Judging the delivery itself
+// no longer needs the pause: the status store orders same-millisecond records
+// by lifecycle rank, so dead_lettered wins over in_flight regardless — see
+// internal/chquery.)
 func (rc *receiver) pause(r *http.Request) bool {
 	if rc.latency <= 0 {
 		return true

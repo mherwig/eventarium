@@ -1,8 +1,8 @@
 // Package chquery implements the delivery status read path of sections 9 and
 // 10 of the spec against the append-only delivery_status table of
 // internal/chstore: the full history of one delivery, the current status of
-// many deliveries via argMax(status, ts), keyset pagination on
-// (ts, delivery_id) and the per-status summary.
+// many deliveries via argMax over the "latest record" key described below,
+// keyset pagination on (ts, delivery_id) and the per-status summary.
 //
 // The read path is eventually consistent: status records reach ClickHouse
 // through the batch inserts of status-writer, so everything this package
@@ -54,6 +54,56 @@ var Statuses = []string{
 	status.Expired,
 	status.Dropped,
 }
+
+// rankSQLFor ranks a status by its place in the lifecycle: the index in
+// Statuses, and the length of that list for anything unknown.
+//
+// It is the last component of LatestKeySQL, and it exists because ts alone
+// does not identify the newest record. Status records are produced in
+// batches (the dispatcher flushes at most every 50 ms), so in_flight and
+// delivered of one delivery routinely carry the same millisecond - observed
+// in the live cluster for all 20 of 20 deliveries - and argMax then breaks
+// the tie by row order, which reported every delivery as in_flight with
+// http_code 0 instead of delivered with 200.
+//
+// prefix qualifies the status column ("ds." in a query that aliases the
+// table); it must stay "" for the history query, which orders by this
+// expression bare.
+func rankSQLFor(prefix string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CASE %sstatus", prefix)
+	for i, st := range Statuses {
+		fmt.Fprintf(&b, " WHEN '%s' THEN %d", st, i)
+	}
+	fmt.Fprintf(&b, " ELSE %d END", len(Statuses)) // no ")": LatestKeySQL adds the parentheses, and the history query uses this bare in an ORDER BY
+	return b.String()
+}
+
+var rankSQL = rankSQLFor("")
+
+// LatestKeySQL is the sort key that decides which record of a delivery is
+// the current one: (ts, attempt, lifecycle rank), with every column
+// qualified by prefix ("" for an unaliased table, "ds." for one aliased ds).
+//
+//   - ts first: newest transition wins.
+//   - attempt before the rank, so a later attempt always beats an earlier
+//     one even when both land in the same millisecond (retrying of attempt 1
+//     versus in_flight of attempt 2).
+//   - rank last, to order records that share both, which happens exactly
+//     when two transitions of one attempt are emitted back to back.
+//
+// The key is built in a subquery (SELECT *, <key> AS latest) because
+// ClickHouse resolves a result alias before the column of the same name, and
+// argMax(status, ...) AS status would otherwise nest an aggregate in itself.
+// internal/replay calls this directly instead of writing its own argMax: the
+// replay selector must judge "current status" with the definition the Status
+// API reads, or the two disagree about one delivery whenever two transitions
+// share a millisecond.
+func LatestKeySQL(prefix string) string {
+	return "(" + prefix + "ts, " + prefix + "attempt, " + rankSQLFor(prefix) + ")"
+}
+
+var latestKeySQL = LatestKeySQL("")
 
 // Transition is one status record of one delivery, exactly as stored
 // (section 9): IDs and measurements, never a payload.
@@ -157,7 +207,7 @@ func (s *Store) Delivery(ctx context.Context, owner, deliveryID string) (*Delive
 		       src_partition, src_offset
 		FROM `+chstore.Table+`
 		WHERE owner = ? AND delivery_id = ?
-		ORDER BY ts`,
+		ORDER BY ts, attempt, `+rankSQL,
 		owner, deliveryID)
 	if err != nil {
 		return nil, fmt.Errorf("chquery: delivery history: %w", err)
@@ -190,8 +240,10 @@ func (s *Store) Delivery(ctx context.Context, owner, deliveryID string) (*Delive
 	if len(d.History) == 0 {
 		return nil, ErrNotFound
 	}
-	// Current is the latest record, i.e. exactly what argMax(*, ts) would
-	// pick for this single delivery (ties resolved by ORDER BY ts).
+	// Current is the latest record under the same key the list queries use
+	// (ts, attempt, lifecycle rank): ordering the history by that key here
+	// and taking the last row must agree with argMax over it, or endpoint 1
+	// and endpoint 3 would disagree about one delivery.
 	d.Current = d.History[len(d.History)-1]
 	return d, nil
 }
@@ -205,15 +257,18 @@ func (s *Store) EventDeliveries(ctx context.Context, owner, eventRef string) ([]
 		SELECT
 			delivery_id,
 			subscription_id,
-			argMax(status, ts)         AS status,
-			argMax(reason, ts)         AS reason,
-			argMax(attempt, ts)        AS attempt,
-			argMax(http_code, ts)      AS http_code,
-			argMax(latency_ms, ts)     AS latency_ms,
-			argMax(connection_id, ts)  AS connection_id,
-			argMax(ts, ts)             AS last_ts
-		FROM `+chstore.Table+`
-		WHERE owner = ? AND event_ref = ?
+			argMax(status, latest)          AS status,
+			argMax(reason, latest)          AS reason,
+			argMax(attempt, latest)         AS attempt,
+			argMax(http_code, latest)       AS http_code,
+			argMax(latency_ms, latest)      AS latency_ms,
+			argMax(connection_id, latest)   AS connection_id,
+			argMax(ts, latest)              AS last_ts
+		FROM (
+			SELECT *, `+latestKeySQL+` AS latest
+			FROM `+chstore.Table+`
+			WHERE owner = ? AND event_ref = ?
+		)
 		GROUP BY delivery_id, subscription_id
 		ORDER BY delivery_id, subscription_id`,
 		owner, eventRef)
@@ -250,7 +305,7 @@ func (s *Store) SubscriptionDeliveries(ctx context.Context, owner, subscriptionI
 	// The status filter judges a delivery by its latest record, so it must
 	// run on the grouped value (HAVING), never on the raw rows (WHERE).
 	if f.Status != "" {
-		having = append(having, "argMax(status, ts) = ?")
+		having = append(having, "argMax(r.status, r.latest) = ?")
 		args = append(args, f.Status)
 	}
 	if f.Cursor != nil {
@@ -259,7 +314,10 @@ func (s *Store) SubscriptionDeliveries(ctx context.Context, owner, subscriptionI
 		// the driver render toDateTime('...') at second precision, and with
 		// 100+ rows in one second the keyset restarted inside that second,
 		// repeated the page forever and stalled pagination (section 10).
-		having = append(having, "(max(ts), delivery_id) > (toDateTime64(?, 3), ?)")
+		// max(r.ts) and argMax(r.ts, r.latest) are the same value: ts is the
+		// first component of the key, so the page boundary stays comparable
+		// with the last_ts it orders by.
+		having = append(having, "(max(r.ts), delivery_id) > (toDateTime64(?, 3), ?)")
 		args = append(args, f.Cursor.TS.UTC().Format("2006-01-02 15:04:05.999"), f.Cursor.DeliveryID)
 	}
 	limit := f.Limit
@@ -272,20 +330,20 @@ func (s *Store) SubscriptionDeliveries(ctx context.Context, owner, subscriptionI
 			delivery_id,
 			subscription_id,
 			event_ref,
-			argMax(status, ts)         AS status,
-			argMax(reason, ts)         AS reason,
-			argMax(attempt, ts)        AS attempt,
-			argMax(http_code, ts)      AS http_code,
-			argMax(latency_ms, ts)     AS latency_ms,
-			argMax(connection_id, ts)  AS connection_id,
-			-- Aliased last_ts, not ts: ClickHouse would otherwise resolve the
-			-- ts inside argMax(ts, ts) to the alias being defined and error
-			-- out with a nested aggregate.
-			argMax(ts, ts)             AS last_ts
-		FROM ` + chstore.Table + `
-		WHERE ` + strings.Join(where, " AND ")
+			argMax(r.status, r.latest)          AS status,
+			argMax(r.reason, r.latest)          AS reason,
+			argMax(r.attempt, r.latest)         AS attempt,
+			argMax(r.http_code, r.latest)       AS http_code,
+			argMax(r.latency_ms, r.latest)      AS latency_ms,
+			argMax(r.connection_id, r.latest)   AS connection_id,
+			argMax(r.ts, r.latest)              AS last_ts
+		FROM (
+			SELECT *, ` + latestKeySQL + ` AS latest
+			FROM ` + chstore.Table + `
+			WHERE ` + strings.Join(where, " AND ") + `
+		) AS r`
 	// One row per delivery: everything in the SELECT is either aggregated or
-	// part of the key.
+	// part of the key (the subquery's columns, qualified through r).
 	q += `
 		GROUP BY delivery_id, subscription_id, event_ref`
 	if len(having) > 0 {
@@ -316,17 +374,27 @@ func (s *Store) SubscriptionDeliveries(ctx context.Context, owner, subscriptionI
 	return items, next, nil
 }
 
-// StatusCounts counts the status records written for one subscription since
-// the given time (the API passes now-24h) and returns the counts per status
-// (zero for statuses that did not occur) plus the total (section 10,
-// endpoint 4).
+// StatusCounts counts the deliveries of one subscription that were in each
+// status since the given time (the API passes now-24h) and returns the
+// counts per status (zero for statuses that did not occur) plus the number
+// of distinct deliveries in the window (section 10, endpoint 4).
+//
+// It counts delivery_id, not status records, on purpose. A delivery has one
+// record per transition (pending, in_flight, delivered), so counting rows
+// would report 63 "deliveries" for the 20 published here, and at-least-once
+// adds duplicates: the router was observed committing the same delivery
+// twice in the live cluster, which made count() answer 21 for 20 events.
+// uniqExact(delivery_id) answers the same number either way. The total is
+// likewise distinct deliveries, not the sum of the per-status counts - one
+// delivery passes through several statuses, so that sum is not a count of
+// anything a reader can use.
 //
 // Backlog, delivery mode and active connections are deliberately absent:
 // they are PostgreSQL control data (sections 6.6 and 7) and would come from
 // there in a later version; spec section 10 marks this endpoint optional.
 func (s *Store) StatusCounts(ctx context.Context, owner, subscriptionID string, since time.Time) (map[string]int64, int64, error) {
 	rows, err := s.conn.Query(ctx, `
-		SELECT status, count()
+		SELECT status, uniqExact(delivery_id)
 		FROM `+chstore.Table+`
 		WHERE owner = ? AND subscription_id = ? AND ts >= ?
 		GROUP BY status`,
@@ -340,19 +408,31 @@ func (s *Store) StatusCounts(ctx context.Context, owner, subscriptionID string, 
 	for _, st := range Statuses {
 		counts[st] = 0
 	}
-	var total int64
 	for rows.Next() {
 		var (
 			st string
-			n  uint64 // count() is UInt64, which the driver scans into uint64
+			n  uint64 // uniqExact is UInt64, which the driver scans into uint64
 		)
 		if err := rows.Scan(&st, &n); err != nil {
 			return nil, 0, fmt.Errorf("chquery: scanning status counts: %w", err)
 		}
 		counts[st] = int64(n)
-		total += int64(n)
 	}
-	return counts, total, nil
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("chquery: status counts: %w", err)
+	}
+
+	// One more pass for the total: the sum of the per-status distinct counts
+	// would count a delivery once per status it passed through.
+	var total uint64
+	if err := s.conn.QueryRow(ctx, `
+		SELECT uniqExact(delivery_id)
+		FROM `+chstore.Table+`
+		WHERE owner = ? AND subscription_id = ? AND ts >= ?`,
+		owner, subscriptionID, since).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("chquery: status total: %w", err)
+	}
+	return counts, int64(total), nil
 }
 
 // scanItems reads the Item rows of the grouped list queries. With withEventRef

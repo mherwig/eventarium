@@ -504,9 +504,13 @@ func parkRow(it deliveryItem, reason string) (store.InboxRow, error) {
 }
 
 // statusFor builds the status record of one delivery (section 9). It carries
-// IDs and metadata only, never a payload.
+// IDs and metadata only, never a payload. TS is stamped here rather than at
+// produce time for the same reason as the dispatcher's emitStatus: records
+// produced in one batch must not all carry the flush's millisecond (see
+// internal/chquery for how same-millisecond records are ordered).
 func statusFor(msg *delivery.Message, st, reason, connectionID string) status.Record {
 	return status.Record{
+		TS:             time.Now().UTC(),
 		Owner:          msg.Owner,
 		EventRef:       msg.EventRef,
 		DeliveryID:     msg.DeliveryID,

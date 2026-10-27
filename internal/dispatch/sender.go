@@ -230,9 +230,19 @@ func eventData(e *cloudevents.Event) []byte {
 // emitStatus sends one status transition for the item to the status topic
 // (section 9). SrcPartition/SrcOffset carry the deliveries-topic sequence, the
 // dispatcher's position of record, which matches the pubsub-seq header.
+//
+// TS is stamped here, at the transition, and not left to the producer: the
+// emitter queues records and flushes them in batches of 512 or 50 ms, and
+// status.Producer only fills a zero TS when it actually produces - so
+// in_flight and delivered of one delivery would otherwise be stamped with the
+// flush's millisecond, making the history and last_ts of a delivery say when
+// a batch went out rather than what happened. (Ordering within a shared
+// millisecond is then settled by the lifecycle rank, internal/chquery; the
+// stamp is what makes the timestamps themselves true.)
 func (d *Dispatcher) emitStatus(it *item, st, reason string, attempt uint16, code int, latency time.Duration) {
 	msg := it.msg
 	d.emitter.Emit(status.Record{
+		TS:             time.Now().UTC(),
 		Owner:          msg.Owner,
 		EventRef:       msg.EventRef,
 		DeliveryID:     msg.DeliveryID,

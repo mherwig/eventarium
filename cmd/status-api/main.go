@@ -121,8 +121,8 @@ func (a *api) delivery(w http.ResponseWriter, r *http.Request) {
 }
 
 // eventDeliveries returns one row per delivery of one event, each summarised
-// with its current status (argMax per delivery_id), ordered by delivery_id
-// (section 10, endpoint 2).
+// with its current status (the (ts, attempt, rank) latest record, see
+// internal/chquery), ordered by delivery_id (section 10, endpoint 2).
 func (a *api) eventDeliveries(w http.ResponseWriter, r *http.Request) {
 	claims, ok := a.validator.Authorize(w, r, auth.ScopeStatusRead)
 	if !ok {

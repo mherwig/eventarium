@@ -8,6 +8,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 
+	"pubsub/internal/chquery"
 	"pubsub/internal/chstore"
 )
 
@@ -22,7 +23,7 @@ type Match struct {
 	SrcPartition   int32
 	SrcOffset      int64
 	Ingested       time.Time // first status record of the delivery: "by ingestion time" (section 280)
-	CurrentStatus  string    // argMax(status, ts): what the selector judges
+	CurrentStatus  string    // newest record by chquery.LatestKeySQL: what the selector judges
 }
 
 // Resolve runs the selector of section 280 against delivery_status in one
@@ -98,8 +99,15 @@ func Resolve(ctx context.Context, conn clickhouse.Conn, owner, subscriptionID st
 			-- exact for them.
 			argMin(ds.src_partition, ds.ts) AS src_partition,
 			argMin(ds.src_offset, ds.ts)    AS src_offset,
-			min(ds.ts)                 AS ingested,
-			argMax(ds.status, ds.ts)   AS current_status
+			min(ds.ts)                      AS ingested,
+			-- current_status is the newest record by the same key the Status
+			-- API reads (internal/chquery): (ts, attempt, lifecycle rank), not
+			-- ts alone. Two transitions of one delivery routinely share a
+			-- millisecond (the status emitter flushes them together), and
+			-- argMax over ts alone then breaks the tie by row order - so a
+			-- selector for "delivered" could miss a delivery that the Status
+			-- API reports as delivered.
+			argMax(ds.status, ` + chquery.LatestKeySQL("ds.") + `) AS current_status
 		FROM ` + chstore.Table + ` AS ds
 		WHERE ` + strings.Join(where, " AND ") + `
 		GROUP BY delivery_id`
@@ -136,15 +144,16 @@ func Resolve(ctx context.Context, conn clickhouse.Conn, owner, subscriptionID st
 
 // Progress counts the current status of every delivery of one replay job, for
 // the live delivered/failed fields of GET /replays/{id} (section 11): one
-// argMax(status, ts) per delivery among the rows carrying the replay ID,
-// owner scoped as every read in this service (section 6.7). The current
-// status of a replayed delivery is exactly what the dispatcher wrote with the
-// replay ID (sections 9 and 11), so the earlier history stays invisible here.
+// latest record per delivery (chquery.LatestKeySQL, the same definition the
+// Status API reads) among the rows carrying the replay ID, owner scoped as
+// every read in this service (section 6.7). The current status of a replayed
+// delivery is exactly what the dispatcher wrote with the replay ID (sections
+// 9 and 11), so the earlier history stays invisible here.
 func Progress(ctx context.Context, conn clickhouse.Conn, owner, replayID string) (delivered, failed int64, err error) {
 	rows, err := conn.Query(ctx, `
 		SELECT current_status, count()
 		FROM (
-			SELECT argMax(status, ts) AS current_status
+			SELECT argMax(status, `+chquery.LatestKeySQL("")+`) AS current_status
 			FROM `+chstore.Table+`
 			WHERE owner = ? AND replay_id = ?
 			GROUP BY delivery_id
