@@ -102,12 +102,24 @@ func envOr(key, def string) string {
 }
 
 // NewClient builds a franz-go client with the platform defaults.
+//
+// FetchIsolationLevel(ReadCommitted) is the platform default because two
+// stages produce transactionally (section 9): the router with its group
+// transact session and the replay worker. Kafka's own default is
+// read_uncommitted, so a consumer would fetch records of a transaction that
+// later aborted. Observed in the live cluster: the router aborted its first
+// transaction and the dispatcher still delivered the rolled-back record -
+// 21 delivery records for 20 published events, only 20 of them committed.
+// The option affects fetches only; producers ignore it. Consumers of topics
+// that are never written transactionally (the event logs) are unaffected,
+// because uncommitted records do not exist there.
 func NewClient(extra ...kgo.Opt) (*kgo.Client, error) {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokerList()...),
 		kgo.ProducerLinger(2 * time.Millisecond),
 		kgo.ProducerBatchMaxBytes(4 << 20),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
 	}
 	opts = append(opts, extra...)
 	return kgo.NewClient(opts...)
