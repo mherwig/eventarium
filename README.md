@@ -80,7 +80,7 @@ live in Kafka, and both stores are read/written off that path.
 | --- | --- | --- |
 | **Kafka** | `events-<class>` (the events themselves), `deliveries` (one record per subscription per event), `delivery-status`, `sse-live`, `sse-presence` | The data plane: buffering, fan-out, ordering per key, at-least-once replay from offsets |
 | **PostgreSQL** | `event_types` + `subscriptions` (the registry, §5/§7), `inbox` (parked deliveries, §6.6), `replay_jobs` (replay job metadata, §11) | Small, transactional, mutated: CRUD with constraints, and the inbox needs ordered per-subscription scans, batched deletes and partition drop at expiry |
-| **ClickHouse** | `delivery_status`: one append-only row per status transition (`pending → sent → delivered/failed/parked`) with attempt, HTTP code, latency, reason (§9/§10) | High-volume append plus analytical reads (current status via `argMax`, counts, keyset pagination), cheap expiry via partition TTL — the shape MergeTree is built for |
+| **ClickHouse** | `delivery_status`: one append-only row per status transition (`pending → sent → delivered/failed/parked`) with attempt, HTTP code, latency, reason (§9/§10) | High-volume append plus analytical reads (current status via the `(ts, attempt, rank)` latest key, distinct-delivery counts, keyset pagination), cheap expiry via partition TTL — the shape MergeTree is built for |
 
 The status table grows with traffic × fan-out × attempts (~20k rows/s at the
 N1 rate), which is why it is not in PostgreSQL; see the load-test section for
@@ -317,12 +317,19 @@ event reference, and logs what it saw:
 ./bin/harness sse -sub <id> -owner team-a -last-event-id 7:1904 ...
 ```
 
-**Query the outcome** — the delivery's status history
-(`status:read` scope, `:8081`):
+**Query the outcome** — the delivery's status history and a per-status
+summary (`status:read` scope, `:8081`):
 
 ```sh
 T=$(./bin/minttoken -owner team-a -scopes status:read)
+
+# one row per delivery with its current status (filter: ?status=&from=&to=,
+# paging: ?limit=&cursor=)
 curl -s localhost:8081/v1/subscriptions/<id>/deliveries -H "Authorization: Bearer $T"
+
+# counts per status + total, over the last 24 h (narrow with ?since=RFC3339)
+curl -s localhost:8081/v1/subscriptions/<id>/status-summary -H "Authorization: Bearer $T"
+# → {"counts":{"delivered":40,...},"total":40}
 ```
 
 **Delivery statuses** — every transition is one append-only row in
@@ -457,10 +464,24 @@ in ClickHouse.
 
 Every transition of a delivery is one append-only row in ClickHouse
 (`delivery_status`, §9); a delivery's *current* status is the newest row for
-its ID (`argMax(status, ts)`), the older rows stay as the history. These ten
-values are the contract — defined once in `internal/status` and accepted
-verbatim by the Status API `?status=` filter, by the replay selector's
-`statuses` and by the status-summary counts:
+its ID, the older rows stay as the history. "Newest" is a three-part key —
+`(ts, attempt, lifecycle rank)` — not `ts` alone: transitions are produced in
+batches (the dispatcher flushes at most every 50 ms), so `in_flight` and
+`delivered` of one delivery routinely share a millisecond, and ordering by
+timestamp alone breaks the tie by row order, which reported every delivery as
+`in_flight`/`0` instead of `delivered`/`200`. The rank is the position of the
+status in the lifecycle table below, so a same-millisecond transition always
+loses to the one that follows it in the lifecycle. `attempt` exists to keep
+the ordering total when two rows of the same status land on the same
+millisecond (a retry).
+
+The status summary counts **distinct deliveries**, not rows: `total` is the
+number of distinct deliveries seen in the window and each status counts the
+distinct deliveries whose *current* status is that value, so the counts never
+double-count one delivery that transitioned through `pending` → `in_flight` →
+`delivered`. These ten values are the contract — defined once in
+`internal/status` and accepted verbatim by the Status API `?status=` filter,
+by the replay selector's `statuses` and by the status-summary counts:
 
 | Status | Meaning | Written by | Terminal |
 | --- | --- | --- | --- |

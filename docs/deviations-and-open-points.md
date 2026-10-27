@@ -31,7 +31,10 @@ are in [SPIKE.md](SPIKE.md); the measured results are in the
 One small *extension* appeared during load testing: the status-summary
 endpoint (§10, endpoint 4 — optional in the spec) gained an optional `since`
 parameter, because the status table is cumulative across runs and the oracle
-needed to scope counts to one run.
+needed to scope counts to one run. The counts themselves are **distinct
+deliveries**, not status rows: §10 says "counts per status" without saying
+what is counted, and rows would count one delivery once per transition it
+passed through (21 of a batch of 20, before the fix).
 
 One smaller gap on the same page: §9's "`failed` *or* `dead_lettered` —
 retries exhausted" is implemented as `dead_lettered` only. `failed` is part
@@ -244,11 +247,18 @@ Behaviours worth knowing:
   `argMin(ts)`, never `any()`: 1,965 deliveries in the dev database
   disagreed between the two before the fix. Any consumer needing the event
   position has to take the *earliest* record.
-- **Millisecond ties in `argMax(status, ts)`** make the current status
-  ambiguous when two transitions land in the same millisecond (an instant
-  410 answered before `in_flight` was written, for example). Tests need a
-  receiver `-latency`; the Status API has the same behaviour. A monotonic
-  tiebreaker would remove this platform-wide.
+- **Millisecond ties in `argMax(status, ts)`** made the current status
+  ambiguous when two transitions landed in the same millisecond (an instant
+  410 answered before `in_flight` was written, for example) — observed live
+  for 63 of the 90 deliveries in the test database, which the Status API
+  reported as `in_flight`/`http_code 0` instead of `delivered`/`200`.
+  **Fixed** by ordering on `(ts, attempt, lifecycle rank)` instead of `ts`
+  alone: the rank is the position of the status in the lifecycle, so a
+  same-millisecond transition always loses to the one that follows it. The
+  key is defined once (`chquery.LatestKeySQL`) and used by the Status API,
+  the replay selector and the replay progress counts alike, so all three
+  judge "current status" identically; `-latency` on the simulated receiver
+  is no longer what decides which status wins.
 - **A replay keeps the original delivery ID** (`event_ref/subscription_id`)
   and carries the replay ID separately (message, status records,
   `pubsub-replay-id` header) — consumers must be idempotent by event

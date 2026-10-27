@@ -124,6 +124,34 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - The delivery record and its pending status are written in one Kafka
   transaction together with the offset commit (section 9), using
   `kgo.NewGroupTransactSession`.
+- `End(TryCommit)` returns `(committed, err)` and both outcomes are handled:
+  an `err != nil` is documented as non-retryable (failed/fenced transactional
+  id, retry limit hit), so the router exits non-zero and Kubernetes restarts
+  the pod with a fresh session — continuing would consume and commit nothing
+  forever. `(false, nil)` means the transaction was aborted (offset commit
+  rejected, group rebalanced): it is logged as a warning with the batch size,
+  backed off, and re-consumed. franz-go rewinds the consumer to the last
+  committed offsets in that case, so the aborted batch is polled again —
+  observed live, where a transaction overlapping a rollout's rebalance aborted
+  this way and the batch was re-routed without duplicates.
+- Abort *reasons* come from franz-go's own logger, bridged to slog via
+  `kgo.WithLogger(kgoLogger{})`: franz-go's Info (≈8 lines per transaction:
+  begin, flush, `AddOffsetsToTxn`, end, response) is demoted to debug so the
+  default log stays two lines, warnings and errors pass through, and
+  `LOG_LEVEL=debug` turns on the full trace — where `transaction session
+  ending` carries `was_failed` and `can_try_commit`, the two fields that say
+  *why* an abort happened.
+- Every consumer of a transactionally written topic reads with
+  `read_committed`, set once in the frozen `kafkautil.NewClient`
+  (`kgo.FetchIsolationLevel(kgo.ReadCommitted())`): Kafka's default is
+  `read_uncommitted`, so a consumer would fetch records of an aborted
+  transaction. Observed live: the router's first transaction aborted and the
+  dispatcher still delivered the rolled-back record — 21 delivery records for
+  20 published events, only 20 of them committed. That covers the dispatcher,
+  status-writer, SSE gateway, backlog and replay worker; the two bare clients
+  in `internal/replay/fetch.go` re-read `events-*`, which is never written
+  transactionally, so isolation is irrelevant there (the option only affects
+  fetches anyway).
 - Ordering: one source partition is processed serially; the key of the
   delivery record is the subscription ID, so per-key order survives because one
   router instance owns the source partition.
@@ -196,8 +224,18 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 
 - The four read endpoints of section 10, owner scoped from the token (scope
   `status:read`), keyset pagination on the subscription list.
-- Current status is `argMax(status, ts)` per delivery; the history stays
-  queryable.
+- Current status is the newest row per delivery by the key
+  `(ts, attempt, lifecycle rank)` (`chquery.LatestKeySQL` in
+  `internal/chquery`): `ts` alone is not enough because transitions are
+  flushed in batches and routinely share a millisecond, so `argMax` broke the
+  tie by row order and reported `in_flight`/0 instead of `delivered`/200.
+  The history stays queryable, ordered by the same key.
+- The status summary counts **distinct deliveries**, not rows: `total` is the
+  distinct deliveries in the window and each status counts the distinct
+  deliveries whose current status is that value, so one delivery moving
+  `pending → in_flight → delivered` counts once per status it *ends* in, not
+  three times. (`COUNT(DISTINCT delivery_id)` per status; before this it was
+  a row count and reported 21/63 for a batch of 20.)
 - The status values of section 9 are defined once in `internal/status` and
   are the contract for `?status=` filtering, the replay selector and the
   status summary: `pending`, `in_flight`, `retrying`, `paused`, `sent` (SSE:
@@ -218,7 +256,8 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   (progress: persisted matched/enqueued/not_replayable plus `delivered` and
   `failed` computed live from ClickHouse by replay ID), `POST
   /v1/replays/{id}/cancel`, `GET /v1/subscriptions/{id}/replays`.
-- Selector: `statuses` (current status, `argMax` per delivery), `from`/`to`
+- Selector: `statuses` (current status, by the same `(ts, attempt, rank)`
+  latest-record key as the Status API), `from`/`to`
   (RFC3339, by ingestion time = first status record), `event_refs`. Order:
   original ingestion order (section 11). `event_types` is rejected with 400
   (section 9: status records carry no event type).
