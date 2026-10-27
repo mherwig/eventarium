@@ -105,7 +105,10 @@ func main() {
 	defer sess.Close()
 
 	health.SetReady(true)
-	run(ctx, sess, routing.New(reg))
+	if err := run(ctx, sess, routing.New(reg)); err != nil {
+		slog.Error("router: stopped", "err", err)
+		os.Exit(1)
+	}
 	slog.Info("router: stopped")
 }
 
@@ -126,20 +129,70 @@ func newSession(topics []string) (*kgo.GroupTransactSession, error) {
 		kgo.TransactionalID(fmt.Sprintf("%s-%d", host, os.Getpid())),
 		kgo.ProducerLinger(2*time.Millisecond),
 		kgo.ProducerBatchMaxBytes(4<<20),
+		// Without this, franz-go's logs are discarded and an aborted
+		// transaction is a bare "committed=false": the reason (a revoke,
+		// a failed heartbeat, an abortable offset commit) is only ever
+		// printed here. See kgoLogger.
+		kgo.WithLogger(kgoLogger{}),
 	)
+}
+
+// kgoLogger forwards franz-go's own logging to slog so that it interleaves
+// with the router's and obeys LOG_LEVEL.
+//
+// franz-go's Info is deliberately demoted to debug: it logs roughly eight
+// lines per transaction (begin, flush, AddOffsetsToTxn, end, response, ...),
+// which at a few thousand events per second is a line per small batch on
+// every replica. What stays at the default level is what an operator acts
+// on: franz-go's own warnings and errors, plus the router's warning for an
+// aborted transaction.
+//
+// The diagnostic path is LOG_LEVEL=debug, where "kgo: transaction session
+// ending" carries was_failed and can_try_commit - the reason an abort that
+// is reported to us as a plain (committed=false, err=nil) happened at all.
+// Level() mirrors that mapping because franz-go consults it before building
+// a message: it never reports Info, so those messages are never built when
+// they would only be dropped.
+type kgoLogger struct{}
+
+func (kgoLogger) Level() kgo.LogLevel {
+	ctx := context.Background()
+	switch {
+	case slog.Default().Enabled(ctx, slog.LevelDebug):
+		return kgo.LogLevelDebug
+	case slog.Default().Enabled(ctx, slog.LevelWarn):
+		return kgo.LogLevelWarn
+	default:
+		return kgo.LogLevelError
+	}
+}
+
+func (kgoLogger) Log(l kgo.LogLevel, msg string, keyvals ...any) {
+	var lvl slog.Level
+	switch l {
+	case kgo.LogLevelError:
+		lvl = slog.LevelError
+	case kgo.LogLevelWarn:
+		lvl = slog.LevelWarn
+	default: // Info and Debug both become debug; LogLevelNone never reaches us
+		lvl = slog.LevelDebug
+	}
+	slog.Log(context.Background(), lvl, "kgo: "+msg, keyvals...)
 }
 
 // run is the consume loop: poll a batch, process its records serially in
 // offset order, then commit the deliveries, the pending statuses and the
-// consumed offsets in one transaction. Errors are logged and retried after a
-// backoff; the router never exits on a transient failure.
-func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router) {
+// consumed offsets in one transaction. Transient errors (fetch, begin,
+// produce, an aborted commit) are logged and retried after a backoff; only a
+// non-retryable commit failure returns an error, which main turns into a
+// non-zero exit so the pod is restarted with a fresh session.
+func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router) error {
 	slog.Info("router: ready", "group", group)
 	backoff := errorBackoff
 	for ctx.Err() == nil {
 		fetches := sess.PollRecords(ctx, pollBatch)
 		if ctx.Err() != nil || fetches.IsClientClosed() {
-			return
+			return nil
 		}
 		// Partial fetch errors (e.g. an unreachable broker for one
 		// partition) only cost the records of that partition; the rest
@@ -151,7 +204,7 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 			if fetchErr != nil {
 				slog.Warn("router: fetch error", "err", fetchErr)
 				if !sleep(ctx, backoff) {
-					return
+					return nil
 				}
 				backoff = nextBackoff(backoff)
 			}
@@ -169,7 +222,7 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 		if err := sess.Begin(); err != nil {
 			slog.Error("router: beginning transaction", "err", err)
 			if !sleep(ctx, backoff) {
-				return
+				return nil
 			}
 			backoff = nextBackoff(backoff)
 			continue
@@ -183,25 +236,49 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 				slog.Error("router: aborting transaction", "err", err)
 			}
 			if !sleep(ctx, backoff) {
-				return
+				return nil
 			}
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		if _, err := sess.End(ctx, kgo.TryCommit); err != nil {
-			// The records were not committed: they are re-consumed
-			// after the next rebalance or restart, which the
-			// transactional produce keeps duplicate-free only for
-			// batches that actually commit. Retry after backoff.
-			slog.Error("router: committing transaction", "err", err)
+		committed, err := sess.End(ctx, kgo.TryCommit)
+		if ctx.Err() != nil {
+			return nil // shutdown mid-flush, not a failure
+		}
+		if err != nil {
+			// franz-go documents every End error as non-retryable:
+			// the transactional id is in a failed state or its retry
+			// limit was hit. Continuing to poll would consume events
+			// and commit nothing, ever - exit so Kubernetes restarts
+			// the pod with a fresh session instead.
+			return fmt.Errorf("router: committing transaction: %w", err)
+		}
+		if !committed {
+			// End aborts without an error when the group rebalanced
+			// or the offset commit was rejected. Observed live: the
+			// first transaction of every router pod on a cold
+			// cluster, while __transaction_state was still being
+			// created, came back as (false, nil) and was previously
+			// indistinguishable from success.
+			//
+			// Nothing is lost: the aborted produce is rolled back
+			// and franz-go rewinds the consumer to the last
+			// committed offsets, so this very batch is polled again
+			// and re-routed. That makes it visible here, and the
+			// backoff stops a persistently aborting batch from
+			// spinning. Downstream consumers do not see the aborted
+			// copy at all (kafkautil.NewClient is read_committed).
+			slog.Warn("router: transaction aborted, batch will be re-consumed",
+				"records", len(out), "backoff", backoff)
 			if !sleep(ctx, backoff) {
-				return
+				return nil
 			}
 			backoff = nextBackoff(backoff)
 			continue
 		}
 		backoff = errorBackoff
 	}
+	return nil
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
