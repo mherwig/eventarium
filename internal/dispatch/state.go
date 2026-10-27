@@ -10,6 +10,7 @@ import (
 	"pubsub/internal/delivery"
 	"pubsub/internal/kafkautil"
 	"pubsub/internal/status"
+	"pubsub/internal/store"
 )
 
 // item is one delivery moving through a subscription's pipeline.
@@ -46,7 +47,7 @@ type subState struct {
 	bucket      *tokenBucket // rate_limit_per_s, shared by the workers
 	drainBucket *tokenBucket // drain_rate_per_s, used while draining the inbox
 	breaker     *breaker
-	parked      parkCounter // cached inbox row count behind backlog_max
+	parked      store.ParkCounter // cached inbox row count behind backlog_max
 
 	mu         sync.Mutex
 	pauseUntil time.Time

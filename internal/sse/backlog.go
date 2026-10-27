@@ -260,6 +260,11 @@ fetch:
 		if err := g.status.Produce(actx, recs...); err != nil {
 			g.log.Warn("sse backlog: emitting status", "err", err, "subscription", subID)
 		}
+		// The cached backlog counters (parked) are deliberately not lowered
+		// here: most of these keys were never parked rows - this phase deletes
+		// them best-effort - so subtracting them would undercount the inbox by
+		// the whole backlog. The reconciliation corrects the count instead,
+		// and while this subscription has a connection nothing parks anyway.
 		if err := g.store.AckParked(actx, keys); err != nil {
 			g.log.Warn("sse backlog: deleting parked rows", "err", err, "subscription", subID)
 		}

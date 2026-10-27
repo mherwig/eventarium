@@ -107,7 +107,7 @@ func (d *Dispatcher) seedParked(ids []string, counts map[string]int64) {
 	defer d.mu.Unlock()
 	for _, id := range ids {
 		if s, ok := d.subs[id]; ok {
-			s.parked.seed(counts[id])
+			s.parked.Seed(counts[id])
 		}
 	}
 }
@@ -273,5 +273,5 @@ func (d *Dispatcher) ackRow(ctx context.Context, s *subState, row store.InboxRow
 			"subscription", row.SubscriptionID, "part", row.Part, "offset", row.Offset, "err", err)
 		return
 	}
-	s.parked.add(-1)
+	s.parked.Add(-1)
 }

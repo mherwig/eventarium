@@ -22,6 +22,13 @@ const defaultDrainRate = 100
 // drainTick is the drainer's polling interval.
 const drainTick = 500 * time.Millisecond
 
+// parkedReconcile is how often the cached inbox counts behind backlog_max are
+// refreshed from PostgreSQL (spec 16). It bounds how far a counter can drift:
+// rows the expiry sweep deleted, rows another node parked or acked - the
+// drainer is allowed to run on a different node than the delivery stage - and
+// any seed that raced a count.
+const parkedReconcile = time.Second
+
 // runDeliveryStage consumes the deliveries topic. The consumer group is
 // sse-delivery: across the group every partition of the topic is owned by
 // exactly one node, and within a node one poll batch is processed serially, so
@@ -90,14 +97,17 @@ func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 		backlogCap := g.backlogMax(subID) // backlog_max of section 7, 0 = no cap
 		var parked int64
 		if !hasConn && backlogCap > 0 {
-			counts, err := g.store.CountParked(ctx, []string{subID})
-			if err != nil {
-				// Degrade to "no cap" rather than dropping deliveries on a
-				// database hiccup.
+			// The cached count instead of a count(*) per batch: parking runs
+			// at ingestion speed while nobody is connected, and one count over
+			// a full inbox costs about 10 ms. Until the counter knows the rows
+			// it inherited there is no cap - the degradation a failed count
+			// had (warn, then park rather than drop).
+			c := g.parkedCounter(subID)
+			if err := c.Ensure(ctx, g.store, subID); err != nil {
 				g.log.Warn("sse-delivery: counting parked rows", "err", err, "subscription", subID)
 				backlogCap = 0
 			} else {
-				parked = counts[subID]
+				parked = c.Total()
 			}
 		}
 		for _, it := range items {
@@ -134,6 +144,7 @@ func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 			g.log.Error("sse-delivery: parking rows", "err", err)
 			pending = nil // offsets are committed after this batch; production would retry
 		} else {
+			g.addParked(parkRows)
 			for _, it := range pending {
 				statuses = append(statuses, statusFor(it.msg, status.Pending, "no_connection", ""))
 			}
@@ -168,6 +179,7 @@ func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 		if err := g.store.Park(ctx, fallbackRows); err != nil {
 			g.log.Error("sse-delivery: parking fallback rows", "err", err)
 		} else {
+			g.addParked(fallbackRows)
 			for _, it := range fallbackPending {
 				statuses = append(statuses, statusFor(it.msg, status.Pending, "no_connection", ""))
 			}
@@ -200,6 +212,98 @@ func (g *Gateway) runInboxExpiry(ctx context.Context) {
 			if n > 0 {
 				g.log.Info("deleted expired parked rows", "rows", n)
 			}
+		}
+	}
+}
+
+// runParkedReconcile refreshes the cached inbox counts behind backlog_max
+// (spec 16) from PostgreSQL. The delivery stage pays no count per batch
+// because of them, so something has to keep them honest: this loop. It is the
+// only writer of base besides the one-off seed of a fresh counter, which is
+// what makes a restart, a pruned state or a row parked by another node cost a
+// bounded error instead of an unbounded one.
+func (g *Gateway) runParkedReconcile(ctx context.Context) {
+	ticker := time.NewTicker(parkedReconcile)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			g.reconcileParked(ctx)
+		}
+	}
+}
+
+func (g *Gateway) reconcileParked(ctx context.Context) {
+	g.parkedMu.Lock()
+	ids := make([]string, 0, len(g.parked))
+	for id := range g.parked {
+		ids = append(ids, id)
+	}
+	g.parkedMu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	counts, err := g.store.CountParked(ctx, ids)
+	if err != nil {
+		g.log.Warn("sse-delivery: reconciling parked counts", "err", err)
+		return
+	}
+	g.seedParked(ids, counts)
+}
+
+// seedParked applies one count(*) to the counters it belongs to. A missing
+// key means zero rows: they were drained, expired or never existed. Counters
+// are not removed when they reach zero - the map is proportional to the
+// subscriptions that ever parked, and counting an empty inbox is free.
+func (g *Gateway) seedParked(ids []string, counts map[string]int64) {
+	g.parkedMu.Lock()
+	defer g.parkedMu.Unlock()
+	for _, id := range ids {
+		if c := g.parked[id]; c != nil {
+			c.Seed(counts[id])
+		}
+	}
+}
+
+// parkedCounter returns the cached count of a subscription, creating it if
+// needed; a new one seeds itself on first use.
+func (g *Gateway) parkedCounter(subID string) *store.ParkCounter {
+	g.parkedMu.Lock()
+	defer g.parkedMu.Unlock()
+	return g.counterLocked(subID)
+}
+
+func (g *Gateway) counterLocked(subID string) *store.ParkCounter {
+	c := g.parked[subID]
+	if c == nil {
+		c = &store.ParkCounter{}
+		g.parked[subID] = c
+	}
+	return c
+}
+
+// addParked credits rows that reached the inbox to the cached counts of their
+// subscriptions. It runs only after a successful batch insert: rows that were
+// never written must not be counted.
+func (g *Gateway) addParked(rows []store.InboxRow) {
+	g.parkedMu.Lock()
+	defer g.parkedMu.Unlock()
+	for _, r := range rows {
+		g.counterLocked(r.SubscriptionID).Add(1)
+	}
+}
+
+// ackParked lowers the cached counts of rows that left the inbox. A
+// subscription without a counter is left alone: it has nothing cached, and
+// the next park seeds it from a fresh count anyway.
+func (g *Gateway) ackParked(rows []store.InboxRow) {
+	g.parkedMu.Lock()
+	defer g.parkedMu.Unlock()
+	for _, r := range rows {
+		if c := g.parked[r.SubscriptionID]; c != nil {
+			c.Add(-1)
 		}
 	}
 }
@@ -304,6 +408,10 @@ func (g *Gateway) drainOnce(ctx context.Context, carry map[string]float64) {
 		if len(acked) > 0 {
 			if err := g.store.AckParked(ctx, acked); err != nil {
 				g.log.Warn("drainer: deleting parked rows", "err", err, "subscription", subID)
+			} else {
+				// Lower the cached counts so the subscription can park again
+				// without waiting for the next reconciliation.
+				g.ackParked(acked)
 			}
 		}
 		if len(statuses) > 0 {

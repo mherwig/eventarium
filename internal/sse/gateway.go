@@ -93,6 +93,16 @@ type Gateway struct {
 	conns map[string]*connection            // connection ID -> connection
 	bySub map[string]map[string]*connection // subscription ID -> connection ID -> connection
 
+	// parked caches the inbox row count per subscription behind backlog_max
+	// (spec 16), so the delivery stage does not count the inbox per batch -
+	// one count over a full inbox costs about 10 ms. Refilled by
+	// runParkedReconcile; a counter that has never been seeded counts itself
+	// on first use. Its own mutex: it is touched from the delivery stage, the
+	// drainer and the reconciler, none of which may block on connection
+	// lookups.
+	parkedMu sync.Mutex
+	parked   map[string]*store.ParkCounter
+
 	shutdown chan struct{}
 }
 
@@ -127,6 +137,7 @@ func New(opts Options) (*Gateway, error) {
 		view:     newPresenceView(),
 		conns:    map[string]*connection{},
 		bySub:    map[string]map[string]*connection{},
+		parked:   map[string]*store.ParkCounter{},
 		shutdown: make(chan struct{}),
 	}
 
@@ -216,6 +227,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 	start("delivery stage", g.runDeliveryStage)
 	start("live consumer", g.runLive)
 	start("inbox expiry", g.runInboxExpiry)
+	start("parked reconcile", g.runParkedReconcile)
 	if g.opts.Drainer {
 		start("drainer", g.runDrainer)
 	} else {
