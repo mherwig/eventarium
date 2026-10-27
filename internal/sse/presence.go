@@ -139,8 +139,10 @@ func (g *Gateway) publishPresence(ctx context.Context, c *connection, tombstone 
 	return res.FirstErr()
 }
 
-// runPresenceView consumes the presence topic from the beginning (a fresh
-// group) so that every node rebuilds the full connection map after a restart.
+// runPresenceView folds the presence topic into the in-memory view. The client
+// joins no group, so it reads every partition from the beginning and commits
+// nothing (gateway.go): the view is rebuilt from scratch on every start, and a
+// restart can never leave a connection of another node out of the map.
 func (g *Gateway) runPresenceView(ctx context.Context) {
 	for {
 		fs := g.presenceCl.PollFetches(ctx)
@@ -155,16 +157,8 @@ func (g *Gateway) runPresenceView(ctx context.Context) {
 				return
 			}
 		}
-		recs := fs.Records()
-		for _, rec := range recs {
+		for _, rec := range fs.Records() {
 			g.view.apply(string(rec.Key), rec.Value)
-		}
-		if len(recs) > 0 {
-			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := g.presenceCl.CommitRecords(cctx, recs...); err != nil {
-				g.log.Warn("presence view: committing offsets", "err", err)
-			}
-			cancel()
 		}
 	}
 }

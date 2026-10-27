@@ -83,7 +83,7 @@ type Gateway struct {
 	status      *status.Producer // delivery-status topic
 	presencePub *kgo.Client      // connect records and tombstones
 	livePub     *kgo.Client      // targeted deliveries for the gateway nodes
-	presenceCl  *kgo.Client      // group sse-presence-view
+	presenceCl  *kgo.Client      // no group: whole presence topic, from the start
 	deliveryCl  *kgo.Client      // group sse-delivery
 	liveCl      *kgo.Client      // group sse-live-<node>
 
@@ -166,13 +166,19 @@ func New(opts Options) (*Gateway, error) {
 		cleanup()
 		return nil, err
 	}
-	// The presence view rebuilds the full connection map on a fresh group, so
-	// it starts at the beginning of the compacted topic (section 6.5).
+	// The presence view is a mirror, not work to split: pick() answers with a
+	// connection on *any* node, so every gateway needs the whole topic
+	// (section 6.5). A consumer group would hand each node only its slice of
+	// the partitions - one third of the map at three replicas - and the
+	// delivery stage would park deliveries that another node could have taken.
+	// Without a group nothing is committed and nothing is shared: every node
+	// consumes all partitions itself, and because there is no committed
+	// offset to resume from, every start rebuilds the map from the beginning
+	// of the compacted topic, including connections opened on other nodes
+	// while this one was down.
 	if g.presenceCl, err = kafkautil.NewClient(
-		kgo.ConsumerGroup("sse-presence-view"),
 		kgo.ConsumeTopics(kafkautil.TopicPresence),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-		kgo.DisableAutoCommit(), // the view commits explicitly after applying a batch
 	); err != nil {
 		cleanup()
 		return nil, err
@@ -313,6 +319,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"status":        "ok",
 		"node_id":       g.opts.NodeID,
 		"connections":   n,
+		"presence":      len(g.view.subscriptions()), // connections on every node, not just this one
 		"subscriptions": g.reg.Len(),
 	})
 }
