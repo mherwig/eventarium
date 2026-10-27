@@ -1,0 +1,34 @@
+{{ include "pubsub.fullname" . }} deployed.
+
+Components ({{ .Values.replicaCount }} replicas each unless overridden):
+{{- range $name, $c := .Values.components }}
+  {{ printf "%-14s" $name }} :{{ $c.port }}  readiness {{ $c.readyPath | default "/healthz" }}  replicas {{ include "pubsub.componentReplicas" (dict "root" $ "c" $c) }}
+{{- end }}
+Config secret: {{ include "pubsub.configSecret" . }}{{ if .Values.existingSecret }} (existing){{ end }}
+Provisioning:  {{ if .Values.admin.enabled }}`admin all` runs as a pre-install/pre-upgrade hook{{ else }}disabled - run `admin all` yourself before traffic{{ end }}
+
+Watch it come up:
+
+  kubectl rollout status deploy/{{ include "pubsub.fullname" . }}-dispatcher
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Reach an API (distroless images have no shell, so port-forward instead of exec):
+
+  kubectl port-forward svc/{{ include "pubsub.fullname" . }}-publish-api 8080:8080
+  kubectl port-forward svc/{{ include "pubsub.fullname" . }}-sse-gateway 8082:8082
+
+Then mint a token in a container of the same image:
+
+  kubectl run token --rm -it --image={{ .Values.image.repository }}:{{ .Values.image.tag }} --restart=Never -- \
+    /usr/bin/minttoken -owner team-a
+
+Verify the install:
+
+  helm test {{ .Release.Name }}
+
+Notes
+- sse-gateway sets NODE_ID to the pod name, so every pod owns its own
+  `sse-live-<NODE_ID>` group. Rollouts therefore leave idle groups behind;
+  Kafka drops them after offsets retention (7 days by default).
+- The stores are single instances by design (see charts/pubsub-infra): the
+  eight services tolerate losing a node, the databases do not.

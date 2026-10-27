@@ -108,6 +108,10 @@ internal/
   routing/, dispatch/, sse/, replay/, harness/   service-internal logic
 migrations/           embedded PostgreSQL migrations
 docker-compose.yaml   Kafka (KRaft), PostgreSQL 16, ClickHouse 24.8
+Dockerfile            one distroless image containing every binary
+charts/
+  pubsub-infra/       Kafka + PostgreSQL + ClickHouse, one instance each
+  pubsub/             the eight services (3 replicas), the admin hook, PDBs
 ```
 
 ## Prerequisites
@@ -381,6 +385,49 @@ Notes that cost me time:
   filters itself and never asks the platform — and compares them with what the
   receivers recorded and what the status API reports. It exits non-zero on any
   missing or unexpected delivery.
+
+## Deploying to Kubernetes
+
+Two charts, installed in this order because the second one's hook provisions
+the platform against the first one's endpoints:
+
+```sh
+docker build -t pubsub:dev .                  # or push it and set image.repository
+
+helm upgrade --install pubsub-infra charts/pubsub-infra
+kubectl rollout status statefulset/pubsub-infra-postgres   # wait for the stores
+
+helm upgrade --install pubsub charts/pubsub
+helm test pubsub                              # reaches /healthz and /readyz in-cluster
+```
+
+`pubsub-infra` is one Kafka, one PostgreSQL, one ClickHouse — deliberately
+(see `charts/pubsub-infra/values.yaml`); growing them is failover tooling, a
+different project from this spike. `pubsub` runs **three replicas of every
+service**, which the inbox lease and the groupless presence view make safe,
+plus:
+
+- `admin all` as a `pre-install`/`pre-upgrade` hook, so topics, migrations
+  and the ClickHouse table exist before the new revision starts serving. Its
+  environment is written inline because at `pre-install` the config secret
+  does not exist yet.
+- `maxUnavailable: 0` rollouts gated by `/readyz` on the three worker
+  services, and a `PodDisruptionBudget` per component (`replicas - 1`).
+- Readiness is `/healthz` for the five APIs (that is all they expose) and
+  `/readyz` for router, dispatcher and status-writer, which fail it when
+  their database is unreachable.
+- No service account token, no writable root filesystem, no capabilities,
+  uid 65532 — nothing here talks to the Kubernetes API.
+
+Configuration is one Secret (`pubsub-config`, or `existingSecret` if you
+keep credentials elsewhere) that every pod loads with `envFrom`; keys are
+the environment variables of the table above. `HTTP_ADDR` is always set
+explicitly because the binaries disagree on their defaults.
+
+Nothing in these charts has been installed on a real cluster yet — they are
+`helm lint`-clean and validated against the Kubernetes 1.31 schemas with
+`kubeconform -strict`, including the `existingSecret`, `admin.enabled=false`
+and single-replica variants.
 
 ## Inspecting state
 

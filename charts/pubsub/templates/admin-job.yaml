@@ -1,0 +1,75 @@
+{{- if .Values.admin.enabled }}
+{{/*
+Provisioning: topics, PostgreSQL migrations, the ClickHouse table.
+
+A pre-install/pre-upgrade hook so the schema exists before a single service
+of the new revision starts - the services do not migrate on boot, and a
+router that boots against a table its migration has not created yet is a
+confusing failure to debug.
+
+The environment is written inline rather than read from the config secret:
+at pre-install time Helm has not created that secret yet (hooks run before
+the release's resources). When the operator pointed at an existing secret,
+that one is already there and is used instead.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "pubsub.fullname" . }}-admin
+  labels:
+    {{- include "pubsub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admin
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    # Keep a failed job around to read its logs; drop the successful one so
+    # upgrades do not pile up Jobs.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # admin retries internally for up to five minutes; three attempts cover a
+  # store that is still coming up right after its own chart was installed.
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "pubsub.labels" . | nindent 8 }}
+        app.kubernetes.io/component: admin
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: admin
+          image: {{ include "pubsub.componentImage" (dict "root" .) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/bin/admin", "all"]
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- else }}
+          env:
+            {{- range $key, $value := .Values.config }}
+            {{- if $value }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+          {{- end }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}

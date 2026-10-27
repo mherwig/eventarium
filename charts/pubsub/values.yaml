@@ -1,0 +1,121 @@
+# One image contains every binary (see the repository Dockerfile); a
+# deployment simply names the one it runs:
+#
+#   command: ["/usr/bin/dispatcher"]
+#
+image:
+  repository: pubsub
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Replicas for every component unless it overrides them below. Three is the
+# HA target: what Kafka splits by partition needs no coordination, and the
+# two pieces of work that are not partition-scoped (the dispatcher's inbox
+# lease, the gateway's groupless presence view) are exactly what makes this
+# number safe - see README "More than one replica".
+replicaCount: 3
+
+# Rendered into a Secret that every pod loads with envFrom. Keys are the
+# environment variable names read by internal/config.
+#
+# Point these at the pubsub-infra chart when it runs in the same cluster, or
+# at whatever else hosts the stores.
+config:
+  KAFKA_BROKERS: "pubsub-infra-kafka:9092"
+  PG_DSN: "postgres://pubsub:pubsub@pubsub-infra-postgres:5432/pubsub?sslmode=disable"
+  CH_DSN: "clickhouse://pubsub:pubsub@pubsub-infra-clickhouse:9000/pubsub"
+  JWT_SECRET: "dev-secret"
+  JWT_ISSUER: "dev"
+  JWT_AUDIENCE: "pubsub"
+  # Set in a real deployment - it turns on X-Pubsub-Signature on webhooks:
+  # WEBHOOK_SIGNING_SECRET: ""
+  # ALLOW_PRIVATE_WEBHOOKS: "0"
+
+# Use an existing secret instead of the one the chart renders (external
+# secrets, sealed secrets, ...). Its keys must match the config map above.
+existingSecret: ""
+
+# Default resources: small on purpose. None of these services buffers much
+# in memory - Kafka and the databases hold the data - so requests stay low
+# enough to fit a dozen of them on a modest node.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+# Readiness gates a rolling update, so it must check what the service
+# actually needs: /readyz exists on the three worker services and fails when
+# PostgreSQL or ClickHouse is unreachable; the APIs only offer /healthz.
+#
+# "port" is the container port and the value of HTTP_ADDR for that binary.
+# The defaults in cmd/ disagree for registry-api (it defaults to :8080), so
+# HTTP_ADDR is always set explicitly rather than inherited.
+components:
+  publish-api:
+    port: 8080
+    readyPath: /healthz
+  registry-api:
+    port: 8083
+    readyPath: /healthz
+  status-api:
+    port: 8081
+    readyPath: /healthz
+  replay-api:
+    port: 8084
+    readyPath: /healthz
+  sse-gateway:
+    port: 8082
+    readyPath: /healthz
+    # NODE_ID decides which `sse-live-<NODE_ID>` consumer group this pod owns,
+    # and it must be unique per pod - two pods sharing it would split that
+    # group's partitions and each drop the messages aimed at the other. The
+    # pod name guarantees that; the binary's own fallback (hostname) happens
+    # to be the same thing, but saying it here keeps it true if the pod
+    # template ever gains a custom hostname.
+    extraEnv:
+      - name: NODE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+    # SSE connections have to finish their shutdown (tombstones, parked
+    # rows) before the pod disappears.
+    terminationGracePeriodSeconds: 60
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+  router:
+    port: 8085
+    readyPath: /readyz
+  dispatcher:
+    port: 8086
+    readyPath: /readyz
+    # Holds the inbox lease; shutdown releases it immediately, but a batch of
+    # deliveries in flight should be allowed to finish or park first.
+    terminationGracePeriodSeconds: 45
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+  status-writer:
+    port: 8087
+    readyPath: /readyz
+
+# The provisioning job: Kafka topics, PostgreSQL migrations, the ClickHouse
+# table. It runs as a pre-install/pre-upgrade hook, which is why its
+# environment is written inline - at pre-install time the config secret does
+# not exist yet.
+admin:
+  enabled: true
+
+# Service type for every component. ClusterIP plus `kubectl port-forward` is
+# the default; switch sse-gateway (or all of them) to LoadBalancer/NodePort
+# when something outside the cluster has to reach them.
+service:
+  type: ClusterIP

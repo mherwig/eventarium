@@ -1,0 +1,22 @@
+pubsub-infra installed: one Kafka, one PostgreSQL, one ClickHouse.
+
+  Kafka       {{ include "pubsub-infra.kafkaService" . }}:9092   (KRaft, single node)
+  PostgreSQL  {{ include "pubsub-infra.postgresService" . }}:5432
+  ClickHouse  {{ include "pubsub-infra.clickhouseService" . }}:8123 (HTTP) / :9000 (native)
+
+Check they are up:
+
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl port-forward svc/{{ include "pubsub-infra.postgresService" . }} 5432:5432
+
+These are single instances by design (values.yaml): the application layer runs
+three replicas of every component, the stores do not - they are the remaining
+single points of failure.
+
+Next: install the app chart, which runs `admin all` (topics, migrations,
+ClickHouse table) as a hook before the services start.
+
+  helm upgrade --install pubsub charts/pubsub \
+    --set config.KAFKA_BROKERS={{ include "pubsub-infra.kafkaService" . }}:9092 \
+    --set config.PG_DSN=postgres://{{ .Values.postgres.username }}:PASSWORD@{{ include "pubsub-infra.postgresService" . }}:5432/{{ .Values.postgres.database }}?sslmode=disable \
+    --set config.CH_DSN=clickhouse://{{ .Values.clickhouse.username }}:PASSWORD@{{ include "pubsub-infra.clickhouseService" . }}:9000/{{ .Values.clickhouse.database }}

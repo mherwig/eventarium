@@ -1,0 +1,95 @@
+{{- $root := . }}
+{{- range $name, $c := .Values.components }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pubsub.fullname" $root }}-{{ $name }}
+  labels:
+    {{- include "pubsub.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: {{ include "pubsub.componentReplicas" (dict "root" $root "c" $c) }}
+  # Never take a replica out of service while another is still starting:
+  # with three pods maxUnavailable 0 keeps two serving at all times, and the
+  # readiness gate (/readyz on the workers) keeps a pod that cannot reach
+  # PostgreSQL or ClickHouse out of the endpoint list instead of receiving
+  # traffic it would only fail.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "pubsub.componentSelectorLabels" (dict "root" $root "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pubsub.componentSelectorLabels" (dict "root" $root "name" $name) | nindent 8 }}
+      annotations:
+        {{- if not $root.Values.existingSecret }}
+        # Rolling restart when the configuration changes: env is only read
+        # when a container starts, so a changed secret would otherwise apply
+        # to nobody until the next unrelated deploy.
+        checksum/config: {{ toYaml $root.Values.config | sha256sum }}
+        {{- end }}
+    spec:
+      # Nothing here talks to the Kubernetes API - the services discover
+      # their stores through DNS and their own configuration.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ $c.terminationGracePeriodSeconds | default 30 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ $name }}
+          image: {{ include "pubsub.componentImage" (dict "root" $root) | quote }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          # The image carries every binary; the deployment names the one it
+          # wants. Absolute path, because distroless has no shell to resolve
+          # a bare name.
+          command: ["/usr/bin/{{ $name }}"]
+          ports:
+            - name: http
+              containerPort: {{ $c.port }}
+          env:
+            # Always explicit: the binaries disagree on their defaults
+            # (registry-api falls back to :8080) and a probe has to know the
+            # port it is hitting.
+            - name: HTTP_ADDR
+              value: ":{{ $c.port }}"
+            {{- with $c.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "pubsub.configSecret" $root }}
+          resources:
+            {{- include "pubsub.componentResources" (dict "root" $root "c" $c) | nindent 12 }}
+          livenessProbe:
+            # /healthz answers while the stores are down, by design: a
+            # consumer must not be restarted because PostgreSQL had a bad
+            # minute, that only disturbs the consumer groups.
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: {{ $c.readyPath | default "/healthz" }}
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}

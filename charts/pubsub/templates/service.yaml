@@ -1,0 +1,22 @@
+{{- $root := . }}
+{{- range $name, $c := .Values.components }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pubsub.fullname" $root }}-{{ $name }}
+  labels:
+    {{- include "pubsub.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  # A Service per component even for the three that serve no traffic:
+  # distroless images have no shell, so `kubectl exec` is not an option and
+  # a ClusterIP is how you reach /healthz from outside the pod.
+  type: {{ $c.serviceType | default $root.Values.service.type }}
+  selector:
+    {{- include "pubsub.componentSelectorLabels" (dict "root" $root "name" $name) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $c.servicePort | default $c.port }}
+      targetPort: http
+{{- end }}

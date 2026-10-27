@@ -1,0 +1,22 @@
+{{- $root := . }}
+{{- range $name, $c := .Values.components }}
+{{- $replicas := int (include "pubsub.componentReplicas" (dict "root" $root "c" $c)) }}
+{{- if ge $replicas 2 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pubsub.fullname" $root }}-{{ $name }}
+  labels:
+    {{- include "pubsub.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  # One replica may be taken away at a time - a node drain, a `kubectl
+  # drain`, an upgrade of the cluster itself - so the HA target survives
+  # every voluntary disruption, not just crashes.
+  minAvailable: {{ sub $replicas 1 }}
+  selector:
+    matchLabels:
+      {{- include "pubsub.componentSelectorLabels" (dict "root" $root "name" $name) | nindent 6 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,61 @@
+# One instance of every store, deliberately.
+#
+# The application layer runs three replicas of each component (see the
+# pubsub chart); the stores do not. Kafka, PostgreSQL and ClickHouse are
+# single StatefulSets here, which makes them the remaining single points of
+# failure - documented, not accidental. Growing them is a matter of
+# replication factor (Kafka) and failover tooling (the databases), which is
+# a different project from this spike.
+
+nameOverride: ""
+
+kafka:
+  image:
+    repository: apache/kafka
+    tag: "3.9.0"
+    pullPolicy: IfNotPresent
+  # Single-node KRaft: this node is broker and controller at once.
+  storage: 20Gi
+  storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+postgres:
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  username: pubsub
+  # Development default. Override on install (--set postgres.password=...)
+  # or point the app chart at an existing secret.
+  password: pubsub
+  database: pubsub
+  storage: 10Gi
+  storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+clickhouse:
+  image:
+    repository: clickhouse/clickhouse-server
+    tag: "24.8"
+    pullPolicy: IfNotPresent
+  username: pubsub
+  password: pubsub
+  database: pubsub
+  storage: 20Gi
+  storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: pubsub-infra
+description: >
+  Kafka, PostgreSQL and ClickHouse for the event platform spike - one
+  instance of each, hand-rolled so it matches the compose stack the spike
+  was verified against.
+type: application
+version: 0.1.0
+appVersion: "3.9.0"

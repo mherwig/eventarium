@@ -1,0 +1,9 @@
+apiVersion: v2
+name: pubsub
+description: >
+  The event platform itself: eight services, three replicas each, plus the
+  admin job that provisions Kafka topics, the PostgreSQL schema and the
+  ClickHouse table.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
