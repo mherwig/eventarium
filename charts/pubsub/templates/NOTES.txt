@@ -17,9 +17,22 @@ Reach an API (distroless images have no shell, so port-forward instead of exec):
   kubectl port-forward svc/{{ include "pubsub.fullname" . }}-publish-api 8080:8080
   kubectl port-forward svc/{{ include "pubsub.fullname" . }}-sse-gateway 8082:8082
 
-Then mint a token in a container of the same image:
+Then mint a token in a container of the same image. minttoken has no
+defaults for the JWT settings and panics without them, so pass the same
+values the services got. kubectl run spells it --env - there is no -e:
 
-  kubectl run token --rm -it --image={{ .Values.image.repository }}:{{ .Values.image.tag }} --restart=Never -- \
+{{- if .Values.existingSecret }}
+
+  # the three JWT_* values live in {{ .Values.existingSecret }} - read them
+  # there, .Values.config is not what the pods got
+{{- end }}
+
+  kubectl run token --rm -i --image={{ .Values.image.repository }}:{{ .Values.image.tag }} --restart=Never -- \
+{{- if .Values.existingSecret }}
+    --env=JWT_SECRET=<from your secret> --env=JWT_ISSUER=<from your secret> --env=JWT_AUDIENCE=<from your secret> -- \
+{{- else }}
+    --env=JWT_SECRET={{ .Values.config.JWT_SECRET | quote }} --env=JWT_ISSUER={{ .Values.config.JWT_ISSUER | quote }} --env=JWT_AUDIENCE={{ .Values.config.JWT_AUDIENCE | quote }} -- \
+{{- end }}
     /usr/bin/minttoken -owner team-a
 
 Verify the install:
