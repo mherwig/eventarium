@@ -128,6 +128,27 @@ type publishResult struct {
 	EventType      string `json:"event_type"`
 	RetentionClass string `json:"retention_class"`
 	ExpiresAt      string `json:"expires_at"`
+	// Warning is absent unless nothing will be delivered (see
+	// noSubscriberWarning). The normal response is therefore unchanged.
+	Warning string `json:"warning,omitempty"`
+}
+
+// noSubscriberWarning tells a publisher that an event type nobody is
+// subscribed to was accepted: it will be stored and routed to nothing, which
+// is otherwise only visible later, as an absent delivery.
+//
+// The check is the registry the publish API already holds for the 422 of an
+// unknown event type, so it is advisory - a snapshot that is refreshed on
+// change - and it counts *candidates*, subscriptions registered for the type.
+// It cannot say how many will pass their CEL filters; that answer lands in the
+// status store as `filtered` a moment later, once the router has seen the
+// event. Reporting a candidate count would read as a delivery forecast, so
+// only the actionable case, zero, is reported at all.
+func noSubscriberWarning(reg *registry.Registry, owner, eventType string) string {
+	if len(reg.Match(owner, eventType)) > 0 {
+		return ""
+	}
+	return fmt.Sprintf("no subscription is registered for event type %q: the event is accepted and stored, but nothing will be delivered", eventType)
 }
 
 // handleEvents implements POST /v1/events: one event in binary or structured
@@ -201,6 +222,7 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 			EventType:      e.Type,
 			RetentionClass: et.RetentionClass,
 			ExpiresAt:      expiresAt.Format(time.RFC3339),
+			Warning:        noSubscriberWarning(a.registry, owner, e.Type),
 		})
 	}
 
