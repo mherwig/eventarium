@@ -252,6 +252,26 @@ curl -s -X POST localhost:8080/v1/events -H "Authorization: Bearer $T" \
   -d '{"order_id":"o-1","total":99.9,"internal":"secret"}'
 ```
 
+A `201` means *accepted into the event log*, not *will be delivered* — and an
+event type nobody subscribes to would otherwise be accepted silently and
+routed to nothing. So when the registry knows **zero** subscriptions for the
+event's type, the response carries an extra advisory field (absent otherwise,
+so the normal `201` is unchanged):
+
+```json
+{"event_ref":"94453d07-...","event_type":"track.empty","retention_class":"short",
+ "expires_at":"2026-10-29T22:23:35Z",
+ "warning":"no subscription is registered for event type \"track.empty\": the event is accepted and stored, but nothing will be delivered"}
+```
+
+It is a warning, never an error: a subscription can be created a second later,
+and `422 unknown event type` already rejects the typo case. Note what it does
+*not* report — the number of subscriptions. That count would be a **candidate**
+count (publish does not evaluate CEL filters), so `"subscriptions": 5` could
+still mean zero deliveries; it would read as a delivery forecast. The per-event
+answer to "did the filter accept it?" lands in the status store a moment later
+as [`filtered`](#delivery-statuses).
+
 The publish API caches the registry, and so do the router, dispatcher and SSE
 gateway. Creating an event type or subscription fires a trigger (migration
 003) on `event_types`/`subscriptions`, every service LISTENs for it and
@@ -338,7 +358,7 @@ curl -s localhost:8081/v1/subscriptions/<id>/status-summary -H "Authorization: B
 ```
 
 **Delivery statuses** — every transition is one append-only row in
-ClickHouse; the complete list of the ten values, who writes them and which
+ClickHouse; the complete list of the eleven values, who writes them and which
 are terminal is in [Delivery statuses](#delivery-statuses) below.
 
 **Replay deliveries** — resend what a subscription already matched, selected
@@ -362,9 +382,13 @@ curl -s localhost:8084/v1/subscriptions/<id>/replays -H "Authorization: Bearer $
 
 The selector takes `statuses` (current status: `delivered`, `dead_lettered`,
 `dropped`, `failed`, … — the full list is in
-[Delivery statuses](#delivery-statuses)), `from`/`to` (RFC3339, by ingestion
-time) and `event_refs` — at least one. `"dry_run": true` reports `matched` and
-`not_replayable` without enqueuing anything. Replayed events keep their event
+[Delivery statuses](#delivery-statuses); `filtered` is rejected with a 400,
+because a filtered event never became a delivery), `from`/`to` (RFC3339, by
+ingestion time) and `event_refs` — at least one. Time-range and `event_refs`
+selectors never pick up `filtered` rows either; `replay.Resolve` excludes them
+unconditionally, since a replay re-applies the projection but not the filter.
+`"dry_run": true` reports `matched` and `not_replayable` without enqueuing
+anything. Replayed events keep their event
 reference, are flagged as a replay on the wire (`pubsub-replay-id` header,
 `"replay":true` in the SSE payload), travel the normal delivery path (rate
 limits, breaker, delivery mode) and must be handled idempotently by the
@@ -482,11 +506,18 @@ millisecond (a retry).
 
 The status summary counts **distinct deliveries**, not rows: `total` is the
 number of distinct deliveries seen in the window and each status counts the
-distinct deliveries whose *current* status is that value, so the counts never
-double-count one delivery that transitioned through `pending` → `in_flight` →
-`delivered`. These ten values are the contract — defined once in
-`internal/status` and accepted verbatim by the Status API `?status=` filter,
-by the replay selector's `statuses` and by the status-summary counts:
+distinct deliveries that were *seen in* that status within the window. A
+delivery that transitioned through `pending` → `in_flight` → `delivered` is
+therefore counted under all three — the counts may sum to more than `total`.
+What never happens is counting one delivery twice *within* one status: a
+delivery with a dozen status rows still contributes at most 1 to each bucket,
+which is exactly the mistake `total` exists to rule out (it was a plain row
+count once, and reported 21 for a batch of 20).
+
+These eleven values are the contract — defined once in `internal/status` and
+accepted verbatim by the Status API `?status=` filter, by the replay
+selector's `statuses` (except `filtered`, see below) and by the status-summary
+counts:
 
 | Status | Meaning | Written by | Terminal |
 | --- | --- | --- | --- |
@@ -500,6 +531,28 @@ by the replay selector's `statuses` and by the status-summary counts:
 | `dropped` | Discarded on purpose: inbox overflow (`backlog_max`), full queue of a live-class delivery (`queue_full`), retries exhausted while live (`max_attempts`), live-class with no connection (`live_class`), unknown subscription (`unknown_subscription`), inbox write failed (`park_failed`) | dispatcher, SSE gateway | ✓ |
 | `expired` | `expires_at` passed before the delivery went out | dispatcher, SSE gateway | ✓ |
 | `failed` | Reserved by the spec ("failed *or* dead_lettered"); **no emitter writes it in the spike** — exhausted retries become `dead_lettered`, so every filter accepts the value but it never appears in the data | – | ✓ |
+| `filtered` | The router's verdict for a subscription that was a *candidate* for the event's type but whose filter rejected it (§6.2): `reason` is `filter_mismatch` (filter said no) or `filter_error` (the CEL could not be evaluated, which counts as a non-match too). **No delivery exists** — the row carries the `delivery_id` that delivery *would* have had (`event_ref/subscription_id`), so it lists and counts like any other row. Extension beyond §9, which only describes the statuses of a delivery | router | ✓ |
+
+`filtered` is the trace for a silent case: before it, a subscription whose
+filter matched nothing left **no** record anywhere — no delivery, no status,
+not even a log line — so "why did this never arrive" could only be answered by
+re-running the filter by hand. Note the deliberate boundary: an event with **no
+subscription at all** for its type gets no status (there is no subscription ID
+to attach one to); instead the *publish* response carries a `warning` (see
+above), because that is the only place the mistake is visible at the source.
+
+Because a `filtered` row is not a delivery, the replay selector rejects
+`"statuses":["filtered"]` with a 400 (`status "filtered" cannot be replayed:
+the filter rejected this event, so no delivery ever existed for it`) — a replay
+re-applies the projection but **not** the filter, so replaying one would
+deliver exactly what the filter said no to. Time-range and `event_refs`
+selectors exclude these rows too, unconditionally, in `replay.Resolve`.
+
+`filtered` rows *are* counted in `status-summary` (in their own bucket and in
+`total`, which is the number of distinct delivery IDs seen in the window): a
+subscription whose filter rejected every event reports `total` equal to the
+number of rejected events, all of it under `counts.filtered` — which is the
+point of the row.
 
 The record also carries `reason`, `attempt`, `http_code`, `latency_ms`,
 `connection_id`, the replay ID and the event's retention class — never a

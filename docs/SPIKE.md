@@ -66,7 +66,12 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   inbox payload) and `Seq{Partition, Offset}`.
 - `internal/status` – `Record` and `Producer` for the status topic. Status
   constants: pending, in_flight, retrying, delivered, sent, failed,
-  dead_lettered, paused, expired, dropped.
+  dead_lettered, paused, expired, dropped, **filtered**. `filtered` is an
+  approved change to this frozen package: the router's verdict
+  for a candidate subscription whose filter rejected the event — no delivery
+  exists, so the record carries the delivery ID that would have been. It is
+  appended to the constant list, never inserted, because the list's order is
+  the lifecycle rank every query uses to pick the latest record.
 - `internal/registry` – `EventType`, `Subscription`, `Entry` (subscription with
   compiled filters) and the in-memory `Registry` refreshed from PostgreSQL.
   Spike deviation: the registry reads PostgreSQL instead of a compacted config
@@ -108,6 +113,13 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - Writes to `events-<class>` with the headers above; responds 201 with
   `{"event_ref": ..., "retention_class": ..., "expires_at": ...}` (a list for
   batches). Republishing is allowed and creates a new reference (F19).
+  When the registry holds **no** subscription for the event's type, the entry
+  also carries an advisory `"warning"` naming the type: the event is accepted
+  and stored, but nothing will be delivered. Absent otherwise, so the normal
+  response is unchanged; it is never an error (a subscription may be created a
+  moment later). The subscription *count* is deliberately not reported — it
+  would be a candidate count that ignores CEL filters and would read like a
+  delivery forecast.
 - `GET /healthz` – no auth.
 
 ### registry-api (port 8080)
@@ -127,7 +139,12 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   attribute filter and the JSON data filter, compute the ordering key before
   projection, apply the projection, then produce one delivery record per
   matching subscription keyed by subscription ID, plus one pending
-  `status.Record`.
+  `status.Record`. A candidate subscription whose filter rejects the event (or
+  whose CEL fails to evaluate, which counts as a non-match) produces **no**
+  delivery but one `status.Record` with status `filtered`, reason
+  `filter_mismatch`/`filter_error`, carrying the delivery ID that would have
+  been. An event type with no subscription at all produces nothing — that case
+  is reported by publish-api as a `warning` on the 201 instead.
 - The delivery record and its pending status are written in one Kafka
   transaction together with the offset commit (section 9), using
   `kgo.NewGroupTransactSession`.
@@ -239,20 +256,28 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   The history stays queryable, ordered by the same key.
 - The status summary counts **distinct deliveries**, not rows: `total` is the
   distinct deliveries in the window and each status counts the distinct
-  deliveries whose current status is that value, so one delivery moving
-  `pending → in_flight → delivered` counts once per status it *ends* in, not
-  three times. (`COUNT(DISTINCT delivery_id)` per status; before this it was
-  a row count and reported 21/63 for a batch of 20.)
+  deliveries seen in that status within the window, so one delivery moving
+  `pending → in_flight → delivered` is counted under each of the three — the
+  counts may sum to more than `total`, one delivery is just never counted
+  twice *within* one status. (`COUNT(DISTINCT delivery_id)` per `GROUP BY
+  status`; before this it was a row count and reported 21/63 for a batch of
+  20.)
 - The status values of section 9 are defined once in `internal/status` and
   are the contract for `?status=` filtering, the replay selector and the
   status summary: `pending`, `in_flight`, `retrying`, `paused`, `sent` (SSE:
   written, not acknowledged), `delivered`, `dead_lettered`, `dropped`,
-  `expired`, `failed`. Terminal: `delivered`, `dead_lettered`, `dropped`,
-  `expired`, `failed`. `failed` is reserved by the spec ("failed or
+  `expired`, `failed`, plus the extension `filtered`. Terminal:
+  `delivered`, `dead_lettered`, `dropped`, `expired`, `failed`,
+  `filtered`. `failed` is reserved by the spec ("failed or
   dead_lettered") but no emitter writes it — exhausted retries become
   `dead_lettered` — so it is accepted by every filter and never present in
-  the data. The Status API does not validate `?status=` (an unknown value
-  simply matches no rows); the replay selector rejects one with a 400.
+  the data. `filtered` is written by the router for an event the filter
+  rejected: it has no delivery, but carries the delivery ID that would have
+  been, and is therefore *not* replayable — the replay selector rejects it
+  with a 400 and `replay.Resolve` excludes such rows from every selector.
+  The Status API does not validate `?status=` (an unknown value
+  simply matches no rows); the replay selector rejects an unknown one with a
+  400.
 
 ### replay-api (port 8084)
 

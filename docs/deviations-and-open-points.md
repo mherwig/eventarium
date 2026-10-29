@@ -49,8 +49,27 @@ One smaller gap on the same page: §9's "`failed` *or* `dead_lettered` —
 retries exhausted" is implemented as `dead_lettered` only. `failed` is part
 of the contract (the Status API filter and the replay selector both accept
 it) but the dispatcher never writes it, so it never appears in the data. All
-ten status values are documented in the
+eleven status values are documented in the
 [README](../README.md#delivery-statuses).
+
+A second *extension* is the `filtered` status (it required a new constant in
+the frozen `internal/status` — approved for this feature). §9 describes the
+statuses of a **delivery**, but a candidate subscription whose filter rejects
+an event gets no delivery at all, and before this the router's `continue` left
+no trace of it anywhere: no row, no log line, no counter. Now the router
+writes one `filtered` row (reason `filter_mismatch`, or `filter_error` when
+the CEL itself failed to evaluate) carrying the `delivery_id` that delivery
+*would* have had, so the case is queryable with the existing Status API,
+appears as a zero-able bucket in the status summary, and `terminal` from the
+start. Two boundaries are deliberate: an event with **no subscription at all**
+for its type gets no status row (there is no subscription ID to hang one on —
+publish-api reports that case as an advisory `warning` on the 201 instead),
+and `filtered` is **not replayable** — the replay selector answers 400 and
+`replay.Resolve` drops such rows from every selector, because a replay
+re-applies the projection but never the filter and would otherwise deliver
+exactly what the filter rejected. It is a per-event row, so its volume scales
+with the number of candidate subscriptions per event type; the spec's own
+figure of a few hundred filter evaluations per event bounds it.
 
 ## Open points — answered by the spike
 
@@ -247,6 +266,14 @@ ingestion order. Test runs against subscription `d3df8fd9` (webhook,
    `matched=2, enqueued=0, not_replayable=2`.
 7. **Cancel of a running job** — stopped exactly at a batch boundary:
    `matched=601, enqueued=400` (two batches of 200), 400 receipts.
+8. **`filtered` is never replayed** — `statuses:["filtered"]` → 400 with a
+   message that says why (`… the filter rejected this event, so no delivery
+   ever existed for it`), and, more importantly, a time-range or
+   `event_refs` selector (neither names a status) matched **0** for a
+   subscription whose only rows were `filtered` — before `Resolve` excluded
+   them it matched 2 and would have re-delivered both rejected events. A
+   time-range selector over the same window on a subscription with real
+   deliveries still matched 2, so the exclusion is surgical.
 
 Behaviours worth knowing:
 
