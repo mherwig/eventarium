@@ -56,9 +56,11 @@ func main() {
 	}
 	defer st.Close()
 
-	// The registry reads the control data through the store interface; the
-	// poller keeps the index fresh after event type changes (section 6.1).
-	reg := registry.New(st, 2*time.Second)
+	// The registry reads the control data through the store interface. The
+	// NOTIFY trigger (migration 003) refreshes the index within milliseconds
+	// of an event type or subscription changing; REGISTRY_POLL is the safety
+	// net for notifications missed while the listener was down (section 6.1).
+	reg := registry.New(st, config.Duration("REGISTRY_POLL", 2*time.Second), registry.WithNotify(dsn))
 	if err := reg.Reload(ctx); err != nil {
 		slog.Warn("initial registry load failed", "err", err)
 	}

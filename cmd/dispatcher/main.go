@@ -51,9 +51,10 @@ func main() {
 	}
 	defer producer.Close()
 
-	// Spike deviation per docs/SPIKE.md: the registry polls PostgreSQL; the
-	// dispatcher wants a fresh policy, so poll every second.
-	reg := registry.New(st, time.Second)
+	// Spike deviation per docs/SPIKE.md: the registry reads PostgreSQL, and a
+	// NOTIFY from migration 003 refreshes the policy the moment it changes.
+	// REGISTRY_POLL (one second by default) is the safety net underneath.
+	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn))
 	go reg.Run(ctx)
 
 	// Daily inbox partitions exist before the first park (spec 6.6).

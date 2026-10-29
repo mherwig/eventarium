@@ -48,7 +48,6 @@ import (
 const (
 	group           = "router"
 	pollBatch       = 500
-	registryEvery   = time.Second
 	errorBackoff    = time.Second
 	maxErrorBackoff = 30 * time.Second
 )
@@ -58,9 +57,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Control data: the registry polls PostgreSQL (spike deviation from the
-	// compacted config topic of section 6.1, see docs/SPIKE.md).
-	st, err := store.Open(ctx, config.Str("PG_DSN", "postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable"))
+	// Control data: the registry reads PostgreSQL (spike deviation from the
+	// compacted config topic of section 6.1, see docs/SPIKE.md); a NOTIFY from
+	// the trigger of migration 003 refreshes it, the poll is the safety net.
+	dsn := config.Str("PG_DSN", "postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable")
+	st, err := store.Open(ctx, dsn)
 	if err != nil {
 		slog.Error("router: opening store", "err", err)
 		os.Exit(1)
@@ -74,7 +75,9 @@ func main() {
 	// match anything for.
 	health := httpx.NewHealth(func(ctx context.Context) error { return st.Pool.Ping(ctx) })
 	go health.Serve(ctx, config.Str("HTTP_ADDR", ":8085"))
-	reg := registry.New(st, registryEvery)
+	// REGISTRY_POLL is only the safety net: the NOTIFY trigger of migration
+	// 003 wakes the registry the moment a subscription changes.
+	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn))
 
 	// Do not join the group before the first successful reload: otherwise
 	// events consumed while the index is empty would be committed without

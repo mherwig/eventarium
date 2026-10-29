@@ -149,7 +149,9 @@ func New(opts Options) (*Gateway, error) {
 	if g.store, err = store.Open(ctx, opts.PGDSN); err != nil {
 		return nil, err
 	}
-	g.reg = registry.New(g.store, opts.RegistryPoll)
+	// The NOTIFY listener (migration 003) is what makes a subscription created
+	// just now reachable without waiting out the poll interval.
+	g.reg = registry.New(g.store, opts.RegistryPoll, registry.WithNotify(opts.PGDSN))
 	if g.auth, err = auth.NewHMAC(opts.JWTSecret, opts.JWTIssuer, opts.JWTAudience); err != nil {
 		cleanup()
 		return nil, err

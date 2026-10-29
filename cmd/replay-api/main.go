@@ -53,7 +53,8 @@ func main() {
 	// Control data: the replay_jobs table (migration 002) plus the
 	// subscription registry. migrations.Apply is idempotent, the same call
 	// registry-api makes, so whichever service starts first provisions it.
-	st, err := store.Open(ctx, config.Str("PG_DSN", defaultPGDSN))
+	dsn := config.Str("PG_DSN", defaultPGDSN)
+	st, err := store.Open(ctx, dsn)
 	if err != nil {
 		slog.Error("replay-api: opening store", "err", err)
 		os.Exit(1)
@@ -84,7 +85,7 @@ func main() {
 	// The subscription registry is the existence and ownership oracle for the
 	// API and the source of the *current* projection for the worker (spike
 	// deviation of section 6.1, refreshed from PostgreSQL).
-	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second))
+	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn))
 	for {
 		if err := reg.Reload(ctx); err == nil {
 			break

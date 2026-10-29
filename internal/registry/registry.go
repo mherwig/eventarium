@@ -4,7 +4,10 @@
 //
 // Spike deviation from section 6.1: the index is refreshed from PostgreSQL
 // instead of a compacted Kafka config topic. The interface stays the same, so
-// only the source changes later.
+// only the source changes later. Two mechanisms keep it fresh: a poll (the
+// safety net, see interval) and, when WithNotify is used, a PostgreSQL
+// LISTEN/NOTIFY connection woken by the trigger of migration 003 (the fast
+// path).
 package registry
 
 import (
@@ -14,7 +17,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"pubsub/internal/filter"
+)
+
+// NotifyChannel is the PostgreSQL notification channel the trigger of
+// migration 003 writes to, and ListenAppName is the application_name the
+// listener connection identifies itself with in pg_stat_activity.
+const (
+	NotifyChannel     = "registry_changed"
+	ListenAppName     = "pubsub-registry-listen"
+	listenBackoff0    = 500 * time.Millisecond
+	listenBackoffMax  = 30 * time.Second
+	listenStableAfter = time.Minute
 )
 
 // EventType is one registered CloudEvents type (section 6.1).
@@ -73,10 +89,14 @@ type Source interface {
 }
 
 // Registry is the in-memory index: owner+type to subscriptions, plus a lookup
-// by owner and type. It is refreshed on a ticker and safe for concurrent use.
+// by owner and type. It is refreshed on a ticker, optionally woken by a
+// notification, and safe for concurrent use.
 type Registry struct {
-	source   Source
-	interval time.Duration
+	source    Source
+	interval  time.Duration
+	notifyDSN string
+
+	reloadMu sync.Mutex // serialises the ticker and the listener's Reload
 
 	mu      sync.RWMutex
 	types   map[string]EventType // owner + "\x00" + name
@@ -86,12 +106,32 @@ type Registry struct {
 	loaded  time.Time
 }
 
+// Option configures a Registry.
+type Option func(*Registry)
+
+// WithNotify wakes the registry on change: it keeps one dedicated connection
+// (never a pooled one - a pooled connection would hand "config changed" to
+// whatever query acquired it next) in LISTEN on NotifyChannel and reloads as
+// soon as a control table is written. Where the poll bounds staleness by an
+// interval, this bounds it by the notification round trip: milliseconds.
+//
+// The notification is best effort by nature. PostgreSQL only delivers it to
+// listeners that are connected when the writing transaction commits and never
+// replays it, so Run keeps polling and reloads once on every (re)connect to
+// close any gap. A listener that is down for an hour therefore costs one
+// reload on reconnect, not an hour of staleness.
+//
+// The DSN is used verbatim; an empty one disables the listener.
+func WithNotify(dsn string) Option {
+	return func(r *Registry) { r.notifyDSN = dsn }
+}
+
 // New builds a registry over a source, refreshed at the given interval.
-func New(source Source, interval time.Duration) *Registry {
+func New(source Source, interval time.Duration, opts ...Option) *Registry {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
-	return &Registry{
+	r := &Registry{
 		source:   source,
 		interval: interval,
 		types:    map[string]EventType{},
@@ -99,10 +139,18 @@ func New(source Source, interval time.Duration) *Registry {
 		byID:     map[string]*Entry{},
 		invalid:  map[string]string{},
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
-// Run reloads until the context is cancelled.
+// Run reloads until the context is cancelled. With WithNotify a listener runs
+// beside the ticker; it is the fast path, the ticker stays the safety net.
 func (r *Registry) Run(ctx context.Context) {
+	if r.notifyDSN != "" {
+		go r.listen(ctx)
+	}
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 	for {
@@ -117,8 +165,82 @@ func (r *Registry) Run(ctx context.Context) {
 	}
 }
 
+// listen reconnects until the context is cancelled, with a capped backoff that
+// resets once a connection has proven stable: a PostgreSQL restart must not
+// turn into a reconnect storm, and a listener that has been up for a while
+// starts over from the short delay.
+func (r *Registry) listen(ctx context.Context) {
+	backoff := listenBackoff0
+	for ctx.Err() == nil {
+		started := time.Now()
+		if err := r.listenOnce(ctx); ctx.Err() != nil {
+			return
+		} else if err != nil {
+			slog.Warn("registry listener disconnected", "err", err)
+		}
+		if time.Since(started) > listenStableAfter {
+			backoff = listenBackoff0
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, listenBackoffMax)
+	}
+}
+
+// listenOnce connects, listens and reloads until the connection or the
+// context fails. The reload directly after LISTEN is what makes the missed
+// notifications of a downtime window irrelevant: whatever the listener did not
+// hear is read here instead.
+func (r *Registry) listenOnce(ctx context.Context) error {
+	cfg, err := pgx.ParseConfig(r.notifyDSN)
+	if err != nil {
+		return fmt.Errorf("registry: parsing notify DSN: %w", err)
+	}
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = map[string]string{}
+	}
+	// So the connection is recognisable in pg_stat_activity.
+	cfg.RuntimeParams["application_name"] = ListenAppName
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("registry: connecting for LISTEN: %w", err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	}()
+	if _, err := conn.Exec(ctx, "LISTEN "+NotifyChannel); err != nil {
+		return fmt.Errorf("registry: LISTEN %s: %w", NotifyChannel, err)
+	}
+	if err := r.Reload(ctx); err != nil && ctx.Err() == nil {
+		slog.Warn("registry reload failed", "err", err)
+	}
+	for {
+		n, err := conn.WaitForNotification(ctx)
+		if err != nil {
+			return fmt.Errorf("registry: waiting for a notification: %w", err)
+		}
+		slog.Debug("registry change notified", "table", n.Payload)
+		// A failed reload keeps the previous index and the ticker retries, so
+		// it must not cost the listener its connection.
+		if err := r.Reload(ctx); err != nil {
+			slog.Warn("registry reload failed", "err", err)
+		}
+	}
+}
+
 // Reload pulls the control data and swaps the index.
 func (r *Registry) Reload(ctx context.Context) error {
+	// The ticker and the notification listener can reload at the same time.
+	// Both build their maps before touching r.mu, so neither can corrupt the
+	// index, but serialising them stops a slow reload from overwriting a
+	// newer one that finished while it was still querying.
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
 	types, err := r.source.EventTypes(ctx)
 	if err != nil {
 		return fmt.Errorf("registry: loading event types: %w", err)
