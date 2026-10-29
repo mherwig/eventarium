@@ -30,6 +30,7 @@ records what is already decided in code and what each service must implement.
 | `WEBHOOK_SIGNING_SECRET` | unset (no signature) | dispatcher |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api (upper bound for `max_events`) |
+| `REGISTRY_POLL` | `1s` (`2s` in publish-api) — the safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `LOG_LEVEL` | `info` | everything |
 
 Use `internal/config` for all reads. Never read the environment directly.
@@ -68,8 +69,14 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   dead_lettered, paused, expired, dropped.
 - `internal/registry` – `EventType`, `Subscription`, `Entry` (subscription with
   compiled filters) and the in-memory `Registry` refreshed from PostgreSQL.
-  Spike deviation: the registry polls PostgreSQL (default every 2 s) instead of
-  reading a compacted config topic (section 6.1).
+  Spike deviation: the registry reads PostgreSQL instead of a compacted config
+  topic (section 6.1). Freshness has two paths: `REGISTRY_POLL` (1–2 s, the
+  safety net) and, since migration 003, a `pg_notify` trigger on
+  `event_types`/`subscriptions` that the registry LISTENs to — a committed
+  write is in the index within milliseconds. Notifications are not replayed,
+  so the listener reloads once on every (re)connect and keeps the poll running
+  underneath; it holds one dedicated connection (`application_name`
+  `pubsub-registry-listen`, never a pooled one) per registry instance.
 - `internal/store` – PostgreSQL access: control data and the inbox
   (`Park`, `FetchParked`, `AckParked`, `CountParked`, `DeleteExpiredParked`,
   `EnsureInboxPartitions`).
@@ -296,7 +303,8 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 
 ## Deviations from the spec, on purpose
 
-- Registry distribution: PostgreSQL polling instead of a compacted Kafka topic.
+- Registry distribution: PostgreSQL (a poll plus a `pg_notify` trigger of
+  migration 003) instead of a compacted Kafka topic.
 - SSE multi-node routing: presence carries the node ID, so the targeted
   `sse-live` message reaches the node that holds the connection. No message is
   dropped because the connection lives elsewhere.

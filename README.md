@@ -134,6 +134,7 @@ Every service reads its configuration from the environment
 | `HTTP_ADDR` | `:8080` (publish-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api), set `:8083` for registry-api; `:8085` (router), `:8086` (dispatcher), `:8087` (status-writer) — health endpoints only | every service |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api |
+| `REGISTRY_POLL` | `1s` (`2s` in publish-api) — safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `WEBHOOK_SIGNING_SECRET` | unset (no HMAC) | dispatcher |
 | `ALLOW_PRIVATE_WEBHOOKS` | true in the spike; set `0` for real deployments | dispatcher |
 | `DISPATCHER_MAX_ATTEMPTS` | `10` | dispatcher |
@@ -251,9 +252,13 @@ curl -s -X POST localhost:8080/v1/events -H "Authorization: Bearer $T" \
   -d '{"order_id":"o-1","total":99.9,"internal":"secret"}'
 ```
 
-The publish API caches the registry and refreshes it every 2 s (the SSE
-gateway likewise), so wait a moment after creating an event type or
-subscription before publishing to it.
+The publish API caches the registry, and so do the router, dispatcher and SSE
+gateway. Creating an event type or subscription fires a trigger (migration
+003) on `event_types`/`subscriptions`, every service LISTENs for it and
+reloads as soon as the writing transaction commits — so once the
+registry-api call has returned, the type or subscription is usable; no
+settling time. `REGISTRY_POLL` (2 s for publish-api) is only the safety net
+for notifications missed while a listener was down.
 
 **Receive on the webhook**: the dispatcher POSTs the event — binary binding
 by default, with delivery metadata in `pubsub-*` headers (never inside the
@@ -724,9 +729,9 @@ paths:
 Tracked, with reasons, in
 [docs/deviations-and-open-points.md](docs/deviations-and-open-points.md)
 together with the spec's open decisions and what this spike did or did not
-answer. Short version: registry polls PostgreSQL instead of a compacted
-config topic, inbox rows are deleted in batches instead of by watermark,
-HS256 dev auth instead of JWKS, the replay selector rejects `event_types`
-(status records carry no event type) instead of implementing it, and SSE
-multi-node routing uses presence with a node ID rather than rendezvous
-hashing.
+answer. Short version: registry reads PostgreSQL (poll plus a `NOTIFY`
+trigger) instead of a compacted config topic, inbox rows are deleted in
+batches instead of by watermark, HS256 dev auth instead of JWKS, the replay
+selector rejects `event_types` (status records carry no event type) instead
+of implementing it, and SSE multi-node routing uses presence with a node ID
+rather than rendezvous hashing.

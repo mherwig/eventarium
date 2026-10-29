@@ -6,10 +6,19 @@ are in [SPIKE.md](SPIKE.md); the measured results are in the
 
 ## Deviations from the spec, on purpose — five
 
-1. **Registry distribution (§6.1): services poll PostgreSQL every ~1–2 s
-   instead of reading a compacted Kafka config topic.** Interface identical,
-   only the source differs. This was the first cut when building in parallel
-   — one less Kafka contract to get wrong between six components.
+1. **Registry distribution (§6.1): services read PostgreSQL instead of a
+   compacted Kafka config topic — polled every 1–2 s and, since migration
+   003, woken by a `pg_notify` trigger on `event_types`/`subscriptions`.**
+   Interface identical, only the source differs. This was the first cut when
+   building in parallel — one less Kafka contract to get wrong between six
+   components. The trigger turned the poll into a safety net: NOTIFY is
+   transactional (delivered only after the writing transaction commits, so
+   the index can never be refreshed ahead of the rows it describes) and
+   reaches every listening instance, so a just-created subscription is
+   matched within milliseconds instead of after the next tick. Notifications
+   are not replayed, which is why the listener reloads once on every
+   (re)connect and the poll stays; each registry instance holds one dedicated
+   connection, `pubsub-registry-listen` in `pg_stat_activity`.
 2. **Inbox deletion (§6.6): batched deletes instead of a per-subscription
    watermark.** Simpler; the watermark would save deletes at the cost of a
    new table and trickier invariants.
