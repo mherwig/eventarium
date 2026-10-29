@@ -17,7 +17,12 @@
 //   - build one delivery.Message per matching subscription, keyed by
 //     subscription ID so that a subscription always lands on the same
 //     partition of the fixed 12-partition deliveries topic (section 6.3),
-//     plus one pending status.Record for it (section 9).
+//     plus one pending status.Record for it (section 9);
+//   - a candidate subscription whose filter rejects the event gets no
+//     delivery, but does get one status.Record with the status `filtered`
+//     (an extension of section 9, see internal/status), so that a filter
+//     which matches nothing is visible in the status store instead of
+//     indistinguishable from a bug in the pipeline.
 //
 // The caller (cmd/router) writes the returned records, the consumed offsets
 // and nothing else in one Kafka transaction per poll batch, so a crash can
@@ -47,6 +52,20 @@ import (
 // downstream stages can route on the delivery mode without decoding the value.
 const HeaderChannel = "pubsub-channel"
 
+// Reasons the router writes into a status record.
+const (
+	// ReasonRouter is the reason of every pending record: the delivery was
+	// created here (section 9).
+	ReasonRouter = "router"
+	// ReasonFilterMismatch is the reason of a filtered record whose filter
+	// evaluated to false (section 6.2).
+	ReasonFilterMismatch = "filter_mismatch"
+	// ReasonFilterError is the reason of a filtered record whose filter
+	// could not be evaluated at all - a broken filter rejects the event for
+	// the same reason a false one does, but it is a bug worth seeing.
+	ReasonFilterError = "filter_error"
+)
+
 // Router turns consumed event records into delivery and status records. It is
 // stateless; the registry it holds is refreshed concurrently and safe for use.
 type Router struct {
@@ -59,9 +78,12 @@ func New(reg *registry.Registry) *Router { return &Router{reg: reg} }
 // Process evaluates one consumed event record and returns the records to
 // produce for it: for every matching subscription one delivery record on
 // kafkautil.TopicDeliveries followed by its pending status record on
-// kafkautil.TopicStatus. Unparsable records, unmatched events and filter
-// errors yield no records; nothing here panics or aborts the batch, the
-// transactional caller commits the source offset either way.
+// kafkautil.TopicStatus, and for every candidate subscription whose filter
+// rejected the event one status record with the status `filtered`
+// (internal/status). Unparsable records and events without a single
+// subscription for their type yield no records; nothing here panics or
+// aborts the batch, the transactional caller commits the source offset
+// either way.
 func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 	e, err := cloudevents.Parse(rec.Value)
 	if err != nil {
@@ -123,6 +145,19 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 	// because the projection may remove the field it reads.
 	orderingKey := OrderingKey(r.reg, rec, e, owner, decode)
 
+	// base is the status record every emission of this event starts from:
+	// the platform metadata of section 9, copied per candidate and given its
+	// delivery ID, status and reason.
+	base := status.Record{
+		TS:             time.Now().UTC(),
+		Owner:          owner,
+		EventRef:       eventRef,
+		Attempt:        0,
+		RetentionClass: class,
+		SrcPartition:   rec.Partition,
+		SrcOffset:      rec.Offset,
+	}
+
 	out := make([]*kgo.Record, 0, 2*len(entries))
 	for _, entry := range entries {
 		sub := entry.Sub
@@ -133,14 +168,43 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 		}
 		ok, err := filter.Matches(entry.AttrFilter, entry.DataFilter, attrs, data)
 		if err != nil {
-			// A bad filter is a non-match, never a crash (section 6.2:
-			// sandboxed CEL with cost limits; errors still must not stop
+			// Section 6.2: a bad filter is a non-match, never a crash
+			// (sandboxed CEL with cost limits; errors still must not stop
 			// the pipeline).
 			slog.Warn("router: filter error, treating as non-match",
 				"subscription", sub.ID, "event_ref", eventRef, "err", err)
-			continue
 		}
-		if !ok {
+		if !ok || err != nil {
+			// The candidate became no delivery, but it is still an outcome
+			// worth recording: without it a subscription whose filter
+			// matches nothing leaves no trace of the event anywhere - no
+			// delivery, no status, no log line - and "why did this never
+			// arrive" could only be answered by re-running the filter by
+			// hand. The record reuses the delivery ID the delivery would
+			// have had, so it lists and counts like any other row.
+			//
+			// Note what is deliberately *not* recorded here: an event with
+			// no subscription for its type at all has no subscription ID to
+			// hang the record on (publish-api warns about that case at the
+			// source instead).
+			frec := base
+			frec.DeliveryID = delivery.NewID(eventRef, sub.ID)
+			frec.SubscriptionID = sub.ID
+			frec.Status = status.Filtered
+			frec.Reason = ReasonFilterMismatch
+			if err != nil {
+				frec.Reason = ReasonFilterError
+			}
+			if value, merr := json.Marshal(frec); merr != nil {
+				slog.Warn("router: encoding filtered status failed",
+					"subscription", sub.ID, "event_ref", eventRef, "err", merr)
+			} else {
+				out = append(out, &kgo.Record{
+					Topic: kafkautil.TopicStatus,
+					Key:   []byte(frec.DeliveryID),
+					Value: value,
+				})
+			}
 			continue
 		}
 
@@ -201,19 +265,11 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 
 		// Section 9: every created delivery gets exactly one pending
 		// status, written in the same transaction as the delivery.
-		srec := status.Record{
-			TS:             time.Now().UTC(),
-			Owner:          owner,
-			EventRef:       eventRef,
-			DeliveryID:     msg.DeliveryID,
-			SubscriptionID: sub.ID,
-			Status:         status.Pending,
-			Reason:         "router",
-			Attempt:        0,
-			RetentionClass: class,
-			SrcPartition:   rec.Partition,
-			SrcOffset:      rec.Offset,
-		}
+		srec := base
+		srec.DeliveryID = msg.DeliveryID
+		srec.SubscriptionID = sub.ID
+		srec.Status = status.Pending
+		srec.Reason = ReasonRouter
 		svalue, err := json.Marshal(srec)
 		if err != nil {
 			// Cannot happen for this struct, but never drop the

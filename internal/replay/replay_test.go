@@ -50,6 +50,14 @@ func TestParseSelector(t *testing.T) {
 			wantErr: "event_types is not supported",
 		},
 		{name: "unknown status", body: `{"statuses":["exploded"]}`, wantErr: `unknown status "exploded"`},
+		{
+			// Not a typo and not selectable on purpose: the router records
+			// it for an event the filter rejected, so there is no delivery
+			// to repeat - and replay applies the projection, not the filter.
+			name:    "filtered is not replayable",
+			body:    `{"statuses":["filtered"]}`,
+			wantErr: `status "filtered" cannot be replayed`,
+		},
 		{name: "empty status", body: `{"statuses":["  "]}`, wantErr: "statuses must not contain an empty value"},
 		{name: "empty event ref", body: `{"event_refs":[" "]}`, wantErr: "event_refs must not contain an empty value"},
 		{name: "from not rfc3339", body: `{"from":"yesterday"}`, wantErr: "from must be an RFC3339 timestamp"},

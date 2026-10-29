@@ -40,8 +40,13 @@ const (
 // is indistinguishable from "no such row").
 var ErrNotFound = errors.New("chquery: not found")
 
-// Statuses lists every status of section 9 in lifecycle order. It seeds the
-// zero values of the status summary.
+// Statuses lists every status of section 9 in lifecycle order, plus filtered.
+// It seeds the zero values of the status summary.
+//
+// filtered goes last: it is not a step of a delivery's lifecycle (there is no
+// delivery), it only ever appears as the single row of its own delivery ID.
+// Appending also keeps the ranks of the ten real statuses stable, which the
+// latest-record key of every query is built from.
 var Statuses = []string{
 	status.Pending,
 	status.InFlight,
@@ -53,6 +58,7 @@ var Statuses = []string{
 	status.Paused,
 	status.Expired,
 	status.Dropped,
+	status.Filtered,
 }
 
 // rankSQLFor ranks a status by its place in the lifecycle: the index in

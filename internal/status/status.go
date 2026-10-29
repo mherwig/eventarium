@@ -26,6 +26,19 @@ const (
 	Paused       = "paused"
 	Expired      = "expired"
 	Dropped      = "dropped"
+
+	// Filtered is the router's verdict for a subscription that was a
+	// candidate for the event's type but rejected the event with its filter
+	// (section 6.2). No delivery exists for it, so the record carries the
+	// delivery ID that delivery *would* have had - the row is listed and
+	// counted like any other, and it is terminal from the start.
+	//
+	// It is an extension: section 9 describes the statuses of a delivery,
+	// and a filtered event never becomes one. It exists because the
+	// alternative is silence - a filter that rejected everything left no
+	// trace anywhere, which made "why did this never arrive" unanswerable
+	// from the platform's own data.
+	Filtered = "filtered"
 )
 
 // Record is one status transition of one delivery. The idempotency key is

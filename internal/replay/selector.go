@@ -118,6 +118,14 @@ func (s *Selector) validate(maxEvents int) error {
 		if s.Statuses[i] == "" {
 			return fmt.Errorf("statuses must not contain an empty value")
 		}
+		if s.Statuses[i] == status.Filtered {
+			// Deliberately not in selectableStatuses: a filtered event has
+			// no delivery to repeat, and replay applies the projection but
+			// not the filter (section 11), so replaying it would deliver
+			// exactly what the filter rejected. The specific message is
+			// better than "unknown status", which would suggest a typo.
+			return fmt.Errorf("status %q cannot be replayed: the filter rejected this event, so no delivery ever existed for it", status.Filtered)
+		}
 		if !containsStatus(selectableStatuses, s.Statuses[i]) {
 			return fmt.Errorf("unknown status %q, must be one of %s",
 				s.Statuses[i], strings.Join(selectableStatuses, ", "))

@@ -10,6 +10,7 @@ import (
 
 	"pubsub/internal/chquery"
 	"pubsub/internal/chstore"
+	"pubsub/internal/status"
 )
 
 // Match is one delivery selected for replay: the coordinates of its original
@@ -44,8 +45,18 @@ type Match struct {
 // never from an arbitrary one: only the pending record that the router wrote
 // with the delivery points into the events topic (see the inline comment).
 func Resolve(ctx context.Context, conn clickhouse.Conn, owner, subscriptionID string, sel Selector, limit int) ([]Match, error) {
-	where := []string{"ds.owner = ?", "ds.subscription_id = ?"}
-	args := []any{owner, subscriptionID}
+	// `filtered` rows are excluded from every selector, unconditionally. They
+	// are not deliveries: the router wrote them for an event the filter
+	// rejected, so there is nothing to repeat - and a selector that names
+	// only a time range or event refs (both valid under section 11) would
+	// otherwise pick them up and replay exactly what the filter said no to,
+	// because a replay re-applies the projection but never the filter.
+	// Excluding the rows rather than the grouped status also keeps a
+	// delivery ID that carries both kinds of record - possible when the
+	// registry refreshed between two deliveries of one event - replayable
+	// through its real rows: only the rejected verdict is dropped.
+	where := []string{"ds.owner = ?", "ds.subscription_id = ?", "ds.status != ?"}
+	args := []any{owner, subscriptionID, status.Filtered}
 
 	if len(sel.EventRefs) > 0 {
 		ph := make([]string, len(sel.EventRefs))
