@@ -110,6 +110,18 @@ func main() {
 		slog.Error("status-writer: exiting with error", "err", err)
 		os.Exit(1)
 	}
+
+	// The poll loop has stopped, and this client is the only one in the repo
+	// that sets BlockRebalanceOnPoll. On a cancelled context kgo's
+	// PollRecords adds itself to the poller count and returns an error fetch
+	// *without releasing it again*, so the count never reaches zero - and
+	// Close() waits for exactly that before leaving the group. Without this
+	// call the deferred cl.Close() below parks forever: SIGTERM logs
+	// "stopped" and the process then has to be SIGKILLed by the orchestrator
+	// (observed: still alive after 20 s, stack parked in
+	// waitAndAddRebalanceSilent). AllowRebalance resets the count, and the
+	// claim it makes - "all pollers are done" - is true right here.
+	cl.AllowRebalance()
 }
 
 // entry is one parsed record plus the Kafka record it came from, so that the
