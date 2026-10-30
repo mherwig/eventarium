@@ -808,7 +808,8 @@ Stability hardening is verified live as well, scenario by scenario
   pipeline's — its 500 after a partial batch (open point below).
 
 Full numbers, the status-record bug these runs found, and the three times the
-*harness* passed a scenario that had tested nothing:
+*harness* got in its own way — one of them making a scenario pass with the
+fault never applied:
 [docs/deviations-and-open-points.md](docs/deviations-and-open-points.md#chaos-during-load-crashed-replicas-and-dead-infrastructure-17).
 
 Not exercised yet: the soak test, restart-mid-job recovery of the replay

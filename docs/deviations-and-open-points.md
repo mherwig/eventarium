@@ -144,6 +144,41 @@ From §16, minus what the spike answered:
   and rescan only when the low-water offset itself settles. Not done, because
   nothing measured justifies it yet and the alternative (optimising ahead of
   data) is how the last "obvious" fix gets regretted.
+- **Failover latency is franz-go's default, nobody chose it** — the chaos
+  timing measurement (first duplicate at exactly *kill + 45 s*) is
+  `sessionTimeout: 45000 * time.Millisecond`, franz-go's default, and
+  `kafkautil.NewClient` sets nothing session-related — only seed brokers,
+  linger, batch size, acks and isolation level. So after an **ungraceful**
+  death (`kill -9`, OOMKill, node loss) the group waits out that window before
+  the survivors take the dead member's partitions, and everything that member
+  owned stalls for 45 s; a graceful SIGTERM leaves promptly, which is why a
+  rolling deploy feels instant and a crash does not. Lowering it takes
+  failover to seconds but makes a slow GC pause or a network blip look like a
+  death — an unnecessary rebalance, and with the commit watermark another
+  round of replay duplicates. This should be a `kafkautil.NewClient` option
+  with the tradeoff written next to it, not a number inherited from a library.
+- **The chaos driver lives outside the repo** — the four scenarios are
+  reproducible from the prose in this document, but the script that runs them
+  sits in `/tmp`, and it carries the parts that actually mattered: the fault
+  assertions that fail a run unless the fault is observed to have landed, the
+  wait for the owner's inbox to reach 0 before judging, and the per-run owner
+  that stops one run's events leaking into the next run's status window.
+  Without those, three of the scenarios passed while testing nothing (see
+  below) — so the gap is not cosmetic, it is the difference between the
+  results here and someone else silently getting green runs. Committing it
+  means splitting what is portable (the scenario bodies) from what is not (the
+  docker binary path, `/tmp/opencode`).
+- **The ClickHouse scenario never asserted status-row completeness** — its
+  `missing=0` is evidence about *deliveries*: the receivers recorded all
+  58,366 of them, so the oracle had no way to notice a status row lost while
+  ClickHouse was down. The writer is *designed* not to drop (buffer kept on
+  insert failure, backpressure at `maxBuffered`, Kafka offsets committed only
+  after a successful insert), so this is an unverified claim rather than a
+  suspected bug — but "designed not to" and "measured not to" are different
+  statements, and §9 makes status the only record of what happened. Cheap to
+  close: count `delivery_status` rows for the run's owner against the
+  transitions that run must have produced, while the outage is still open
+  rather than after the drain.
 - **Offline share of subscriptions** — unknown; decides inbox sizing and the
   managed PostgreSQL load (IOPS, WAL, failover). The multi-day offline
   scenario hasn't been run.
@@ -454,9 +489,12 @@ already landed. Open point, below.
 
 ### What the harness itself got wrong (worth repeating)
 
-Three of these cost real time and all three are harness faults, not platform
-faults — the reason they matter is that each one let a scenario *pass without
-testing anything*:
+Three harness faults, not platform faults — and they fail in *opposite*
+directions, which is why each one is worth writing down: one made a scenario
+pass with the fault never applied (the dangerous direction), the other two
+made clean runs fail for reasons that had nothing to do with the platform
+(equally wasteful, and the kind of thing that gets a real bug hunted for a
+day):
 
 - `$DOCKER` was unquoted in the scenario script and the path contains a
   space, so every `docker compose stop` exited 127 into `/dev/null`. The first
@@ -465,11 +503,13 @@ testing anything*:
   observed to have landed (`probe` also has to fail on a non-200 — `curl` exits
   0 on a 503, so a naive probe makes the assertion vacuous).
 - The receiver was killed at scenario end, so the inbox could never drain and
-  the judge read parked deliveries as missing. Fixed: `wait_inbox` waits for
-  the owner's parked rows to reach 0 before the oracle is allowed to speak.
+  the judge read parked deliveries as missing — a **false failure**: parked
+  and durable, reported as lost. Fixed: `wait_inbox` waits for the owner's
+  parked rows to reach 0 before the oracle is allowed to speak.
 - Scenarios shared one owner across runs, so a previous run's events fell into
-  the next run's status window. Fixed: unique owner per invocation, plus a
-  `trap … EXIT` so an aborted scenario cannot leave a publisher running.
+  the next run's status window — another **false failure** (18,432 phantom
+  `unexpected`). Fixed: unique owner per invocation, plus a `trap … EXIT` so
+  an aborted scenario cannot leave a publisher running.
 
 ## Fault injection: dispatcher, SSE gateway and cursor recovery (§17 test plan)
 
