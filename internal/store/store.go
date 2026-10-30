@@ -158,6 +158,41 @@ func (s *Store) CreateSubscription(ctx context.Context, sub *registry.Subscripti
 	return err
 }
 
+// UpdateSubscription replaces a subscription in place (section 7: PUT, full
+// replace). Every column except id and owner is rewritten with the validated
+// values the API built, so an absent field ends up at its default exactly as
+// it would on create. Zero rows updated means the subscription does not exist
+// or belongs to another owner - both answer the same not found (section 6.7).
+// The UPDATE also fires the registry NOTIFY trigger of migration 003, so every
+// service reloads the new configuration within milliseconds.
+func (s *Store) UpdateSubscription(ctx context.Context, sub *registry.Subscription) error {
+	projection, err := json.Marshal(sub.Projection)
+	if err != nil {
+		return err
+	}
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE subscriptions SET
+			event_type = $3, channel = $4, callback_url = NULLIF($5, ''),
+			filter = NULLIF($6, ''), data_filter = NULLIF($7, ''), projection = $8,
+			delivery_mode = $9, max_connections = $10, max_in_flight = $11,
+			rate_limit_per_s = $12, burst = $13, drain_rate_per_s = $14,
+			ack_timeout_ms = $15, ack_window = $16, cb_failure_threshold = $17,
+			probe_interval_s = $18, request_timeout_ms = $19, backlog_max = $20,
+			webhook_format = $21
+		WHERE id = $1::uuid AND owner = $2`,
+		sub.ID, sub.Owner, sub.EventType, sub.Channel, sub.CallbackURL, sub.Filter, sub.DataFilter,
+		projection, sub.DeliveryMode, sub.MaxConnections, sub.MaxInFlight, sub.RateLimitPerS, sub.Burst,
+		sub.DrainRatePerS, sub.AckTimeoutMS, sub.AckWindow, sub.CBFailureThreshold, sub.ProbeIntervalS,
+		sub.RequestTimeoutMS, sub.BacklogMax, sub.WebhookFormat)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("store: subscription %s not found", sub.ID)
+	}
+	return nil
+}
+
 // DeleteSubscription removes a subscription.
 func (s *Store) DeleteSubscription(ctx context.Context, owner, id string) error {
 	tag, err := s.Pool.Exec(ctx, `DELETE FROM subscriptions WHERE id = $1::uuid AND owner = $2`, id, owner)

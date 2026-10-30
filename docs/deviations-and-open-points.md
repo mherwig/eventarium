@@ -71,6 +71,14 @@ exactly what the filter rejected. It is a per-event row, so its volume scales
 with the number of candidate subscriptions per event type; the spec's own
 figure of a few hundred filter evaluations per event bounds it.
 
+A third *extension* is **`PUT /v1/subscriptions/{id}`** — mutable
+subscriptions. §5/§7 say what a registry stores but never how a stored row is
+changed (the spec only lists Status and Replay endpoints), so this fills the
+gap with the conventional full replace: same body as `POST`, immutable `id`
+and `owner`, everything else rewritten. Details and the consequences for
+in-flight deliveries are in the
+[mutability section](#mutable-subscriptions-put-v1subscriptionsid) below.
+
 ## Open points — answered by the spike
 
 - *Load figures are estimates and must be measured early* (§16) — done:
@@ -120,10 +128,11 @@ From §16, minus what the spike answered:
   defined in the registry but not enforced or documented to consumers.
 - **Replay** — the service is built and tested (results below). Still open:
   backfill for events that never matched the subscription (the spec itself
-  defers this decision, §17/§11), whether a replay should ever re-evaluate
-  filters (it applies the current *projection* only, per §11/§17), and an
-  exclusive mode that pauses live delivery during a replay (spec: possible
-  later extension).
+  defers this decision, §17/§11), and an exclusive mode that pauses live
+  delivery during a replay (spec: possible later extension). Decided: a replay
+  never re-evaluates filters (§11 "replays existing deliveries only"); it
+  stamps the *current* projection and channel, so it follows a `PUT` like
+  every other producer of delivery records.
 - **Publisher idempotency** — publishes are not deduplicated by design;
   whether publishers get an optional `Idempotency-Key` is undecided. (Max
   event size *is* handled: `MAX_EVENT_BYTES`, default 1 MiB.)
@@ -131,6 +140,76 @@ From §16, minus what the spike answered:
   restrictions (§6.7). HS256 stands in.
 - **Per-target-host/tenant rate limits** — explicitly out of scope for v1
   (needs a shared counter), per §6.
+
+## Mutable subscriptions: `PUT /v1/subscriptions/{id}`
+
+Full replace, same body as `POST` (README has the call). What was decided and
+what it costs:
+
+- **Verdicts are frozen at routing time, configuration is not.** A filter
+  change applies to *newly published* events only; a delivery that already
+  exists keeps the filter it was routed with. Drain does not re-evaluate
+  filters either — parked rows leave with the policy of the moment they are
+  drained — and replay never re-evaluates them (§11).
+- **The channel follows the record, wherever it is.** `registry.ChannelFor`
+  (approved addition to the frozen package) answers "current channel if the ID
+  is known, stamped channel otherwise" for both dispatcher and sse-gateway —
+  one shared rule, because two rules could let *both* stages skip a record
+  (lost) or *both* take it (duplicated). The stamp only decides for IDs
+  nobody knows any more (deleted subscription), which keeps an orphaned
+  webhook delivery dropping as `unknown_subscription` instead of disappearing
+  between the stages.
+- **Startup: load the registry before consuming.** The dispatcher and the
+  sse-gateway used to start consuming with an empty index — the first reload
+  runs inside `reg.Run`, a goroutine. In that window `ChannelFor` resolved
+  every unknown ID to its stamp, so a record whose channel had been changed
+  since routing was skipped by *both* stages: **lost**. Fixed by doing the
+  synchronous `reg.Reload(ctx)` before the consumers start, exactly as
+  publish-api, router and replay-api already did. This predates `PUT` (a
+  dispatcher starting cold dropped everything as `unknown_subscription`),
+  but `PUT` is what turned it into a silent loss instead of a loud one.
+- **Observed live, once:** a consumer restarted *across* an update read the
+  pre-update configuration while the other stage had already moved on;
+  delivery `15caed88-…` stayed `pending` forever with zero attempts on either
+  side. Same root cause as above, one reload wide.
+
+### The reload-window race (open point)
+
+Even with a loaded index, a `PUT` that flips the channel is not atomic with
+respect to the two stages: each one reads the registry at its own instant, and
+NOTIFY lands in each process separately. So for the handful of milliseconds
+around the flip, two outcomes are possible for one in-flight record:
+
+- **both stages see the new channel** → the old owner skips it and the new one
+  takes it → correct;
+- **one stage sees old, one sees new** → both skip → **lost**, or both take →
+  **duplicate**.
+
+Which one you get depends on which stage reloaded first, and neither can be
+eliminated by reading more data: the two stages are separate processes with no
+shared transaction. Today the code takes the *risk of a rare loss* in exchange
+for never duplicating by construction (each record is owned by exactly one
+stage in any single consistent snapshot).
+
+**The alternative** is to decide ownership on `stamped OR current` instead of
+`current` alone — a record is owned by whichever stage the stamp *or* the
+current config claims, i.e. both stages act if the subscription moved. That
+makes a loss impossible (nobody can skip a record the other also skips), at
+the price of **systematically duplicating every in-flight record of the
+switching subscription**: the old stage delivers it again while the new one
+delivers it too. On an at-least-once platform that is a legal trade — receivers
+are supposed to be idempotent on `pubsub-delivery-id` — but it turns a
+milliseconds-wide, once-per-update race into a guaranteed duplicate burst
+proportional to the in-flight window.
+
+Not built; would be a ~10-line change in `registry.ChannelFor` plus the two
+`ownsChannel` helpers. Recommendation if the platform ever needs "no loss, ever"
+at this boundary: take the OR, and make the duplication visible (status rows
+from both stages) rather than silent.
+
+Also still open and untouched: an update does not rewrite `expires_at` or the
+inbox TTL of already parked rows, so a webhook⇄SSE switch leaves rows waiting
+for the other stage until they expire there.
 
 ## Fault injection: dispatcher, SSE gateway and cursor recovery (§17 test plan)
 

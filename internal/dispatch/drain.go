@@ -91,6 +91,10 @@ func (d *Dispatcher) drainLoop() {
 // it must know every subscription that can have parked rows, including ones
 // with no live traffic since a restart.
 func (d *Dispatcher) refreshKnown() {
+	// Remember the registry state this snapshot covers before reading: a
+	// reload landing after this point carries configuration the next drain
+	// tick has to see, so it must not wait out knownRefresh either.
+	loaded := d.reg.LastLoaded()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), 15*time.Second)
 	defer cancel()
 	subs, err := d.st.Subscriptions(ctx)
@@ -105,7 +109,7 @@ func (d *Dispatcher) refreshKnown() {
 		}
 	}
 	d.mu.Lock()
-	d.known, d.knownAt = known, time.Now()
+	d.known, d.knownAt, d.knownLoaded = known, time.Now(), loaded
 	d.mu.Unlock()
 }
 
@@ -255,8 +259,13 @@ func drainEligible(s *subState) bool {
 }
 
 func (d *Dispatcher) refreshKnownIfStale() {
+	loaded := d.reg.LastLoaded()
 	d.mu.Lock()
-	stale := time.Since(d.knownAt) > knownRefresh
+	// Stale on time and stale on configuration: when an update turns a
+	// subscription into a webhook one (or takes it away again), the drainer
+	// has to learn it with the same latency as every other consumer of the
+	// registry instead of waiting out the rest of knownRefresh.
+	stale := time.Since(d.knownAt) > knownRefresh || loaded.After(d.knownLoaded)
 	d.mu.Unlock()
 	if stale {
 		d.refreshKnown()

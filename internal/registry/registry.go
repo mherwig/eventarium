@@ -313,6 +313,28 @@ func (r *Registry) Subscription(id string) (*Entry, bool) {
 	return e, ok
 }
 
+// ChannelFor returns the channel that decides which delivery stage owns a
+// record: the subscription's current channel when the ID is known, the
+// stamped channel when it is not (deleted subscription, or an ID this
+// instance has not loaded yet).
+//
+// Both stages ask the same question of the same data, and they must agree: a
+// rule that differs between dispatcher and sse-gateway would let one stage
+// skip a delivery the other also skips (lost) or both take it (duplicated).
+// An update can therefore make the two read different snapshots for a moment
+// - that window is one registry reload wide (milliseconds) and the platform
+// is at-least-once, so a rare duplicate is the accepted outcome.
+//
+// ChannelFor is an approved addition to this frozen package.
+func (r *Registry) ChannelFor(id, stamped string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.byID[id]; ok && e != nil && e.Sub != nil && e.Sub.Channel != "" {
+		return e.Sub.Channel
+	}
+	return stamped
+}
+
 // Len returns the number of loaded subscriptions.
 func (r *Registry) Len() int {
 	r.mu.RLock()

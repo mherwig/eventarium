@@ -55,6 +55,15 @@ func main() {
 	// NOTIFY from migration 003 refreshes the policy the moment it changes.
 	// REGISTRY_POLL (one second by default) is the safety net underneath.
 	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn))
+	// Load before consuming, like publish-api, router and replay-api do: the
+	// first gate a delivery meets is its channel, and an index that is not
+	// loaded yet would resolve every unknown subscription to its stamped
+	// channel - dropping a webhook delivery as unknown_subscription (or
+	// leaving an SSE one to the gateway) in the window before the first
+	// reload finishes.
+	if err := reg.Reload(ctx); err != nil {
+		fail("loading the registry", err)
+	}
 	go reg.Run(ctx)
 
 	// Daily inbox partitions exist before the first park (spec 6.6).

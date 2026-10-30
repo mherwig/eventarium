@@ -91,6 +91,10 @@ type Dispatcher struct {
 	// state map.
 	known   map[string]struct{}
 	knownAt time.Time
+	// knownLoaded is the registry state the last refreshKnown covered: a
+	// reload newer than this one means the drainer's webhook set may already
+	// be outdated.
+	knownLoaded time.Time
 
 	workers sync.WaitGroup
 
@@ -160,6 +164,20 @@ func (d *Dispatcher) Run(parent context.Context) {
 	}
 }
 
+// ownsChannel reports whether this stage handles the record. Section 6.4: it
+// follows the subscription's current channel, not the stamp alone - an update
+// that moved the subscription has to move the deliveries already on the topic
+// with it - and it falls back to the stamp for an ID the registry does not
+// know, so an orphaned webhook delivery is still dropped as
+// unknown_subscription while an orphaned SSE delivery stays with the
+// sse-gateway. registry.ChannelFor is the single implementation of that rule,
+// because the sse-gateway asks the same question of the same data: a rule
+// that differed between the two stages could let both skip a record (lost) or
+// both take it (duplicated).
+func (d *Dispatcher) ownsChannel(msg *delivery.Message) bool {
+	return d.reg.ChannelFor(msg.SubscriptionID, msg.Channel) == delivery.ChannelWebhook
+}
+
 // handleRecord dispatches one deliveries-topic record. The offset is marked
 // for commit once the delivery is safely owned by the in-memory state, parked
 // in the inbox, or terminally dropped; a failed park leaves the offset
@@ -173,7 +191,9 @@ func (d *Dispatcher) handleRecord(rec *kgo.Record) {
 		return
 	}
 	it := &item{msg: msg, seq: delivery.Seq{Partition: rec.Partition, Offset: rec.Offset}}
-	if msg.Channel != delivery.ChannelWebhook {
+	// The gate runs before the registry lookup, so a subscription that no
+	// longer exists keeps its stamped channel (see ownsChannel).
+	if !d.ownsChannel(msg) {
 		// SSE deliveries belong to the sse-delivery stage; skip and commit.
 		d.cl.MarkCommitRecords(rec)
 		return
@@ -184,6 +204,14 @@ func (d *Dispatcher) handleRecord(rec *kgo.Record) {
 			"subscription", msg.SubscriptionID, "delivery", msg.DeliveryID)
 		d.emitStatus(it, status.Dropped, reasonUnknownSub, 0, 0, 0)
 		d.count.dropped.Add(1)
+		d.cl.MarkCommitRecords(rec)
+		return
+	}
+	if entry.Sub.Channel != delivery.ChannelWebhook {
+		// The registry reloaded between the gate and this lookup and the
+		// subscription moved again in between. Acting now would combine the
+		// channel of one snapshot with the policy of another, so leave the
+		// record to the stage that owns it in the snapshot held here.
 		d.cl.MarkCommitRecords(rec)
 		return
 	}

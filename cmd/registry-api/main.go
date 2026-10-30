@@ -76,22 +76,7 @@ func main() {
 	}
 
 	api := &api{auth: validator, store: st}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	mux.HandleFunc("POST /v1/event-types", api.handleEventTypeCreate)
-	mux.HandleFunc("GET /v1/event-types", api.handleEventTypeList)
-	mux.HandleFunc("DELETE /v1/event-types/{name}", api.handleEventTypeDelete)
-	mux.HandleFunc("POST /v1/subscriptions", api.handleSubscriptionCreate)
-	mux.HandleFunc("GET /v1/subscriptions", api.handleSubscriptionList)
-	mux.HandleFunc("GET /v1/subscriptions/{id}", api.handleSubscriptionGet)
-	mux.HandleFunc("DELETE /v1/subscriptions/{id}", api.handleSubscriptionDelete)
-	// Catch-all so that unknown paths answer with the platform's JSON error
-	// shape instead of the mux's plain text default.
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		httpx.Error(w, http.StatusNotFound, "not found")
-	})
+	mux := newMux(api)
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -112,6 +97,29 @@ func main() {
 		fatal("serving http", err)
 	}
 	slog.Info("registry-api stopped")
+}
+
+// newMux wires the endpoints. It is separate from main so that the handlers
+// can be exercised through httptest against a real store.
+func newMux(a *api) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("POST /v1/event-types", a.handleEventTypeCreate)
+	mux.HandleFunc("GET /v1/event-types", a.handleEventTypeList)
+	mux.HandleFunc("DELETE /v1/event-types/{name}", a.handleEventTypeDelete)
+	mux.HandleFunc("POST /v1/subscriptions", a.handleSubscriptionCreate)
+	mux.HandleFunc("GET /v1/subscriptions", a.handleSubscriptionList)
+	mux.HandleFunc("GET /v1/subscriptions/{id}", a.handleSubscriptionGet)
+	mux.HandleFunc("PUT /v1/subscriptions/{id}", a.handleSubscriptionUpdate)
+	mux.HandleFunc("DELETE /v1/subscriptions/{id}", a.handleSubscriptionDelete)
+	// Catch-all so that unknown paths answer with the platform's JSON error
+	// shape instead of the mux's plain text default.
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		httpx.Error(w, http.StatusNotFound, "not found")
+	})
+	return mux
 }
 
 // api holds the dependencies of the control plane endpoints.
@@ -304,27 +312,107 @@ func (a *api) handleSubscriptionCreate(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	sub, ok := a.buildSubscription(r.Context(), w, claims.Owner, req)
+	if !ok {
+		return
+	}
+	if err := a.store.CreateSubscription(r.Context(), sub); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "storing subscription failed")
+		slog.Error("creating subscription", "owner", sub.Owner, "event_type", sub.EventType, "err", err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, sub)
+}
 
+// handleSubscriptionUpdate replaces a subscription: PUT, full replace
+// (section 7). The body is the POST body, so a read-modify-write loop through
+// GET is lossless - every field the client omits returns to its default, and
+// "" can only ever mean "clear this filter".
+//
+// The lookup happens before the body is validated: a foreign or unknown ID
+// answers 404 even when the body would have failed validation, because a
+// validation error would otherwise confirm that an ID exists (section 6.7).
+// Only id and owner are kept from the stored row, so event_type, the channel
+// with its callback, both filters, the projection and the whole delivery
+// policy are all mutable. Migration 003's NOTIFY trigger fires on this UPDATE,
+// so new events, drain and replay see the new configuration within
+// milliseconds (see also the channel gates of dispatcher and sse-gateway).
+func (a *api) handleSubscriptionUpdate(w http.ResponseWriter, r *http.Request) {
+	claims, ok := a.authorize(w, r, auth.ScopeSubscribe)
+	if !ok {
+		return
+	}
+	id := r.PathValue("id")
+	if _, err := uuid.Parse(id); err != nil {
+		httpx.Error(w, http.StatusNotFound, "not found")
+		return
+	}
+	existing, err := a.store.Subscription(r.Context(), id)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			httpx.Error(w, http.StatusNotFound, "not found")
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, "loading subscription failed")
+		slog.Error("loading subscription", "id", id, "err", err)
+		return
+	}
+	if existing.Owner != claims.Owner {
+		// Section 6.7: a foreign resource looks exactly like a missing one.
+		httpx.Error(w, http.StatusNotFound, "not found")
+		return
+	}
+	var req subscriptionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// The owner in sub is the caller's, which the lookup just proved to be
+	// the stored one.
+	sub, ok := a.buildSubscription(r.Context(), w, claims.Owner, req)
+	if !ok {
+		return
+	}
+	sub.ID = existing.ID
+	if err := a.store.UpdateSubscription(r.Context(), sub); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			httpx.Error(w, http.StatusNotFound, "not found")
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, "storing subscription failed")
+		slog.Error("updating subscription", "id", sub.ID, "owner", sub.Owner, "event_type", sub.EventType, "err", err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, sub)
+}
+
+// buildSubscription validates a subscription body into a subscription ready to
+// store. It writes the error itself and reports whether the result is usable,
+// so callers return as soon as the second value is false. Create and update
+// share it, which is what keeps PUT validated exactly like POST: one rule for
+// channel and callback_url, delivery_mode and webhook_format, the owner scoped
+// event type lookup, the JSON-only rules for data_filter and projection, and
+// the defaults and bounds of the delivery policy table (section 7).
+func (a *api) buildSubscription(ctx context.Context, w http.ResponseWriter, owner string, req subscriptionRequest) (*registry.Subscription, bool) {
 	channel := strings.TrimSpace(req.Channel)
 	if channel != "webhook" && channel != "sse" {
 		httpx.Error(w, http.StatusUnprocessableEntity, `channel must be "webhook" or "sse"`)
-		return
+		return nil, false
 	}
 	callbackURL := strings.TrimSpace(req.CallbackURL)
 	switch channel {
 	case "webhook":
 		if callbackURL == "" {
 			httpx.Error(w, http.StatusUnprocessableEntity, "callback_url is required for the webhook channel")
-			return
+			return nil, false
 		}
 		if err := validateHTTPURL(callbackURL); err != nil {
 			httpx.Error(w, http.StatusUnprocessableEntity, err.Error())
-			return
+			return nil, false
 		}
 	case "sse":
 		if callbackURL != "" {
 			httpx.Error(w, http.StatusUnprocessableEntity, "callback_url must be empty for the sse channel")
-			return
+			return nil, false
 		}
 	}
 
@@ -335,7 +423,7 @@ func (a *api) handleSubscriptionCreate(w http.ResponseWriter, r *http.Request) {
 	if mode != "ordered" && mode != "key_ordered" && mode != "unordered" {
 		httpx.Error(w, http.StatusUnprocessableEntity,
 			`delivery_mode must be "ordered", "key_ordered" or "unordered"`)
-		return
+		return nil, false
 	}
 	format := strings.TrimSpace(req.WebhookFormat)
 	if format == "" {
@@ -343,24 +431,24 @@ func (a *api) handleSubscriptionCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if format != "binary" && format != "structured" {
 		httpx.Error(w, http.StatusUnprocessableEntity, `webhook_format must be "binary" or "structured"`)
-		return
+		return nil, false
 	}
 
 	eventType := strings.TrimSpace(req.EventType)
 	if eventType == "" {
 		httpx.Error(w, http.StatusUnprocessableEntity, "event_type is required")
-		return
+		return nil, false
 	}
 	// Owner scoped lookup: an event type of another owner is unknown here.
-	et, err := a.store.EventType(r.Context(), claims.Owner, eventType)
+	et, err := a.store.EventType(ctx, owner, eventType)
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpx.Error(w, http.StatusUnprocessableEntity, fmt.Sprintf("unknown event type %q", eventType))
-		return
+		return nil, false
 	}
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "loading event type failed")
 		slog.Error("loading event type", "event_type", eventType, "err", err)
-		return
+		return nil, false
 	}
 
 	dataFilter := strings.TrimSpace(req.DataFilter)
@@ -369,27 +457,27 @@ func (a *api) handleSubscriptionCreate(w http.ResponseWriter, r *http.Request) {
 		// Section 5: data filters and projection exist for JSON data only.
 		httpx.Error(w, http.StatusUnprocessableEntity,
 			fmt.Sprintf("event type %q is not JSON: data_filter and projection are only allowed for JSON event types", eventType))
-		return
+		return nil, false
 	}
 	if dataFilter != "" {
 		if _, err := filter.CompileData(dataFilter); err != nil {
 			httpx.Error(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid data_filter: %v", err))
-			return
+			return nil, false
 		}
 	}
 	if attrFilter != "" {
 		if _, err := filter.CompileAttribute(attrFilter); err != nil {
 			httpx.Error(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid filter: %v", err))
-			return
+			return nil, false
 		}
 	}
 	if err := project.Validate(req.Projection); err != nil {
 		httpx.Error(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid projection: %v", err))
-		return
+		return nil, false
 	}
 
 	sub := &registry.Subscription{
-		Owner:         claims.Owner, // owner from the token only (section 6.7)
+		Owner:         owner, // owner from the token only (section 6.7)
 		EventType:     eventType,
 		Channel:       channel,
 		CallbackURL:   callbackURL,
@@ -426,20 +514,14 @@ func (a *api) handleSubscriptionCreate(w http.ResponseWriter, r *http.Request) {
 		v, err := policyInt(p.name, p.src, p.def, p.min)
 		if err != nil {
 			httpx.Error(w, http.StatusUnprocessableEntity, err.Error())
-			return
+			return nil, false
 		}
 		*p.dst = v
 	}
 	if len(sub.Projection) == 0 {
 		sub.Projection = []string{}
 	}
-
-	if err := a.store.CreateSubscription(r.Context(), sub); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "storing subscription failed")
-		slog.Error("creating subscription", "owner", sub.Owner, "event_type", sub.EventType, "err", err)
-		return
-	}
-	httpx.JSON(w, http.StatusCreated, sub)
+	return sub, true
 }
 
 func (a *api) handleSubscriptionList(w http.ResponseWriter, r *http.Request) {

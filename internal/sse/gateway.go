@@ -152,6 +152,15 @@ func New(opts Options) (*Gateway, error) {
 	// The NOTIFY listener (migration 003) is what makes a subscription created
 	// just now reachable without waiting out the poll interval.
 	g.reg = registry.New(g.store, opts.RegistryPoll, registry.WithNotify(opts.PGDSN))
+	// Load before anything consumes (as publish-api, router and replay-api
+	// do): the delivery stage decides ownership through the registry, and an
+	// empty index resolves an unknown subscription to its stamped channel -
+	// so a record whose channel was changed since routing would be skipped by
+	// this node while the dispatcher skips it too, and neither would own it.
+	if err := g.reg.Reload(ctx); err != nil {
+		cleanup()
+		return nil, err
+	}
 	if g.auth, err = auth.NewHMAC(opts.JWTSecret, opts.JWTIssuer, opts.JWTAudience); err != nil {
 		cleanup()
 		return nil, err

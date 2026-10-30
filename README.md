@@ -238,6 +238,47 @@ curl -s -X POST localhost:8083/v1/subscriptions -H "Authorization: Bearer $T" \
   -d '{"event_type":"orders.created","channel":"sse"}'
 ```
 
+**Update a subscription** with `PUT` (`:8083`, same scope `subscribe`) — full
+replace with the same body as `POST`, never a patch:
+
+```sh
+curl -s -X PUT localhost:8083/v1/subscriptions/<id> -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{"event_type":"orders.created","channel":"sse"}'
+```
+
+Everything the body carries is written; everything it omits goes back to the
+§7 defaults, so a `GET` → modify → `PUT` loop is lossless and `""` can only
+ever mean "clear this filter". `id` and `owner` are the only immutable fields.
+An unknown, malformed or another owner's ID answers `404` — checked *before*
+the body, so an error never reveals whether an ID exists.
+
+The change propagates through the same NOTIFY trigger as a create (in the
+index within milliseconds), and the consequences depend on what changed:
+
+- **Filter / data filter / projection** — applies to *newly published* events
+  only. A verdict is frozen at routing time, so deliveries that already exist
+  keep the configuration they were routed with.
+- **Delivery policy** (`rate_limit_per_s`, `ack_timeout_ms`, breaker
+  thresholds, …) — applies to what happens from now on, including rows the
+  dispatcher drains out of the inbox.
+- **Channel (`webhook` ⇄ `sse`)** — the whole record follows, wherever it
+  already is:
+  - *In-flight deliveries on the topic* follow the subscription's **current**
+    channel, not the one stamped at routing time (the shared rule is
+    `registry.ChannelFor`, so dispatcher and sse-gateway always agree on
+    exactly one owner per record). Parked inbox rows drain with the
+    configuration of the moment they are drained — never re-evaluated against
+    the filter.
+  - *Replay* also stamps the current channel: it re-sends existing deliveries
+    (§11), it does not re-run filters.
+  - *Orphans*: a delivery whose subscription was deleted in between keeps its
+    stamped channel, so an orphaned webhook delivery is still dropped as
+    `unknown_subscription` instead of vanishing between the two stages.
+  - Watch out for the switch itself: a webhook delivery that is parked while
+    the subscription is an SSE one waits for an SSE connection (and vice
+    versa); its expiry (`expires_at`, inbox TTL) is unchanged by the update.
+
 **Publish an event** (data plane, `:8080`, binary CloudEvents binding —
 `ce-*` headers carry the attributes, the body is the data member; use
 `Content-Type: application/cloudevents+json` for structured mode, or

@@ -82,9 +82,14 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   so the listener reloads once on every (re)connect and keeps the poll running
   underneath; it holds one dedicated connection (`application_name`
   `pubsub-registry-listen`, never a pooled one) per registry instance.
+  `ChannelFor(id, stamped)` decides which delivery stage owns a record: the
+  subscription's current channel when the ID is known, the stamped channel
+  when it is not. Approved addition to this frozen package — dispatcher and
+  sse-gateway must apply one shared rule, because two rules could let both
+  stages skip a record (lost) or both take it (duplicated).
 - `internal/store` – PostgreSQL access: control data and the inbox
   (`Park`, `FetchParked`, `AckParked`, `CountParked`, `DeleteExpiredParked`,
-  `EnsureInboxPartitions`).
+  `UpdateSubscription`, `EnsureInboxPartitions`).
 - `internal/filter` – CEL filters. `CompileAttribute` (variables: `attributes`,
   `id`, `source`, `type`, `subject`) and `CompileData` (variable: `data`).
   `Matches(attr, data, attrs, json)` evaluates both, with the equality index of
@@ -128,6 +133,15 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   `publish` for writes, owner scoped).
 - `POST/GET/DELETE /v1/subscriptions` and `/v1/subscriptions/{id}` (scope
   `subscribe`).
+- `PUT /v1/subscriptions/{id}` replaces a subscription (full replace, not a
+  patch): the body is the POST body, so a read-modify-write loop through GET
+  is lossless, absent policy fields return to the section 7 defaults, and `""`
+  can only ever mean "clear this filter". Only `id` and `owner` are kept from
+  the stored row. The lookup runs **before** the body is validated, so an
+  unknown, malformed or foreign ID answers 404 and a validation error never
+  confirms that an ID exists (section 6.7). Validated by the same code as
+  POST, and the UPDATE fires the migration 003 NOTIFY, so new events, drain
+  and replay see the new configuration within milliseconds.
 - Rejects subscriptions with data filters or a projection for non-JSON event
   types (section 5), validates CEL and projection paths, applies the defaults
   of the delivery policy table (section 7).

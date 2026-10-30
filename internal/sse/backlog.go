@@ -192,8 +192,11 @@ fetch:
 				// subscriptions can share it through a hash collision (6.3).
 				continue
 			}
-			if msg.Channel != delivery.ChannelSSE {
-				continue // defensive: webhook deliveries share the topic
+			// Webhook deliveries share the topic: the subscription's current
+			// channel decides, so a record routed before a channel change is
+			// still served here afterwards (ownsChannel).
+			if !g.ownsChannel(msg) {
+				continue
 			}
 			if msg.RetentionClass == kafkautil.ClassLive {
 				// Section 12: live-class events are hot-path only and carry no

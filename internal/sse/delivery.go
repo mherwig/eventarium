@@ -69,6 +69,16 @@ type deliveryItem struct {
 	msg *delivery.Message
 }
 
+// ownsChannel reports whether the sse-delivery stage handles the record: the
+// subscription's current channel, falling back to the stamp for an ID this
+// instance does not know. registry.ChannelFor is the one implementation of
+// that rule - the dispatcher applies it to the same data, which is what keeps
+// exactly one of the two stages on each record (see the note in
+// registry.ChannelFor for the reload window an update opens).
+func (g *Gateway) ownsChannel(msg *delivery.Message) bool {
+	return g.reg.ChannelFor(msg.SubscriptionID, msg.Channel) == delivery.ChannelSSE
+}
+
 func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 	bySub := map[string][]deliveryItem{}
 	for _, rec := range recs {
@@ -78,7 +88,7 @@ func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 				"partition", rec.Partition, "offset", rec.Offset)
 			continue
 		}
-		if msg.Channel != delivery.ChannelSSE {
+		if !g.ownsChannel(msg) {
 			continue // webhook deliveries belong to the dispatcher
 		}
 		it := deliveryItem{seq: delivery.Seq{Partition: rec.Partition, Offset: rec.Offset}, msg: msg}
