@@ -64,6 +64,14 @@ func main() {
 	if err := reg.Reload(ctx); err != nil {
 		fail("loading the registry", err)
 	}
+	// The dispatcher decides ownership and policy from this index, and an
+	// unknown subscription is dropped (with a status, but still): readiness
+	// therefore fails while the index stands still, not just while
+	// PostgreSQL is unreachable - the two can differ, e.g. a LISTEN
+	// connection and a poll both failing on one table.
+	health.AddCheck(func(context.Context) error {
+		return reg.Check(config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter))
+	})
 	go reg.Run(ctx)
 
 	// Daily inbox partitions exist before the first park (spec 6.6).

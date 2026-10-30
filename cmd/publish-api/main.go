@@ -82,10 +82,19 @@ func main() {
 	}
 
 	api := &publishAPI{auth: validator, registry: reg, kafka: client, maxBytes: maxBytes}
+	// Readiness is more than "the process is up": the publish path needs
+	// PostgreSQL (the registry poll) and an index that is not standing still.
+	// /healthz stays answering while they are down - restarting the process
+	// would not fix a database - but /readyz then fails, so a rolling update
+	// does not add a replica that cannot serve (section: docs/SPIKE.md).
+	health := httpx.NewHealth(
+		func(ctx context.Context) error { return st.Pool.Ping(ctx) },
+		func(context.Context) error {
+			return reg.Check(config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter))
+		},
+	)
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	health.Register(mux)
 	mux.HandleFunc("POST /v1/events", api.handleEvents)
 	// Catch-all so that unknown paths answer with the platform's JSON error
 	// shape instead of the mux's plain text default.
@@ -107,6 +116,9 @@ func main() {
 			slog.Error("http shutdown", "err", err)
 		}
 	}()
+	// The initial registry load happened above and the Kafka client is
+	// connected; from here on, readiness is only about the dependencies.
+	health.SetReady(true)
 	slog.Info("publish-api listening", "addr", addr, "brokers", brokers, "max_event_bytes", maxBytes)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fatal("serving http", err)

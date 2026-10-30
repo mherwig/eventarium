@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"pubsub/internal/auth"
+	"pubsub/internal/httpx"
 	"pubsub/internal/registry"
 	"pubsub/internal/store"
 	"pubsub/migrations"
@@ -33,6 +34,7 @@ const (
 type testAPI struct {
 	srv    *httptest.Server
 	tokens map[string]string
+	st     *store.Store
 }
 
 func newTestAPI(t *testing.T) *testAPI {
@@ -61,7 +63,9 @@ func newTestAPI(t *testing.T) *testAPI {
 	if err != nil {
 		t.Fatalf("building the validator: %v", err)
 	}
-	srv := httptest.NewServer(newMux(&api{auth: v, store: st}))
+	health := httpx.NewHealth(func(ctx context.Context) error { return st.Pool.Ping(ctx) })
+	health.SetReady(true)
+	srv := httptest.NewServer(newMux(&api{auth: v, store: st}, health))
 	t.Cleanup(srv.Close)
 
 	tokens := map[string]string{}
@@ -73,7 +77,7 @@ func newTestAPI(t *testing.T) *testAPI {
 		}
 		tokens[owner] = tok
 	}
-	return &testAPI{srv: srv, tokens: tokens}
+	return &testAPI{srv: srv, tokens: tokens, st: st}
 }
 
 func cleanupTestRows(t *testing.T, st *store.Store) {
@@ -371,5 +375,66 @@ func TestSubscriptionUpdateNotFound(t *testing.T) {
 	stored := a.get(t, original.ID)
 	if stored.Channel != "webhook" || stored.CallbackURL != "https://example.test/hook" {
 		t.Errorf("row changed: %+v", stored)
+	}
+}
+
+// TestSubscriptionDeleteIsSoft pins the whole contract of migration 004: a
+// deleted subscription is gone from the control-plane API - GET, PUT and a
+// second DELETE all answer 404, the list does not contain it - while the row
+// itself stays in PostgreSQL, so the delivery path and the status API can
+// still attribute what happened under it (see store.SubscriptionExists).
+func TestSubscriptionDeleteIsSoft(t *testing.T) {
+	a := newTestAPI(t)
+	a.createEventType(t, "put.soft")
+	created := a.createSubscription(t, map[string]any{
+		"event_type":   "put.soft",
+		"channel":      "webhook",
+		"callback_url": "https://example.test/hook",
+	})
+
+	code, body := a.do(t, http.MethodDelete, "/v1/subscriptions/"+created.ID, testOwner, nil)
+	wantStatus(t, code, http.StatusNoContent, body)
+
+	// Gone for every reader of the control plane.
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   string
+		body   map[string]any
+	}{
+		{"get", http.MethodGet, "/v1/subscriptions/" + created.ID, nil},
+		{"put", http.MethodPut, "/v1/subscriptions/" + created.ID, map[string]any{
+			"event_type": "put.soft", "channel": "sse",
+		}},
+		{"delete again", http.MethodDelete, "/v1/subscriptions/" + created.ID, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			code, body := a.do(t, tt.method, tt.path, testOwner, tt.body)
+			if code != http.StatusNotFound {
+				t.Errorf("status = %d, want 404; body: %s", code, body)
+			}
+		})
+	}
+	// The list does not contain it either.
+	t.Run("list", func(t *testing.T) {
+		code, body := a.do(t, http.MethodGet, "/v1/subscriptions", testOwner, nil)
+		wantStatus(t, code, http.StatusOK, body)
+		if strings.Contains(string(body), created.ID) {
+			t.Errorf("the deleted subscription is still in the list: %s", body)
+		}
+	})
+
+	// Still there for everything that asks the database directly - a parked
+	// delivery or a status record must stay attributable to its owner.
+	exists, err := a.st.SubscriptionExists(context.Background(), testOwner, created.ID)
+	if err != nil {
+		t.Fatalf("checking existence after the delete: %v", err)
+	}
+	if !exists {
+		t.Error("SubscriptionExists = false after a soft delete, want true: the row is still the subject of its history")
+	}
+	// But not for anyone else's owner, deleted or not.
+	if exists, err := a.st.SubscriptionExists(context.Background(), foreignOwner, created.ID); err != nil || exists {
+		t.Errorf("SubscriptionExists for a foreign owner = %v, %v; want false, nil", exists, err)
 	}
 }

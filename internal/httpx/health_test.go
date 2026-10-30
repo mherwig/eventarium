@@ -80,3 +80,47 @@ func TestReadyzWithoutChecks(t *testing.T) {
 		t.Fatalf("/readyz = %d, want 200", rec.Code)
 	}
 }
+
+// TestRegisterOnExistingMux is the wiring of the five APIs: they serve the
+// probes from their own mux next to the API routes, and a service that keeps
+// its own /healthz body (sse-gateway) registers readiness only. Both must
+// answer without AccessLog, exactly like the endpoints on a Health.Mux.
+func TestRegisterOnExistingMux(t *testing.T) {
+	healthy := NewHealth()
+	healthy.SetReady(true)
+	mux := http.NewServeMux()
+	healthy.Register(mux)
+	mux.HandleFunc("GET /v1/ping", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/readyz on the API mux = %d, want 200", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/ping", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the API routes on the same mux must keep working, got %d", rec.Code)
+	}
+
+	ownHealthz := http.NewServeMux()
+	broken := NewHealth(func(context.Context) error { return errors.New("clickhouse unreachable") })
+	broken.SetReady(true)
+	ownHealthz.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		JSON(w, http.StatusOK, map[string]string{"status": "ok", "connections": "7"})
+	})
+	broken.RegisterReady(ownHealthz)
+
+	rec = httptest.NewRecorder()
+	ownHealthz.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "connections") {
+		t.Fatalf("the gateway's own /healthz body must survive, got %d: %s", rec.Code, rec.Body)
+	}
+	rec = httptest.NewRecorder()
+	ownHealthz.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz = %d, want 503 while a dependency fails", rec.Code)
+	}
+}

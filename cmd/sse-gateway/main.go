@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"pubsub/internal/config"
+	"pubsub/internal/registry"
 	"pubsub/internal/sse"
 )
 
@@ -43,17 +44,18 @@ func main() {
 	defer stop()
 
 	g, err := sse.New(sse.Options{
-		HTTPAddr:       config.Str("HTTP_ADDR", ":8082"),
-		NodeID:         config.Str("NODE_ID", hostname()),
-		Brokers:        nil, // kafkautil.Bootstrap() reads KAFKA_BROKERS
-		PGDSN:          config.Str("PG_DSN", "postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable"),
-		JWTSecret:      config.Str("JWT_SECRET", "dev-secret"),
-		JWTIssuer:      config.Str("JWT_ISSUER", "dev"),
-		JWTAudience:    config.Str("JWT_AUDIENCE", "pubsub"),
-		Heartbeat:      config.Duration("SSE_HEARTBEAT", 15*time.Second),
-		MaxConnections: config.Int("SSE_MAX_CONNECTIONS", 3),
-		RegistryPoll:   config.Duration("REGISTRY_POLL", time.Second),
-		Drainer:        config.Bool("SSE_DRAINER", true),
+		HTTPAddr:           config.Str("HTTP_ADDR", ":8082"),
+		NodeID:             config.Str("NODE_ID", hostname()),
+		Brokers:            nil, // kafkautil.Bootstrap() reads KAFKA_BROKERS
+		PGDSN:              config.Str("PG_DSN", "postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable"),
+		JWTSecret:          config.Str("JWT_SECRET", "dev-secret"),
+		JWTIssuer:          config.Str("JWT_ISSUER", "dev"),
+		JWTAudience:        config.Str("JWT_AUDIENCE", "pubsub"),
+		Heartbeat:          config.Duration("SSE_HEARTBEAT", 15*time.Second),
+		MaxConnections:     config.Int("SSE_MAX_CONNECTIONS", 3),
+		RegistryPoll:       config.Duration("REGISTRY_POLL", time.Second),
+		RegistryStaleAfter: config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter),
+		Drainer:            config.Bool("SSE_DRAINER", true),
 	})
 	if err != nil {
 		slog.Error("starting", "err", err)

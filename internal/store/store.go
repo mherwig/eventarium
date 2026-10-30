@@ -56,7 +56,12 @@ func (s *Store) EventTypes(ctx context.Context) ([]registry.EventType, error) {
 	return out, rows.Err()
 }
 
-// Subscriptions loads every registered subscription.
+// Subscriptions loads every registered subscription. Soft-deleted rows
+// (migration 004) are excluded: this is the view the whole platform works
+// from - registry index, routing, delivery - and a deleted subscription must
+// answer exactly as before, only without the row. Nothing here needs to know
+// that a subscription ever existed; the status API asks the store directly
+// with SubscriptionExists.
 func (s *Store) Subscriptions(ctx context.Context) ([]registry.Subscription, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id::text, owner, event_type, channel, COALESCE(callback_url, ''), COALESCE(filter, ''),
@@ -64,7 +69,8 @@ func (s *Store) Subscriptions(ctx context.Context) ([]registry.Subscription, err
 		       max_connections, max_in_flight, rate_limit_per_s, burst, drain_rate_per_s,
 		       ack_timeout_ms, ack_window, cb_failure_threshold, probe_interval_s,
 		       request_timeout_ms, backlog_max, webhook_format
-		FROM subscriptions`)
+		FROM subscriptions
+		WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -161,10 +167,12 @@ func (s *Store) CreateSubscription(ctx context.Context, sub *registry.Subscripti
 // UpdateSubscription replaces a subscription in place (section 7: PUT, full
 // replace). Every column except id and owner is rewritten with the validated
 // values the API built, so an absent field ends up at its default exactly as
-// it would on create. Zero rows updated means the subscription does not exist
-// or belongs to another owner - both answer the same not found (section 6.7).
-// The UPDATE also fires the registry NOTIFY trigger of migration 003, so every
-// service reloads the new configuration within milliseconds.
+// it would on create. Zero rows updated means the subscription does not exist,
+// belongs to another owner, or was deleted - all three answer the same not
+// found (section 6.7). The UPDATE also fires the registry NOTIFY trigger of
+// migration 003, so every service reloads the new configuration within
+// milliseconds; updated_at is rewritten with it, because a PUT that changes
+// nothing is still a change of the row's history.
 func (s *Store) UpdateSubscription(ctx context.Context, sub *registry.Subscription) error {
 	projection, err := json.Marshal(sub.Projection)
 	if err != nil {
@@ -178,8 +186,8 @@ func (s *Store) UpdateSubscription(ctx context.Context, sub *registry.Subscripti
 			rate_limit_per_s = $12, burst = $13, drain_rate_per_s = $14,
 			ack_timeout_ms = $15, ack_window = $16, cb_failure_threshold = $17,
 			probe_interval_s = $18, request_timeout_ms = $19, backlog_max = $20,
-			webhook_format = $21
-		WHERE id = $1::uuid AND owner = $2`,
+			webhook_format = $21, updated_at = now()
+		WHERE id = $1::uuid AND owner = $2 AND deleted_at IS NULL`,
 		sub.ID, sub.Owner, sub.EventType, sub.Channel, sub.CallbackURL, sub.Filter, sub.DataFilter,
 		projection, sub.DeliveryMode, sub.MaxConnections, sub.MaxInFlight, sub.RateLimitPerS, sub.Burst,
 		sub.DrainRatePerS, sub.AckTimeoutMS, sub.AckWindow, sub.CBFailureThreshold, sub.ProbeIntervalS,
@@ -193,9 +201,17 @@ func (s *Store) UpdateSubscription(ctx context.Context, sub *registry.Subscripti
 	return nil
 }
 
-// DeleteSubscription removes a subscription.
+// DeleteSubscription removes a subscription - softly (migration 004): the row
+// stays with its deleted_at set, so the delivery path and the status API keep
+// the subject of a parked or replayed delivery (see the deviations doc). To
+// the registry and the control-plane API the subscription is
+// gone the moment the statement commits, because both work from the live set
+// only. A second delete of the same ID answers not found: it is not
+// idempotent, it is already done.
 func (s *Store) DeleteSubscription(ctx context.Context, owner, id string) error {
-	tag, err := s.Pool.Exec(ctx, `DELETE FROM subscriptions WHERE id = $1::uuid AND owner = $2`, id, owner)
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE subscriptions SET deleted_at = now(), updated_at = now()
+		WHERE id = $1::uuid AND owner = $2 AND deleted_at IS NULL`, id, owner)
 	if err != nil {
 		return err
 	}
@@ -203,6 +219,23 @@ func (s *Store) DeleteSubscription(ctx context.Context, owner, id string) error 
 		return fmt.Errorf("store: subscription %s not found", id)
 	}
 	return nil
+}
+
+// SubscriptionExists reports whether a subscription ID is known to the
+// platform - including soft-deleted rows. It is the existence and ownership
+// check of the status API (section 10): deliveries of a deleted subscription
+// stay queryable, because the delivery did happen and its history must not
+// disappear with the row's live half. Fail-closed on the database's word: an
+// error is not "does not exist".
+func (s *Store) SubscriptionExists(ctx context.Context, owner, id string) (bool, error) {
+	var exists bool
+	err := s.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM subscriptions WHERE id = $1::uuid AND owner = $2)`,
+		id, owner).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: subscription %s existence: %w", id, err)
+	}
+	return exists, nil
 }
 
 // InboxRow is one parked delivery.

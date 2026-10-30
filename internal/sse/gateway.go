@@ -18,10 +18,12 @@
 // ID, so one subscription always sits on exactly one partition and is owned by
 // exactly one consumer. The delivery stage handles a poll batch serially and
 // produces to the sse-live topic, which is keyed by subscription ID again, so
-// per-subscription order reaches the client in order. Offsets are committed
-// only after a batch has been fully processed, so a crash repeats a batch
-// instead of losing one; the duplicates are identified downstream by the event
-// reference (8).
+// per-subscription order reaches the client in order. Offsets are committed as
+// a watermark over records that have reached a durable outcome - written to
+// sse-live or parked in the inbox - and never past a record that has not: one
+// waiting for the background park retry holds its partition's commit point
+// still, so a crash repeats it instead of losing it. The duplicates are
+// identified downstream by the event reference (8).
 //
 // Spike simplifications, commented where they occur: the connection assigned
 // to a delivery is picked arbitrarily instead of by rendezvous hashing (7),
@@ -49,6 +51,7 @@ import (
 	"pubsub/internal/delivery"
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
+	"pubsub/internal/offsetgate"
 	"pubsub/internal/registry"
 	"pubsub/internal/status"
 	"pubsub/internal/store"
@@ -68,7 +71,10 @@ type Options struct {
 	Heartbeat      time.Duration // SSE_HEARTBEAT, default 15s
 	MaxConnections int           // SSE_MAX_CONNECTIONS, default 3; a subscription policy overrides it
 	RegistryPoll   time.Duration // registry poll interval, default 1s
-	Drainer        bool          // run the inbox drainer on this node (SSE_DRAINER)
+	// RegistryStaleAfter bounds the age the registry index may reach before
+	// /readyz fails (REGISTRY_STALE_AFTER, default registry.DefaultStaleAfter).
+	RegistryStaleAfter time.Duration
+	Drainer            bool // run the inbox drainer on this node (SSE_DRAINER)
 }
 
 // Gateway is the running service: HTTP server, presence view, delivery stage,
@@ -103,6 +109,27 @@ type Gateway struct {
 	parkedMu sync.Mutex
 	parked   map[string]*store.ParkCounter
 
+	// gate is the commit watermark of the deliveries topic for the
+	// sse-delivery group: a record's offset is released only once the
+	// delivery is durable (internal/offsetgate).
+	gate *offsetgate.Gate
+	// parkRetry carries the deliveries whose park failed to the background
+	// worker that keeps trying them.
+	parkRetry chan parkJob
+
+	// parkLogErr/parkLogAt throttle the park-failure warning: parking runs at
+	// ingestion speed and again every retry tick (parkLogEvery).
+	parkLogMu  sync.Mutex
+	parkLogErr string
+	parkLogAt  time.Time
+
+	// health answers /readyz (the gateway keeps its own /healthz body with
+	// the connection counts). Readiness needs PostgreSQL - the inbox and the
+	// drainer both do - and a registry index that is not standing still: a
+	// delivery stage that works off a frozen snapshot resolves channels it
+	// should skip and skips ones it should take.
+	health *httpx.Health
+
 	shutdown chan struct{}
 }
 
@@ -127,18 +154,23 @@ func New(opts Options) (*Gateway, error) {
 	if opts.RegistryPoll <= 0 {
 		opts.RegistryPoll = time.Second
 	}
+	if opts.RegistryStaleAfter <= 0 {
+		opts.RegistryStaleAfter = registry.DefaultStaleAfter
+	}
 	if len(opts.Brokers) == 0 {
 		opts.Brokers = kafkautil.Bootstrap()
 	}
 
 	g := &Gateway{
-		opts:     opts,
-		log:      slog.Default().With("service", "sse-gateway", "node", opts.NodeID),
-		view:     newPresenceView(),
-		conns:    map[string]*connection{},
-		bySub:    map[string]map[string]*connection{},
-		parked:   map[string]*store.ParkCounter{},
-		shutdown: make(chan struct{}),
+		opts:      opts,
+		log:       slog.Default().With("service", "sse-gateway", "node", opts.NodeID),
+		view:      newPresenceView(),
+		conns:     map[string]*connection{},
+		bySub:     map[string]map[string]*connection{},
+		parked:    map[string]*store.ParkCounter{},
+		gate:      offsetgate.New(),
+		parkRetry: make(chan parkJob, parkRetryQueue),
+		shutdown:  make(chan struct{}),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -201,6 +233,12 @@ func New(opts Options) (*Gateway, error) {
 		kgo.ConsumeTopics(kafkautil.TopicDeliveries),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
 		kgo.DisableAutoCommit(),
+		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
+			// A rebalance can hand a partition to another node while this one
+			// still holds records of it in memory; the gate stops tracking
+			// them, so their offsets stay the new owner's to commit.
+			g.gate.Keep(assigned)
+		}),
 	); err != nil {
 		cleanup()
 		return nil, err
@@ -216,6 +254,10 @@ func New(opts Options) (*Gateway, error) {
 		cleanup()
 		return nil, err
 	}
+	g.health = httpx.NewHealth(
+		func(ctx context.Context) error { return g.store.Pool.Ping(ctx) },
+		func(context.Context) error { return g.reg.Check(g.opts.RegistryStaleAfter) },
+	)
 	return g, nil
 }
 
@@ -245,6 +287,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 	start("live consumer", g.runLive)
 	start("inbox expiry", g.runInboxExpiry)
 	start("parked reconcile", g.runParkedReconcile)
+	start("park retry", g.runParkRetry)
 	if g.opts.Drainer {
 		start("drainer", g.runDrainer)
 	} else {
@@ -259,6 +302,10 @@ func (g *Gateway) Run(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 	g.log.Info("listening", "addr", g.opts.HTTPAddr)
+	// Setup is done: the store, the registry index (New reloads it before
+	// returning), every consumer and the listener are up. From here on
+	// /readyz is about the dependencies, not about process existence.
+	g.health.SetReady(true)
 
 	var runErr error
 	select {
@@ -314,6 +361,9 @@ func (g *Gateway) closeAll() {
 func (g *Gateway) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", httpx.AccessLog(http.HandlerFunc(g.handleHealth)))
+	// The probe endpoints skip AccessLog: two probes every ten seconds would
+	// drown the real traffic in noise.
+	g.health.RegisterReady(mux)
 	mux.Handle("POST /sse/ack", httpx.AccessLog(http.HandlerFunc(g.handleAck)))
 	// /sse deliberately stays outside httpx.AccessLog: the SSE writer needs
 	// the raw http.Flusher (the access-log writer hides it) and connect and

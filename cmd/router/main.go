@@ -78,6 +78,14 @@ func main() {
 	// REGISTRY_POLL is only the safety net: the NOTIFY trigger of migration
 	// 003 wakes the registry the moment a subscription changes.
 	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn))
+	// A stale index is a readiness problem for this service specifically: the
+	// router commits an event's offset together with the deliveries it
+	// produces, so an index that stopped moving would fan an event out to a
+	// subscription set that is no longer current - and the commit would make
+	// that decision final. Readiness says so instead of the log having to.
+	health.AddCheck(func(context.Context) error {
+		return reg.Check(config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter))
+	})
 
 	// Do not join the group before the first successful reload: otherwise
 	// events consumed while the index is empty would be committed without

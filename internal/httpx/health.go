@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -27,12 +28,24 @@ const readyTimeout = 2 * time.Second
 //     replica that can actually work instead of declaring it good after two
 //     seconds of process existence.
 type Health struct {
-	ready  atomic.Bool
-	checks []Check
+	ready    atomic.Bool
+	checksMu sync.RWMutex
+	checks   []Check
 }
 
 // NewHealth builds the endpoints. The checks are probed by /readyz only.
 func NewHealth(checks ...Check) *Health { return &Health{checks: checks} }
+
+// AddCheck registers another readiness dependency. It exists for the services
+// that can answer liveness before every dependency object exists - the router
+// starts serving before its registry has even been built - and is safe to
+// call while probes are running; the checks are what /readyz needs, not a
+// fixed picture of the moment NewHealth was called.
+func (h *Health) AddCheck(c Check) {
+	h.checksMu.Lock()
+	defer h.checksMu.Unlock()
+	h.checks = append(h.checks, c)
+}
 
 // SetReady flips the second half of readiness: the initial setup - registry
 // reload, inbox partitions, Kafka client - has finished. Until then /readyz
@@ -47,11 +60,25 @@ func (h *Health) Ready() bool { return h.ready.Load() }
 // probes every ten seconds would drown the real traffic in noise.
 func (h *Health) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
+	h.Register(mux)
+	return mux
+}
+
+// Register adds /healthz and /readyz to an existing mux, for the services
+// that serve their API from the same port and therefore already have one
+// (the five HTTP APIs).
+func (h *Health) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		JSON(w, http.StatusOK, map[string]any{"status": "ok", "ready": h.ready.Load()})
 	})
 	mux.HandleFunc("GET /readyz", h.readyz)
-	return mux
+}
+
+// RegisterReady adds only /readyz, for a service that already answers
+// /healthz with a body of its own (sse-gateway reports its connection counts
+// there) and must not lose it.
+func (h *Health) RegisterReady(mux *http.ServeMux) {
+	mux.HandleFunc("GET /readyz", h.readyz)
 }
 
 func (h *Health) readyz(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +88,10 @@ func (h *Health) readyz(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
 	defer cancel()
-	for _, check := range h.checks {
+	h.checksMu.RLock()
+	checks := h.checks
+	h.checksMu.RUnlock()
+	for _, check := range checks {
 		if err := check(ctx); err != nil {
 			JSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready", "error": err.Error()})
 			return

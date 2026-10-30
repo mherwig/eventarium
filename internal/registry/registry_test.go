@@ -2,6 +2,8 @@ package registry_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,5 +61,63 @@ func TestChannelFor(t *testing.T) {
 				t.Errorf("ChannelFor(%q, %q) = %q, want %q", tt.id, tt.stamped, got, tt.want)
 			}
 		})
+	}
+}
+
+// flakySource fails on demand: the readiness answer of /readyz depends on
+// reloads that stopped succeeding, and this is how one stops.
+type flakySource struct {
+	staticSource
+	fail bool
+}
+
+func (s *flakySource) Subscriptions(ctx context.Context) ([]registry.Subscription, error) {
+	if s.fail {
+		return nil, errors.New("postgres down")
+	}
+	return s.staticSource.Subscriptions(ctx)
+}
+
+// TestCheck pins what /readyz sees: an index that was never loaded is not
+// ready, a freshly loaded one is, and one that is older than the limit is
+// not - with the reload error in the message, because "the index is stale"
+// is much less actionable than "and here is why".
+func TestCheck(t *testing.T) {
+	ctx := context.Background()
+	src := &flakySource{staticSource: staticSource{subs: []registry.Subscription{
+		{ID: "00000000-0000-0000-0000-000000000001", Owner: "put", EventType: "put.test", Channel: "sse"},
+	}}}
+	reg := registry.New(src, time.Hour)
+
+	if err := reg.Check(0); err == nil {
+		t.Fatal("Check before the first reload must fail: nothing is loaded")
+	}
+	if err := reg.Reload(ctx); err != nil {
+		t.Fatalf("loading the fake registry: %v", err)
+	}
+	if err := reg.Check(registry.DefaultStaleAfter); err != nil {
+		t.Fatalf("Check after a good reload: %v", err)
+	}
+
+	// A reload that fails keeps the previous index and says so; readiness
+	// only breaks once the index itself has aged out.
+	src.fail = true
+	if err := reg.Reload(ctx); err == nil {
+		t.Fatal("Reload with a failing source must fail")
+	}
+	if err := reg.Check(time.Nanosecond); err == nil {
+		t.Error("Check with a limit shorter than the index age must fail")
+	} else if !strings.Contains(err.Error(), "postgres down") {
+		t.Errorf("Check error must carry the reload failure, got %q", err)
+	}
+
+	// A successful reload swaps a fresh index in, resets the failure count
+	// and clears the recorded error: readiness is back.
+	src.fail = false
+	if err := reg.Reload(ctx); err != nil {
+		t.Fatalf("reloading after recovery: %v", err)
+	}
+	if err := reg.Check(registry.DefaultStaleAfter); err != nil {
+		t.Fatalf("Check after recovery: %v", err)
 	}
 }

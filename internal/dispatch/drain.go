@@ -306,7 +306,11 @@ func (d *Dispatcher) drainSub(ctx context.Context, s *subState, rows []store.Inb
 		}
 		out := s.attemptLoop(d.ctx, it, true)
 		switch out {
-		case outcomeAborted:
+		case outcomeAborted, outcomeParkRetry:
+			// Nothing durable happened to the row: leave it in the inbox for
+			// the next round (outcomeParkRetry cannot occur for an inbox row -
+			// they are never re-parked - but acking one would be data loss, so
+			// the case is explicit).
 			return
 		default:
 			// delivered, dead-lettered, dropped or expired: the row has seen

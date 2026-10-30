@@ -1,7 +1,8 @@
 {{/*
-Run with `helm test <release>`: proves the wiring, not the logic - a pod
-that can reach an API through its Service and a worker through /readyz.
-distroless has no shell to exec into, so this uses a tiny image with wget.
+Run with `helm test <release>`: proves the wiring, not the logic - an API
+through its Service and the services that gate on their dependencies through
+/readyz. distroless has no shell to exec into, so this uses a tiny image with
+wget.
 */}}
 apiVersion: v1
 kind: Pod
@@ -24,14 +25,17 @@ spec:
         - -c
         - |
           set -e
-          echo "publish-api /healthz:"
-          wget -qO- http://{{ include "pubsub.fullname" . }}-publish-api:{{ index .Values.components "publish-api" "port" }}/healthz
+          echo "publish-api /readyz (needs PostgreSQL and a fresh registry):"
+          wget -qO- http://{{ include "pubsub.fullname" . }}-publish-api:{{ index .Values.components "publish-api" "port" }}/readyz
           echo
           echo "dispatcher /readyz (needs PostgreSQL):"
           wget -qO- http://{{ include "pubsub.fullname" . }}-dispatcher:{{ index .Values.components "dispatcher" "port" }}/readyz
           echo
-          echo "sse-gateway /healthz:"
-          wget -qO- http://{{ include "pubsub.fullname" . }}-sse-gateway:{{ index .Values.components "sse-gateway" "port" }}/healthz
+          echo "sse-gateway /readyz (needs PostgreSQL):"
+          wget -qO- http://{{ include "pubsub.fullname" . }}-sse-gateway:{{ index .Values.components "sse-gateway" "port" }}/readyz
+          echo
+          echo "status-api /readyz (needs both stores):"
+          wget -qO- http://{{ include "pubsub.fullname" . }}-status-api:{{ index .Values.components "status-api" "port" }}/readyz
           echo
       resources:
         requests:

@@ -128,13 +128,14 @@ Every service reads its configuration from the environment
 | Variable | Default | Used by |
 | --- | --- | --- |
 | `KAFKA_BROKERS` | `localhost:9092` | everything |
-| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, router, dispatcher, sse-gateway, replay-api |
+| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, status-api, router, dispatcher, sse-gateway, replay-api |
 | `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api, replay-api |
 | `JWT_SECRET` / `JWT_ISSUER` / `JWT_AUDIENCE` | `dev-secret` / `dev` / `pubsub` | every API service, harness, minttoken |
 | `HTTP_ADDR` | `:8080` (publish-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api), set `:8083` for registry-api; `:8085` (router), `:8086` (dispatcher), `:8087` (status-writer) — health endpoints only | every service |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api |
 | `REGISTRY_POLL` | `1s` (`2s` in publish-api) — safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
+| `REGISTRY_STALE_AFTER` | `30s` — how old the registry index may be before `/readyz` fails | publish-api, replay-api, sse-gateway |
 | `WEBHOOK_SIGNING_SECRET` | unset (no HMAC) | dispatcher |
 | `ALLOW_PRIVATE_WEBHOOKS` | true in the spike; set `0` for real deployments | dispatcher |
 | `DISPATCHER_MAX_ATTEMPTS` | `10` | dispatcher |
@@ -182,8 +183,11 @@ All of them expose `/healthz` (liveness) and `/readyz` (readiness) without
 authentication; the three workers serve only those two. Liveness never fails
 because a database is down — restarting a consumer would gain nothing — while
 readiness does: it also reports `starting` until the registry, the inbox
-partitions and the Kafka client are set up. A restart is safe: Kafka offsets
-and the inbox hold the state, and consumers rejoin their groups.
+partitions and the Kafka client are set up, and afterwards it fails while
+PostgreSQL (plus ClickHouse for status-api and replay-api) is unreachable or
+the registry index has stopped moving (`REGISTRY_STALE_AFTER`, 30 s). A
+restart is safe: Kafka offsets and the inbox hold the state, and consumers
+rejoin their groups.
 
 ### 4. Register, subscribe, publish, receive
 
@@ -488,11 +492,12 @@ plus:
   and the ClickHouse table exist before the new revision starts serving. Its
   environment is written inline because at `pre-install` the config secret
   does not exist yet.
-- `maxUnavailable: 0` rollouts gated by `/readyz` on the three worker
-  services, and a `PodDisruptionBudget` per component (`replicas - 1`).
-- Readiness is `/healthz` for the five APIs (that is all they expose) and
-  `/readyz` for router, dispatcher and status-writer, which fail it when
-  their database is unreachable.
+- `maxUnavailable: 0` rollouts gated by `/readyz` on every component, and a
+  `PodDisruptionBudget` per component (`replicas - 1`).
+- Readiness is `/readyz` everywhere now: PostgreSQL for the APIs and the
+  gateway, ClickHouse additionally for status-api and replay-api, and a
+  registry index that is not standing still for everything that routes on it.
+  Liveness stays `/healthz` and never fails because a store is down.
 - No service account token, no writable root filesystem, no capabilities,
   uid 65532 — nothing here talks to the Kubernetes API.
 
@@ -751,6 +756,34 @@ dead-lettered events replayed to 30 delivered, a time-frame replay of 20,
 dry-run, idempotency, cancel-at-batch-boundary and the not_replayable paths —
 full results in
 [docs/deviations-and-open-points.md](docs/deviations-and-open-points.md).
+
+Stability hardening is verified live as well, scenario by scenario
+([the five failure modes](docs/deviations-and-open-points.md#stability-hardening-five-failure-modes-what-each-one-cost-and-gave-back)):
+
+- **No loss with the store down.** 200 events published while PostgreSQL was
+  stopped and the receiver was offline: every delivery failed, every park
+  failed, and the Kafka commit point stayed behind the records
+  (`offsets_in_flight=200`, partition lag 203 while every other partition was
+  caught up). With the database back, the background retry parked all 200 rows
+  (`parking recovered, retries drained`, `offsets_in_flight=0`), the breaker
+  probed, and the drainer delivered them: `expected=200 received=200 missing=0
+  unexpected=0 duplicates=0`, oracle `OK`.
+- **Readiness.** All eight services answer `/readyz` 200 when healthy; with
+  PostgreSQL stopped the seven that need it answer 503 with the connection
+  error while `/healthz` stays 200 (status-writer, which needs only
+  ClickHouse, correctly stays ready). A registry that stops moving says so
+  with its age: `{"error":"registry index is 9s old (limit 5s)"}` while
+  liveness keeps answering.
+- **Status API 404s.** An unknown ID and a malformed ID both answer 404 on
+  the subscription-scoped endpoints (they used to answer 200 with an empty
+  list and 500 respectively); a real one answers 200.
+- **Soft delete.** `DELETE` answers 204 once; GET, PUT, a second DELETE and
+  the list all answer 404 afterwards; the row still exists with its
+  `deleted_at`, and the Status API can still attribute its history (200).
+- **SSE path.** 100 published / 100 received live through the gateway, and a
+  parked batch of 100 with no connection — the rewritten park, status and
+  commit path.
+
 Not exercised yet: the soak test, restart-mid-job recovery of the replay
 worker, the multi-day offline scenario and multi-node SSE gateway failover.
 

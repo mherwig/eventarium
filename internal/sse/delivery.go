@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"pubsub/internal/delivery"
 	"pubsub/internal/kafkautil"
@@ -29,6 +30,28 @@ const drainTick = 500 * time.Millisecond
 // any seed that raced a count.
 const parkedReconcile = time.Second
 
+// reasonParkFailed is the status reason used when a delivery could neither be
+// written to sse-live nor encoded for the inbox: terminal, retried never.
+const reasonParkFailed = "park_failed"
+
+const (
+	// parkRetryQueue bounds the hand-off to the park-retry worker. When it is
+	// full the caller blocks, which is deliberate: the alternative is
+	// committing an offset for a record that nobody holds any more.
+	parkRetryQueue = 1024
+	// parkRetryMax bounds what the retry worker keeps for itself, for the
+	// same reason. A store that stays unreachable has to turn into
+	// backpressure on the poll loop, not into memory - the offsets stay
+	// uncommitted either way and Kafka keeps the records.
+	parkRetryMax = 4096
+	// parkRetryTick is how often a park that failed is attempted again.
+	parkRetryTick = 2 * time.Second
+	// parkLogEvery throttles the park-failure log: parking runs at delivery
+	// speed and again every retry tick, so one line per attempt would drown
+	// the log exactly while the store is down.
+	parkLogEvery = 30 * time.Second
+)
+
 // runDeliveryStage consumes the deliveries topic. The consumer group is
 // sse-delivery: across the group every partition of the topic is owned by
 // exactly one node, and within a node one poll batch is processed serially, so
@@ -48,17 +71,55 @@ func (g *Gateway) runDeliveryStage(ctx context.Context) {
 			}
 		}
 		recs := fs.Records()
+		// Every polled record joins the commit gate before anything is done
+		// with it: the gate may only decide about records it knows, and one it
+		// never learned about would be invisible to the commit point, which
+		// could then step over it.
+		g.gate.Track(recs...)
 		g.processDeliveries(ctx, recs)
-		// Offsets are committed only after the whole batch has been handled, so
-		// a crash repeats a batch instead of losing one; the duplicates are
-		// identified by the event reference (section 8).
-		if len(recs) > 0 {
-			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := g.deliveryCl.CommitRecords(cctx, recs...); err != nil {
+		// The watermark, not the batch. Whatever in this batch is not durable
+		// yet - a row waiting for the background park retry above all - keeps
+		// its partition's commit point where it is, so a crash repeats it
+		// instead of losing it; the duplicates are identified by the event
+		// reference (section 8).
+		g.commitHeads(ctx)
+	}
+}
+
+// commitHeads commits the durable watermark of every partition the gate knows.
+// Unlike the dispatcher, which marks and lets franz-go's autocommit flush, this
+// consumer commits explicitly (DisableAutoCommit) after each batch and after a
+// park the background retry got through.
+func (g *Gateway) commitHeads(ctx context.Context) {
+	heads := g.gate.CommitPoints()
+	if len(heads) == 0 {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	g.deliveryCl.CommitOffsetsSync(cctx, heads,
+		func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, _ *kmsg.OffsetCommitResponse, err error) {
+			if err != nil {
+				// Not fatal: an uncommitted watermark only means the batch is
+				// repeated after a restart, which is the direction we want.
 				g.log.Warn("sse-delivery: committing offsets", "err", err)
 			}
-			cancel()
-		}
+		})
+}
+
+// settle releases one record's offset: the delivery behind it reached a
+// durable outcome, so its partition's commit point may move past it. The
+// gateway consumes the deliveries topic alone, hence the topic name; a settle
+// for something the gate does not know (an inbox row, a partition a rebalance
+// took away) is a no-op.
+func (g *Gateway) settle(partition int32, offset int64) {
+	g.gate.Settle(kafkautil.TopicDeliveries, partition, offset)
+}
+
+// release settles a batch of records that reached a durable outcome.
+func (g *Gateway) release(seqs []delivery.Seq) {
+	for _, seq := range seqs {
+		g.settle(seq.Partition, seq.Offset)
 	}
 }
 
@@ -81,17 +142,31 @@ func (g *Gateway) ownsChannel(msg *delivery.Message) bool {
 
 func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 	bySub := map[string][]deliveryItem{}
+	// durable holds the records whose outcome lives outside this process - an
+	// inbox row or a record on sse-live - and statusOnly the ones whose only
+	// trace is the status record below. Both are released after the status
+	// emit, statusOnly only if it succeeded: a dropped delivery whose status
+	// was lost would otherwise vanish without a trace, and replaying it is
+	// what re-emits the status.
+	var durable, statusOnly []delivery.Seq
+	keep := func(seq delivery.Seq) { durable = append(durable, seq) }
+	byStatus := func(seq delivery.Seq) { statusOnly = append(statusOnly, seq) }
 	for _, rec := range recs {
+		seq := delivery.Seq{Partition: rec.Partition, Offset: rec.Offset}
 		msg, err := delivery.Decode(rec.Value)
 		if err != nil {
+			// Undecodable: nothing can ever act on it, and it carries no
+			// status either, so it is as durable as it will ever be.
 			g.log.Error("sse-delivery: decoding record", "err", err,
 				"partition", rec.Partition, "offset", rec.Offset)
+			keep(seq)
 			continue
 		}
 		if !g.ownsChannel(msg) {
-			continue // webhook deliveries belong to the dispatcher
+			keep(seq) // webhook deliveries belong to the dispatcher
+			continue
 		}
-		it := deliveryItem{seq: delivery.Seq{Partition: rec.Partition, Offset: rec.Offset}, msg: msg}
+		it := deliveryItem{seq: seq, msg: msg}
 		bySub[msg.SubscriptionID] = append(bySub[msg.SubscriptionID], it)
 	}
 
@@ -129,16 +204,26 @@ func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 				// Live events have no redelivery duty, so they are never
 				// parked (section 12); without a connection they are dropped.
 				statuses = append(statuses, statusFor(it.msg, status.Dropped, "live_class", ""))
+				byStatus(it.seq)
 			case !it.msg.ExpiresAt.After(time.Now()):
 				// Section 8: after expires_at a delivery is expired.
 				statuses = append(statuses, statusFor(it.msg, status.Expired, "", ""))
+				byStatus(it.seq)
 			case backlogCap > 0 && parked >= backlogCap:
 				// Section 9: dropped because backlog_max was exceeded.
 				statuses = append(statuses, statusFor(it.msg, status.Dropped, "backlog_max", ""))
+				byStatus(it.seq)
 			default:
 				row, err := parkRow(it, "no_connection")
 				if err != nil {
+					// The payload cannot be encoded for the inbox, so it never
+					// will be - retrying cannot help and committing a record
+					// nobody will ever see again would be silent loss. A
+					// terminal drop with a status, exactly what the dispatcher
+					// does with the same failure (reason park_failed).
 					g.log.Error("sse-delivery: encoding parked payload", "err", err, "subscription", subID)
+					statuses = append(statuses, statusFor(it.msg, status.Dropped, reasonParkFailed, ""))
+					byStatus(it.seq)
 					continue
 				}
 				parkRows = append(parkRows, row)
@@ -151,12 +236,17 @@ func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 	// Park first: the inbox is the durable fallback (section 6.6).
 	if len(parkRows) > 0 {
 		if err := g.store.Park(ctx, parkRows); err != nil {
-			g.log.Error("sse-delivery: parking rows", "err", err)
-			pending = nil // offsets are committed after this batch; production would retry
+			g.logParkFailure(err)
+			// Nothing is durable for these records: no inbox row and no
+			// status. The background retry keeps trying until the store takes
+			// them; until then their offsets stay uncommitted, so a crash
+			// replays them instead of losing them.
+			g.queueParkRetry(ctx, pending, parkRows, "no_connection")
 		} else {
 			g.addParked(parkRows)
 			for _, it := range pending {
 				statuses = append(statuses, statusFor(it.msg, status.Pending, "no_connection", ""))
+				keep(it.seq) // the inbox row is the durability
 			}
 		}
 	}
@@ -178,20 +268,33 @@ func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 			if row, perr := parkRow(it, "no_connection"); perr == nil {
 				fallbackRows = append(fallbackRows, row)
 				fallbackPending = append(fallbackPending, it)
+				continue
+			} else {
+				// The payload cannot be encoded for the inbox either, so it
+				// never will be - committing this record would be silent
+				// loss. Terminal drop with a status, exactly what the
+				// dispatcher does with the same failure.
+				g.log.Error("sse-delivery: encoding parked payload", "err", perr,
+					"subscription", it.msg.SubscriptionID)
+				statuses = append(statuses, statusFor(it.msg, status.Dropped, reasonParkFailed, ""))
+				byStatus(it.seq)
+				continue
 			}
-			continue
 		}
 		// Written, not acknowledged: only an ack turns this into delivered
 		// (sections 6.5 and 9).
 		statuses = append(statuses, statusFor(it.msg, status.Sent, "", liveTargets[i].ConnectionID))
+		keep(it.seq) // the record on sse-live is the durability
 	}
 	if len(fallbackRows) > 0 {
 		if err := g.store.Park(ctx, fallbackRows); err != nil {
-			g.log.Error("sse-delivery: parking fallback rows", "err", err)
+			g.logParkFailure(err)
+			g.queueParkRetry(ctx, fallbackPending, fallbackRows, "no_connection")
 		} else {
 			g.addParked(fallbackRows)
 			for _, it := range fallbackPending {
 				statuses = append(statuses, statusFor(it.msg, status.Pending, "no_connection", ""))
+				keep(it.seq)
 			}
 		}
 	}
@@ -199,8 +302,151 @@ func (g *Gateway) processDeliveries(ctx context.Context, recs []*kgo.Record) {
 	if len(statuses) > 0 {
 		if err := g.status.Produce(ctx, statuses...); err != nil {
 			g.log.Warn("sse-delivery: emitting status", "err", err)
+			// The status records of this batch are gone until the replay
+			// after the restart re-emits them. Records with a durable outcome
+			// may move anyway (an inbox row or an sse-live record is the
+			// delivery); the ones whose status was their only trace may not -
+			// they stay uncommitted and are repeated rather than vanishing.
+			g.release(durable)
+			return
 		}
 	}
+	g.release(durable)
+	g.release(statusOnly)
+}
+
+// parkJob is a delivery whose park failed: the store did not take the row, so
+// the record's offset has to stay uncommitted and this job owns the delivery
+// until the row is in the inbox (spec 6.6). Retrying instead of dropping is
+// what keeps the partition's commit point from standing still for the
+// lifetime of the process.
+type parkJob struct {
+	it     deliveryItem
+	row    store.InboxRow
+	reason string
+	// stored marks a row that reached the inbox, so a later pass does not
+	// credit the cached backlog counter for it a second time.
+	stored bool
+}
+
+// queueParkRetry hands the deliveries whose park failed to the background
+// worker. The send blocks when the channel is full, which is deliberate: the
+// alternative is committing an offset for a record nobody holds any more.
+// Shutdown escapes the block, and then the offsets simply stay uncommitted.
+func (g *Gateway) queueParkRetry(ctx context.Context, items []deliveryItem, rows []store.InboxRow, reason string) {
+	for i, row := range rows {
+		select {
+		case g.parkRetry <- parkJob{it: items[i], row: row, reason: reason}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runParkRetry keeps trying the parks that failed. A store outage must not
+// cost data and must not cost the process its memory either: the channel that
+// feeds this loop and the jobs it holds itself are both bounded, so an
+// unreachable PostgreSQL turns into backpressure on the poll loop, where the
+// offsets are already staying put and Kafka keeps the records. A job leaves
+// the loop only when its outcome is durable - the row is in the inbox and the
+// status went out, or the delivery expired and the status for that did.
+func (g *Gateway) runParkRetry(ctx context.Context) {
+	tick := time.NewTicker(parkRetryTick)
+	defer tick.Stop()
+	var pending []parkJob
+	var warned bool
+	for {
+		if len(pending) < parkRetryMax {
+			select {
+			case <-ctx.Done():
+				return
+			case j := <-g.parkRetry:
+				pending = append(pending, j)
+				continue
+			case <-tick.C:
+			}
+		} else {
+			// Full: stop accepting and let the channel block the callers.
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+		if ctx.Err() != nil {
+			return // the rows are not durable; their offsets stay uncommitted
+		}
+		kept, left := pending[:0], 0
+		progressed := false
+		for _, j := range pending {
+			if !j.row.ExpiresAt.After(time.Now()) {
+				// Section 8: after expires_at a delivery is expired - and
+				// store.Park skips a row whose expiry has passed without
+				// saying so, which would credit a durability that does not
+				// exist. The status is the only trace of the drop, so the
+				// offset may move only once it is out.
+				if err := g.status.Produce(ctx, statusFor(j.it.msg, status.Expired, "", "")); err != nil {
+					g.log.Warn("sse-delivery: emitting status", "err", err)
+					kept = append(kept, j)
+					left++
+					continue
+				}
+				g.settle(j.it.seq.Partition, j.it.seq.Offset)
+				progressed = true
+				continue
+			}
+			if err := g.store.Park(ctx, []store.InboxRow{j.row}); err != nil {
+				g.logParkFailure(err)
+				kept = append(kept, j)
+				left++
+				continue
+			}
+			if !j.stored {
+				g.addParked([]store.InboxRow{j.row})
+				j.stored = true
+			}
+			if err := g.status.Produce(ctx, statusFor(j.it.msg, status.Pending, j.reason, "")); err != nil {
+				// The row is durable but the status is not out: keep the job
+				// and the offset, the row is re-parked harmlessly (ON
+				// CONFLICT DO NOTHING) on the next pass.
+				g.log.Warn("sse-delivery: emitting status", "err", err)
+				kept = append(kept, j)
+				left++
+				continue
+			}
+			g.settle(j.it.seq.Partition, j.it.seq.Offset)
+			progressed = true
+		}
+		pending = kept
+		if progressed {
+			g.commitHeads(ctx)
+		}
+		switch {
+		case left > 0 && !warned:
+			g.log.Warn("sse-delivery: parking is failing, retries queued",
+				"waiting", left, "retry", parkRetryTick.String())
+			warned = true
+		case left == 0 && warned:
+			g.log.Info("sse-delivery: parking recovered, retries drained")
+			warned = false
+		}
+	}
+}
+
+// logParkFailure reports a failed park without drowning the log: parking runs
+// at delivery speed and again every retry tick, so an unreachable store would
+// otherwise put one line per delivery into it. One line per distinct error
+// and never more often than parkLogEvery - the pattern the drainer's lease
+// check uses for the same reason.
+func (g *Gateway) logParkFailure(err error) {
+	g.parkLogMu.Lock()
+	defer g.parkLogMu.Unlock()
+	text := err.Error()
+	if text == g.parkLogErr && time.Since(g.parkLogAt) < parkLogEvery {
+		return
+	}
+	g.parkLogErr, g.parkLogAt = text, time.Now()
+	g.log.Warn("sse-delivery: parking failed", "err", err)
 }
 
 // runInboxExpiry deletes parked rows whose expiry has passed, every five

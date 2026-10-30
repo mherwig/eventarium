@@ -124,11 +124,20 @@ func main() {
 	}()
 
 	server := replay.NewServer(validator, jobs, conn, reg, maxEvents)
+	// Readiness needs every dependency the worker and the API touch:
+	// PostgreSQL (replay_jobs, registry), ClickHouse (the selector) and a
+	// registry index that is not standing still.
+	health := httpx.NewHealth(
+		func(ctx context.Context) error { return st.Pool.Ping(ctx) },
+		func(ctx context.Context) error { return conn.Ping(ctx) },
+		func(context.Context) error {
+			return reg.Check(config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter))
+		},
+	)
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	health.Register(mux)
 	server.Register(mux)
+	health.SetReady(true)
 
 	addr := config.Str("HTTP_ADDR", ":8084")
 	srv := &http.Server{Addr: addr, Handler: httpx.AccessLog(mux)}

@@ -6,6 +6,7 @@
 //	GET /v1/subscriptions/{id}/deliveries        filterable, keyset paginated
 //	GET /v1/subscriptions/{id}/status-summary    per-status counts, last 24h
 //	GET /healthz                                 no auth
+//	GET /readyz                                  no auth (PostgreSQL + ClickHouse)
 //
 // Every endpoint except /healthz requires the status:read scope and every
 // query is filtered by the owner in the verified JWT (section 6.7): a caller
@@ -30,14 +31,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"pubsub/internal/auth"
 	"pubsub/internal/chquery"
 	"pubsub/internal/chstore"
 	"pubsub/internal/config"
 	"pubsub/internal/httpx"
+	"pubsub/internal/store"
 )
 
-const defaultCHDSN = "clickhouse://pubsub:pubsub@localhost:9000/pubsub"
+const (
+	defaultCHDSN = "clickhouse://pubsub:pubsub@localhost:9000/pubsub"
+	defaultPGDSN = "postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable"
+)
 
 func main() {
 	setupLogging()
@@ -51,6 +58,19 @@ func main() {
 	}
 	defer conn.Close()
 
+	// PostgreSQL is the existence and ownership oracle: a subscription ID is
+	// asked of the subscriptions table, not of ClickHouse, which only ever
+	// holds delivery records (section 9 keeps them metadata-free). The
+	// lookup includes soft-deleted rows (migration 004) on purpose: the
+	// deliveries of a subscription that has since been deleted happened, and
+	// their history must stay readable under the owner that owns them.
+	pg, err := store.Open(ctx, config.Str("PG_DSN", defaultPGDSN))
+	if err != nil {
+		slog.Error("status-api: postgres", "err", err)
+		os.Exit(1)
+	}
+	defer pg.Close()
+
 	validator, err := auth.NewHMAC(
 		config.Str("JWT_SECRET", "dev-secret"),
 		config.Str("JWT_ISSUER", "dev"),
@@ -60,10 +80,17 @@ func main() {
 		slog.Error("status-api: auth", "err", err)
 		os.Exit(1)
 	}
-	a := &api{validator: validator, store: chquery.New(conn)}
+	a := &api{validator: validator, store: chquery.New(conn), pg: pg}
+
+	// Readiness needs both stores: every endpoint answers from ClickHouse
+	// and the two subscription-scoped ones gate on PostgreSQL first.
+	health := httpx.NewHealth(
+		func(ctx context.Context) error { return conn.Ping(ctx) },
+		func(ctx context.Context) error { return pg.Pool.Ping(ctx) },
+	)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", a.healthz)
+	health.Register(mux)
 	// The delivery ID is event_ref + "/" + subscription_id (section 5), so
 	// it spans two path segments and needs a prefix route.
 	mux.HandleFunc("GET /v1/deliveries/", a.delivery)
@@ -72,6 +99,7 @@ func main() {
 	mux.HandleFunc("GET /v1/subscriptions/{id}/status-summary", a.statusSummary)
 
 	addr := config.Str("HTTP_ADDR", ":8081")
+	health.SetReady(true)
 	srv := &http.Server{Addr: addr, Handler: httpx.AccessLog(mux)}
 	go func() {
 		slog.Info("status-api: listening", "addr", addr)
@@ -92,11 +120,43 @@ func main() {
 type api struct {
 	validator *auth.Validator
 	store     *chquery.Store
+	// pg answers "does this subscription exist for this owner?" - the one
+	// question the status store cannot answer, because section 9 keeps status
+	// records free of subscription metadata.
+	pg *store.Store
 }
 
-// healthz is the liveness probe; it needs no auth.
-func (a *api) healthz(w http.ResponseWriter, _ *http.Request) {
-	httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+// requireSubscription fails the request with 404 unless the owner really has
+// this subscription. Without it, an arbitrary ID answers 200 with an empty
+// list, which is the platform claiming to have checked something it did not
+// (section 6.7: a foreign ID and a foreign delivery are the same not found).
+// A database error is not "does not exist": it fails closed with a 500, so a
+// broken lookup can never turn into a 404 that hides real history, nor into a
+// 200 that invents an ownership that was never verified.
+func (a *api) requireSubscription(w http.ResponseWriter, r *http.Request) (owner, id string, ok bool) {
+	claims, authorized := a.validator.Authorize(w, r, auth.ScopeStatusRead)
+	if !authorized {
+		return "", "", false
+	}
+	id = r.PathValue("id")
+	// A malformed ID is not a database problem and must not become a 500:
+	// the $1::uuid cast would error. Like the control-plane API, it answers
+	// 404 - unknown and malformed are the same "you have no such
+	// subscription" (section 6.7), and a 400 would confirm nothing either.
+	if _, err := uuid.Parse(id); err != nil {
+		httpx.Error(w, http.StatusNotFound, "not found")
+		return "", "", false
+	}
+	exists, err := a.pg.SubscriptionExists(r.Context(), claims.Owner, id)
+	if err != nil {
+		a.fail(w, "subscription lookup", err)
+		return "", "", false
+	}
+	if !exists {
+		httpx.Error(w, http.StatusNotFound, "not found")
+		return "", "", false
+	}
+	return claims.Owner, id, true
 }
 
 // delivery returns the full history of one delivery ordered by ts, plus the
@@ -140,7 +200,7 @@ func (a *api) eventDeliveries(w http.ResponseWriter, r *http.Request) {
 // by current status and time range, with keyset pagination on
 // (ts, delivery_id) (section 10, endpoint 3).
 func (a *api) subscriptionDeliveries(w http.ResponseWriter, r *http.Request) {
-	claims, ok := a.validator.Authorize(w, r, auth.ScopeStatusRead)
+	owner, id, ok := a.requireSubscription(w, r)
 	if !ok {
 		return
 	}
@@ -149,7 +209,7 @@ func (a *api) subscriptionDeliveries(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	items, next, err := a.store.SubscriptionDeliveries(r.Context(), claims.Owner, r.PathValue("id"), f)
+	items, next, err := a.store.SubscriptionDeliveries(r.Context(), owner, id, f)
 	if err != nil {
 		a.fail(w, "subscription deliveries", err)
 		return
@@ -164,7 +224,7 @@ func (a *api) subscriptionDeliveries(w http.ResponseWriter, r *http.Request) {
 // connections are PostgreSQL control data and would be added there in a later
 // version; the spec marks this endpoint optional.
 func (a *api) statusSummary(w http.ResponseWriter, r *http.Request) {
-	claims, ok := a.validator.Authorize(w, r, auth.ScopeStatusRead)
+	owner, id, ok := a.requireSubscription(w, r)
 	if !ok {
 		return
 	}
@@ -179,7 +239,7 @@ func (a *api) statusSummary(w http.ResponseWriter, r *http.Request) {
 			since = t
 		}
 	}
-	counts, total, err := a.store.StatusCounts(r.Context(), claims.Owner, r.PathValue("id"), since)
+	counts, total, err := a.store.StatusCounts(r.Context(), owner, id, since)
 	if err != nil {
 		a.fail(w, "status summary", err)
 		return

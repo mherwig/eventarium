@@ -12,6 +12,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -32,6 +33,13 @@ const (
 	listenBackoffMax  = 30 * time.Second
 	listenStableAfter = time.Minute
 )
+
+// DefaultStaleAfter is the age Check accepts when the caller names no
+// maximum: far beyond the poll interval (2 s by default), so that one slow
+// reload does not flap readiness, and still short enough that an index which
+// stopped moving - the failure this exists for - is noticed within a probe or
+// two.
+const DefaultStaleAfter = 30 * time.Second
 
 // EventType is one registered CloudEvents type (section 6.1).
 type EventType struct {
@@ -104,6 +112,13 @@ type Registry struct {
 	byID    map[string]*Entry
 	invalid map[string]string // subscription id -> compile error, for logging
 	loaded  time.Time
+	// failures counts the reloads that did not succeed in a row and lastErr
+	// holds the text of the most recent one (empty after a success). Check
+	// turns them into a readiness answer and the reload log into a line that
+	// says how long the index has been standing still, not just that a query
+	// failed again.
+	failures int
+	lastErr  string
 }
 
 // Option configures a Registry.
@@ -153,9 +168,24 @@ func (r *Registry) Run(ctx context.Context) {
 	}
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
+	// A database outage fails every reload for as long as it lasts, and the
+	// poll plus the listener both retry - one line per attempt would bury the
+	// log exactly while it is most interesting. Log the first failure and
+	// every change of the error, then the recovery; the line carries the
+	// consecutive count and the age of the index, which is the part that
+	// matters ("how long have we been working from this snapshot").
+	var loggedErr string
 	for {
-		if err := r.Reload(ctx); err != nil {
-			slog.Warn("registry reload failed", "err", err)
+		err := r.Reload(ctx)
+		failures, age := r.status()
+		switch {
+		case err != nil && err.Error() != loggedErr:
+			slog.Warn("registry reload failed", "err", err,
+				"consecutive", failures, "index_age", age.String())
+			loggedErr = err.Error()
+		case err == nil && loggedErr != "":
+			slog.Info("registry reload recovered", "index_age", age.String())
+			loggedErr = ""
 		}
 		select {
 		case <-ctx.Done():
@@ -243,11 +273,11 @@ func (r *Registry) Reload(ctx context.Context) error {
 	defer r.reloadMu.Unlock()
 	types, err := r.source.EventTypes(ctx)
 	if err != nil {
-		return fmt.Errorf("registry: loading event types: %w", err)
+		return r.failed(fmt.Errorf("registry: loading event types: %w", err))
 	}
 	subs, err := r.source.Subscriptions(ctx)
 	if err != nil {
-		return fmt.Errorf("registry: loading subscriptions: %w", err)
+		return r.failed(fmt.Errorf("registry: loading subscriptions: %w", err))
 	}
 	newTypes := make(map[string]EventType, len(types))
 	for i := range types {
@@ -281,9 +311,58 @@ func (r *Registry) Reload(ctx context.Context) error {
 	}
 	r.mu.Lock()
 	r.types, r.byType, r.byID, r.invalid, r.loaded = newTypes, byType, byID, invalid, time.Now()
+	r.failures, r.lastErr = 0, ""
 	r.mu.Unlock()
 	for id, msg := range invalid {
 		slog.Warn("subscription has invalid filters, skipped", "subscription", id, "err", msg)
+	}
+	return nil
+}
+
+// failed records a reload that did not reach the index and returns the error
+// unchanged, so callers keep reporting it.
+func (r *Registry) failed(err error) error {
+	r.mu.Lock()
+	r.failures++
+	r.lastErr = err.Error()
+	r.mu.Unlock()
+	return err
+}
+
+// status reports how many reloads failed in a row and how old the live index
+// is - the two facts the reload log and /readyz need to say more than "an
+// error happened".
+func (r *Registry) status() (failures int, age time.Duration) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if !r.loaded.IsZero() {
+		age = time.Since(r.loaded)
+	}
+	return r.failures, age
+}
+
+// Check reports why the in-memory index may not be trusted right now. It is
+// the readiness hook (internal/httpx): a service that routes on this index
+// answers 503 while it is older than maxAge instead of quietly working
+// against a snapshot that stopped moving when the database went away. A
+// non-positive maxAge means DefaultStaleAfter.
+//
+// Check is an approved addition to this frozen package, like ChannelFor.
+func (r *Registry) Check(maxAge time.Duration) error {
+	if maxAge <= 0 {
+		maxAge = DefaultStaleAfter
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.loaded.IsZero() {
+		return errors.New("registry index has never been loaded")
+	}
+	if age := time.Since(r.loaded); age > maxAge {
+		if r.lastErr != "" {
+			return fmt.Errorf("registry index is %s old (limit %s), last reload failed: %s",
+				age.Round(time.Second), maxAge, r.lastErr)
+		}
+		return fmt.Errorf("registry index is %s old (limit %s)", age.Round(time.Second), maxAge)
 	}
 	return nil
 }

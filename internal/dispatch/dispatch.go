@@ -27,6 +27,7 @@ import (
 
 	"pubsub/internal/delivery"
 	"pubsub/internal/kafkautil"
+	"pubsub/internal/offsetgate"
 	"pubsub/internal/registry"
 	"pubsub/internal/status"
 	"pubsub/internal/store"
@@ -53,6 +54,22 @@ const (
 	drainBatch      = 200
 	heartbeatEvery  = 10 * time.Second
 	defaultAttempts = 10
+
+	// parkRetryQueue bounds the hand-off to the park-retry worker. When it is
+	// full the caller blocks, which is deliberate: the alternative is
+	// committing an offset for a record that nobody holds any more.
+	parkRetryQueue = 1024
+	// parkRetryMax bounds what the retry worker keeps for itself, for the same
+	// reason. A store that stays unreachable has to turn into backpressure on
+	// the poll loop, not into memory - the offsets stay uncommitted either way
+	// and Kafka keeps the records.
+	parkRetryMax = 4096
+	// parkRetryTick is how often a park that failed is attempted again.
+	parkRetryTick = 2 * time.Second
+	// parkLogEvery throttles the park-failure log: parking runs at ingestion
+	// speed and again every retry tick, so one line per attempt would drown the
+	// log exactly while the store is down.
+	parkLogEvery = 30 * time.Second
 )
 
 // accept is the decision of the submit path.
@@ -63,6 +80,17 @@ const (
 	acceptPark
 	acceptDropQueue
 )
+
+// parkRetry is a delivery whose park failed: the store did not take the row,
+// so the record's offset has to stay uncommitted and this job owns the
+// delivery until the row is in the inbox (spec 6.6). Retrying instead of
+// dropping is what keeps the partition's commit point from standing still for
+// the lifetime of the process.
+type parkRetry struct {
+	s      *subState
+	it     *item
+	reason string
+}
 
 type counters struct {
 	delivered    atomic.Uint64
@@ -98,6 +126,20 @@ type Dispatcher struct {
 
 	workers sync.WaitGroup
 
+	// gate holds the commit watermark of the deliveries topic: a record's
+	// offset joins it when the poll returns the record, and is released only
+	// when the delivery reached a durable outcome (internal/offsetgate).
+	gate *offsetgate.Gate
+	// parkRetry hands deliveries whose park failed to the background worker
+	// that keeps trying until the store takes them.
+	parkRetry chan *parkRetry
+
+	// parkLogErr/parkLogAt throttle the park-failure warning: parking runs at
+	// ingestion speed and again every retry tick (parkLogEvery).
+	parkLogMu  sync.Mutex
+	parkLogErr string
+	parkLogAt  time.Time
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	count  counters
@@ -111,10 +153,18 @@ func New(cfg Config) (*Dispatcher, error) {
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = defaultAttempts
 	}
+	// The gate is built first because the consumer's assignment callback needs
+	// it: a rebalance can hand a partition to another replica while this one
+	// still holds records of it, and the gate has to stop tracking them - a
+	// late settle must not move an offset somebody else now owns.
+	gate := offsetgate.New()
 	cl, err := kafkautil.NewClient(
 		kgo.ConsumerGroup(consumerGroup),
 		kgo.AutoCommitMarks(),
 		kgo.ConsumeTopics(kafkautil.TopicDeliveries),
+		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
+			gate.Keep(assigned)
+		}),
 	)
 	if err != nil {
 		return nil, err
@@ -129,6 +179,8 @@ func New(cfg Config) (*Dispatcher, error) {
 		maxAttempts:  cfg.MaxAttempts,
 		subs:         map[string]*subState{},
 		known:        map[string]struct{}{},
+		gate:         gate,
+		parkRetry:    make(chan *parkRetry, parkRetryQueue),
 		// No global timeout: every attempt gets its own context timeout
 		// (request_timeout_ms). Redirects are never followed (spec 6.4
 		// security list); a 3xx counts as an ordinary failure.
@@ -146,6 +198,7 @@ func (d *Dispatcher) Run(parent context.Context) {
 	d.ctx, d.cancel = ctx, cancel
 	go d.heartbeat()
 	go d.drainLoop()
+	go d.parkRetryLoop()
 	for {
 		recs := d.cl.PollRecords(ctx, 256)
 		if recs.NumRecords() == 0 {
@@ -178,16 +231,23 @@ func (d *Dispatcher) ownsChannel(msg *delivery.Message) bool {
 	return d.reg.ChannelFor(msg.SubscriptionID, msg.Channel) == delivery.ChannelWebhook
 }
 
-// handleRecord dispatches one deliveries-topic record. The offset is marked
-// for commit once the delivery is safely owned by the in-memory state, parked
-// in the inbox, or terminally dropped; a failed park leaves the offset
-// unmarked so the record is redelivered after a restart.
+// handleRecord dispatches one deliveries-topic record. The record joins the
+// commit gate first and its offset is released only when the delivery is
+// durable: owned by the in-memory state until it reaches a terminal outcome,
+// parked in the inbox, or terminally dropped. A record that is only in memory
+// - queued, retrying, waiting for a park to succeed - keeps its partition's
+// commit point where it is, so a crash replays it instead of skipping it
+// (section 8: duplicates are identified by the event reference).
 func (d *Dispatcher) handleRecord(rec *kgo.Record) {
+	// Before anything else: the gate may only decide about a record it knows,
+	// and a record it never learns about would be invisible to the commit
+	// point, which could then step over it.
+	d.gate.Track(rec)
 	msg, err := delivery.Decode(rec.Value)
 	if err != nil {
 		slog.Warn("dispatcher: undecodable delivery, skipped",
 			"partition", rec.Partition, "offset", rec.Offset, "err", err)
-		d.cl.MarkCommitRecords(rec)
+		d.settle(rec.Partition, rec.Offset)
 		return
 	}
 	it := &item{msg: msg, seq: delivery.Seq{Partition: rec.Partition, Offset: rec.Offset}}
@@ -195,7 +255,7 @@ func (d *Dispatcher) handleRecord(rec *kgo.Record) {
 	// longer exists keeps its stamped channel (see ownsChannel).
 	if !d.ownsChannel(msg) {
 		// SSE deliveries belong to the sse-delivery stage; skip and commit.
-		d.cl.MarkCommitRecords(rec)
+		d.settle(rec.Partition, rec.Offset)
 		return
 	}
 	entry, ok := d.reg.Subscription(msg.SubscriptionID)
@@ -204,7 +264,7 @@ func (d *Dispatcher) handleRecord(rec *kgo.Record) {
 			"subscription", msg.SubscriptionID, "delivery", msg.DeliveryID)
 		d.emitStatus(it, status.Dropped, reasonUnknownSub, 0, 0, 0)
 		d.count.dropped.Add(1)
-		d.cl.MarkCommitRecords(rec)
+		d.settle(rec.Partition, rec.Offset)
 		return
 	}
 	if entry.Sub.Channel != delivery.ChannelWebhook {
@@ -212,26 +272,149 @@ func (d *Dispatcher) handleRecord(rec *kgo.Record) {
 		// subscription moved again in between. Acting now would combine the
 		// channel of one snapshot with the policy of another, so leave the
 		// record to the stage that owns it in the snapshot held here.
-		d.cl.MarkCommitRecords(rec)
+		d.settle(rec.Partition, rec.Offset)
 		return
 	}
 	s, how, reason := d.submit(entry.Sub, it)
 	switch how {
 	case acceptQueued:
-		d.cl.MarkCommitRecords(rec)
+		// The worker releases the offset in finish() when the item reaches a
+		// terminal state. Marking here - what this used to do - commits a
+		// record that a shutdown would then abort from its queue: the offset
+		// was already committed while the delivery was only in memory.
 	case acceptPark:
 		if reason == reasonCircuitOpen {
 			// The breaker opening pauses the delivery that cannot be attempted.
 			d.emitStatus(it, status.Paused, reason, 0, 0, 0)
 		}
-		if d.park(d.ctx, s, it, reason) {
-			d.cl.MarkCommitRecords(rec)
+		if d.parkOrRetry(d.ctx, s, it, reason) {
+			d.settle(rec.Partition, rec.Offset)
 		}
 	case acceptDropQueue:
 		d.emitStatus(it, status.Dropped, reason, 0, 0, 0)
 		d.count.dropped.Add(1)
-		d.cl.MarkCommitRecords(rec)
+		d.settle(rec.Partition, rec.Offset)
 	}
+}
+
+// settle releases a record's offset: the delivery behind it reached a durable
+// outcome, so the commit point of its partition may move up to the next record
+// that has not. The dispatcher consumes the deliveries topic alone, hence the
+// topic name; a settle for something the gate does not know (an inbox row, a
+// partition a rebalance took away) is a no-op.
+func (d *Dispatcher) settle(partition int32, offset int64) {
+	if heads := d.gate.Settle(kafkautil.TopicDeliveries, partition, offset); len(heads) > 0 {
+		d.cl.MarkCommitOffsets(heads)
+	}
+}
+
+// parkOrRetry parks the delivery and reports whether it is durable. A failed
+// park does not fail the record: the item goes to the background retry, which
+// parks it as soon as the store answers and releases the offset then. Until
+// that happens the partition's commit point stands still, so a crash replays
+// the record - and if this process never comes back, that replay is the
+// recovery.
+func (d *Dispatcher) parkOrRetry(ctx context.Context, s *subState, it *item, reason string) bool {
+	if d.park(ctx, s, it, reason) {
+		return true
+	}
+	select {
+	case d.parkRetry <- &parkRetry{s: s, it: it, reason: reason}:
+	case <-ctx.Done():
+		// Shutdown: nobody will park it in this process. The offset stays
+		// uncommitted and the record is replayed after the restart.
+	}
+	return false
+}
+
+// finish settles the offset of an item that left the attempt loop - unless the
+// record is not durable yet, which is exactly the case the offset must not
+// move for.
+func (d *Dispatcher) finish(it *item, out outcome) {
+	if it.fromInbox {
+		return // an inbox row carries no offset of its own; the row is the durability
+	}
+	switch out {
+	case outcomeAborted:
+		// Shutdown: the record is neither delivered nor parked, so its offset
+		// stays uncommitted and whoever consumes the partition next replays it.
+	case outcomeParkRetry:
+		// The background retry owns it and settles the offset once the row is
+		// in the inbox.
+	default:
+		// delivered, dead-lettered, dropped, expired, parked: all durable.
+		d.settle(it.seq.Partition, it.seq.Offset)
+	}
+}
+
+// parkRetryLoop keeps trying the parks that failed. A store outage must not
+// cost data and must not cost the process its memory either: the queue that
+// feeds this loop and the items it holds itself are both bounded, so an
+// unreachable PostgreSQL turns into backpressure on the poll loop, where the
+// offsets are already staying put and Kafka keeps the records.
+func (d *Dispatcher) parkRetryLoop() {
+	tick := time.NewTicker(parkRetryTick)
+	defer tick.Stop()
+	var pending []*parkRetry
+	var warned bool
+	for {
+		if len(pending) < parkRetryMax {
+			select {
+			case <-d.ctx.Done():
+				return
+			case p := <-d.parkRetry:
+				pending = append(pending, p)
+				continue
+			case <-tick.C:
+			}
+		} else {
+			// Full: stop accepting and let the channel block the callers.
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+		if d.ctx.Err() != nil {
+			return // the items are not durable; their offsets stay uncommitted
+		}
+		kept, left := pending[:0], 0
+		for _, p := range pending {
+			if d.park(d.ctx, p.s, p.it, p.reason) {
+				d.settle(p.it.seq.Partition, p.it.seq.Offset)
+				continue
+			}
+			kept = append(kept, p)
+			left++
+		}
+		pending = kept
+		switch {
+		case left > 0 && !warned:
+			slog.Warn("dispatcher: parking is failing, retries queued",
+				"waiting", left, "retry", parkRetryTick.String())
+			warned = true
+		case left == 0 && warned:
+			slog.Info("dispatcher: parking recovered, retries drained")
+			warned = false
+		}
+	}
+}
+
+// logParkFailure reports a failed park without drowning the log: parking runs
+// at ingestion speed and again every retry tick, so an unreachable store would
+// otherwise put one line per delivery into it. One line per distinct error and
+// never more often than parkLogEvery - the pattern the drainer's lease check
+// uses for the same reason.
+func (d *Dispatcher) logParkFailure(sub string, seq delivery.Seq, err error) {
+	d.parkLogMu.Lock()
+	defer d.parkLogMu.Unlock()
+	text := err.Error()
+	if text == d.parkLogErr && time.Since(d.parkLogAt) < parkLogEvery {
+		return
+	}
+	d.parkLogErr, d.parkLogAt = text, time.Now()
+	slog.Warn("dispatcher: parking failed",
+		"subscription", sub, "seq", seq.String(), "err", err)
 }
 
 // submit creates or fetches the subscription state and takes the enqueue
@@ -314,8 +497,10 @@ func (d *Dispatcher) newStateLocked(sub *registry.Subscription, pol policy) *sub
 }
 
 // park moves the delivery into the PostgreSQL inbox (spec 6.6) and emits
-// pending with the reason. Returns false when the park failed and the record
-// should be redelivered.
+// pending with the reason. Returns false when the park failed: the caller then
+// hands the item to the background retry (parkOrRetry) instead of releasing
+// its offset, because a record that is neither delivered nor parked must stay
+// uncommitted.
 func (d *Dispatcher) park(ctx context.Context, s *subState, it *item, reason string) bool {
 	if !it.msg.ExpiresAt.IsZero() && !time.Now().Before(it.msg.ExpiresAt) {
 		d.emitStatus(it, status.Expired, reasonExpired, 0, 0, 0)
@@ -355,8 +540,7 @@ func (d *Dispatcher) park(ctx context.Context, s *subState, it *item, reason str
 		ExpiresAt:      it.msg.ExpiresAt,
 	}
 	if err := d.st.Park(pctx, []store.InboxRow{row}); err != nil {
-		slog.Warn("dispatcher: parking failed",
-			"subscription", s.id, "seq", it.seq.String(), "err", err)
+		d.logParkFailure(s.id, it.seq, err)
 		return false
 	}
 	s.parked.Add(1) // local delta until the drainer's next count replaces it
@@ -392,6 +576,10 @@ func (d *Dispatcher) heartbeat() {
 			"dead_lettered", d.count.deadLettered.Load(),
 			"queue_depth", depth,
 			"subscriptions", states,
+			// Records whose offset may not be committed yet: queued, retrying
+			// or waiting for a park. A number that only grows means the commit
+			// points are standing still while Kafka keeps the records.
+			"offsets_in_flight", d.gate.Pending(),
 		)
 	}
 }

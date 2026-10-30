@@ -28,6 +28,10 @@ type outcome int
 const (
 	outcomeDelivered outcome = iota
 	outcomeParked
+	// outcomeParkRetry: the park itself failed (the store did not take the
+	// row), so the delivery went to the background retry. It is deliberately
+	// not outcomeParked - nothing is durable yet and the offset must not move.
+	outcomeParkRetry
 	outcomeDead
 	outcomeDropped
 	outcomeExpired
@@ -114,20 +118,25 @@ func (s *subState) pick(msg *delivery.Message, pol policy) chan *item {
 
 // work is one delivery worker. Retries with backoff happen in place, so a
 // worker that owns an event keeps it (and its ordering position) until the
-// event reaches a terminal state.
+// event reaches a terminal state. The record's offset is released only then
+// (finish): an item that leaves the loop without a durable outcome - shutdown,
+// or a park that is being retried in the background - keeps its partition's
+// commit point where it is, so the record is replayed rather than lost.
 func (s *subState) work(q chan *item) {
 	defer s.d.workers.Done()
 	for it := range q {
 		s.inFlight.Add(1)
-		s.attemptLoop(s.d.ctx, it, false)
+		out := s.attemptLoop(s.d.ctx, it, false)
 		s.inFlight.Add(-1)
 		s.lastActive.Store(time.Now().UnixNano())
+		s.d.finish(it, out)
 	}
 }
 
 // attemptLoop runs one item to a terminal state: delivered, dead-lettered,
-// dropped (live only), expired, parked, or aborted (shutdown or an inbox row
-// that must stay for the next drain round).
+// dropped (live only), expired, parked, handed to the park retry (the store
+// refused the row), or aborted (shutdown or an inbox row that must stay for
+// the next drain round).
 func (s *subState) attemptLoop(ctx context.Context, it *item, drain bool) outcome {
 	msg := it.msg
 	live := msg.RetentionClass == kafkautil.ClassLive
@@ -166,8 +175,10 @@ func (s *subState) attemptLoop(ctx context.Context, it *item, drain bool) outcom
 				}
 				continue
 			}
-			s.d.park(ctx, s, it, reasonCircuitOpen)
-			return outcomeParked
+			if s.d.parkOrRetry(ctx, s, it, reasonCircuitOpen) {
+				return outcomeParked
+			}
+			return outcomeParkRetry // the background retry owns it now
 		}
 		// Rate limit: the policy bucket for the hot path, the slower drain
 		// bucket for inbox rows.
@@ -190,8 +201,10 @@ func (s *subState) attemptLoop(ctx context.Context, it *item, drain bool) outcom
 				}
 				continue
 			}
-			s.d.park(ctx, s, it, reasonRateLimited)
-			return outcomeParked
+			if s.d.parkOrRetry(ctx, s, it, reasonRateLimited) {
+				return outcomeParked
+			}
+			return outcomeParkRetry // the background retry owns it now
 		}
 
 		attempt++

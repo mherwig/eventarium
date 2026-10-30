@@ -76,7 +76,11 @@ func main() {
 	}
 
 	api := &api{auth: validator, store: st}
-	mux := newMux(api)
+	// Readiness needs PostgreSQL (every endpoint reads it directly) - the
+	// migrations above already proved it once, /readyz proves it again.
+	health := httpx.NewHealth(func(ctx context.Context) error { return st.Pool.Ping(ctx) })
+	mux := newMux(api, health)
+	health.SetReady(true)
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -101,11 +105,9 @@ func main() {
 
 // newMux wires the endpoints. It is separate from main so that the handlers
 // can be exercised through httptest against a real store.
-func newMux(a *api) *http.ServeMux {
+func newMux(a *api, health *httpx.Health) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	health.Register(mux) // /healthz and /readyz
 	mux.HandleFunc("POST /v1/event-types", a.handleEventTypeCreate)
 	mux.HandleFunc("GET /v1/event-types", a.handleEventTypeList)
 	mux.HandleFunc("DELETE /v1/event-types/{name}", a.handleEventTypeDelete)

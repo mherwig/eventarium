@@ -211,6 +211,75 @@ Also still open and untouched: an update does not rewrite `expires_at` or the
 inbox TTL of already parked rows, so a webhook⇄SSE switch leaves rows waiting
 for the other stage until they expire there.
 
+## Stability hardening: five failure modes, what each one cost and gave back
+
+Five questions about what happens when things break, the answer to each, and
+the change it produced. Two of them were real data-loss paths.
+
+1. **Data loss on a crash or a store outage — fixed, at the price of
+   duplicates.** Both delivery stages used to commit their Kafka offsets as
+   soon as a record was *owned in memory*: the dispatcher marked a record the
+   moment it was queued, the sse-gateway committed the whole poll batch after
+   processing it. A crash in between lost the delivery silently — the offset
+   was committed, the work was not done. Now the commit point is a watermark
+   (`internal/offsetgate`, an approved new package): a record's offset is
+   released only when its delivery reached a durable outcome — delivered,
+   dead-lettered, terminally dropped, on `sse-live`, or parked in the inbox.
+   What is still in flight (queued, retrying, waiting for a park) holds the
+   partition's commit point still, so a crash *repeats* the batch instead of
+   skipping it; the duplicates are identified by the event reference (§8).
+   A park that the store refused used to be dropped with the record still
+   committed; it now goes to a bounded background retry queue (backpressure
+   rather than memory), and its offset stays uncommitted until the row is in
+   the inbox. The one deliberate exception is a payload that cannot be encoded
+   for the inbox: no amount of retrying fixes that, so it is a terminal drop
+   with a `dropped`/`park_failed` status — a loss with a record of it, not a
+   silent one. Accepted and documented: the dispatcher's status emitter is
+   asynchronous (50 ms / 512 records), so a crash can lose up to 50 ms of
+   *status rows* while the offsets commit — observability only, never a
+   delivery.
+2. **Readiness — fixed.** The five APIs exposed only `/healthz`, so a rolling
+   update declared a replica good two seconds after it started, before its
+   registry was loaded and with a database it could not reach. Every service
+   now also serves `/readyz` (`internal/httpx.Health`, `Register` onto the
+   API mux, `RegisterReady` for the gateway, which keeps its own `/healthz`
+   body): PostgreSQL for the APIs and the gateway, ClickHouse additionally for
+   status-api and replay-api, and for everything that routes on the registry
+   an index that is not standing still (`Registry.Check`). The chart's five
+   `readyPath` values moved from `/healthz` to `/readyz`. Liveness is
+   unchanged and still never fails because a store is down: restarting a
+   consumer over a database outage gains nothing and only disturbs the
+   consumer groups.
+3. **Deleting a subscription was a hard `DELETE` — fixed, softly.** The row
+   was the only subject a parked delivery, a status record or a replay could
+   be attributed to, and a hard delete took it away: the status API answered
+   404 for history that still existed in ClickHouse, and a delivery in flight
+   became `unknown_subscription` noise instead of a traceable drop. Migration
+   004 adds `deleted_at`; `DELETE` stamps it, and everything that answers
+   "what is configured now" (registry index, control-plane GET/PUT/DELETE,
+   list) filters it out, so the API contract is unchanged — 404, and the
+   second delete is a 404 too. Only the attribution path
+   (`store.SubscriptionExists`) counts deleted rows.
+4. **The status API answered 200 with an empty list for IDs that never
+   existed — fixed.** `/v1/subscriptions/{id}/deliveries` and
+   `/v1/subscriptions/{id}/status-summary` asked ClickHouse, which holds
+   delivery records and no subscription metadata (§9), so an arbitrary ID
+   looked like a valid subscription with no deliveries. Both endpoints now
+   look the ID up in PostgreSQL first, owner scoped, including soft-deleted
+   rows; unknown and foreign answer the same 404 (§6.7), and a database error
+   answers 500 — the check fails closed, because "no rows" and "we could not
+   check" must not look alike.
+5. **A registry that stopped reloading failed silently — fixed.** A reload
+   failure was one warning per attempt and nothing else: the index kept
+   serving whatever it last loaded, `/healthz` stayed green, and nothing said
+   *how long* the snapshot had been standing still. The registry now counts
+   consecutive failures, remembers the last error, and `Check(maxAge)` turns
+   that into a readiness answer (`REGISTRY_STALE_AFTER`, default 30 s, so a
+   single slow reload cannot flap a rollout). The reload log is one line per
+   distinct error with the consecutive count and the index age, plus the
+   recovery line — one line per attempt would bury the log exactly while the
+   database is down.
+
 ## Fault injection: dispatcher, SSE gateway and cursor recovery (§17 test plan)
 
 Run against the live stack — webhook subscription `73d5d2d2` (`fault.cb`),

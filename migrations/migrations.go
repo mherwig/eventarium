@@ -50,7 +50,11 @@ func Apply(ctx context.Context, pool *pgxpool.Pool) error {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("migrations: applying %s: %w", name, err)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (name) VALUES ($1)`, name); err != nil {
+		// ON CONFLICT: two services (or two test packages) can start at the
+		// same moment, both see the migration as not applied and both apply
+		// it. The statements are idempotent, so whoever loses the race just
+		// records the same row the winner recorded.
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, name); err != nil {
 			_ = tx.Rollback(ctx)
 			return err
 		}

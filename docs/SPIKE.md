@@ -86,10 +86,27 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   subscription's current channel when the ID is known, the stamped channel
   when it is not. Approved addition to this frozen package — dispatcher and
   sse-gateway must apply one shared rule, because two rules could let both
-  stages skip a record (lost) or both take it (duplicated).
+  stages skip a record (lost) or both take it (duplicated). `Check(maxAge)` is
+  the second approved addition: it reports why the index may not be trusted
+  right now (never loaded, older than `maxAge`, with the reload error of the
+  last failed attempt) and backs `/readyz` in every service that routes on the
+  index; `Run` logs a reload failure once per distinct error with its
+  consecutive count and the index age, plus the recovery line.
+- `internal/offsetgate` (new) – the no-loss commit watermark both delivery
+  stages share: `Track` records hold a polled record's offset with its leader
+  epoch, `Settle` releases one, `CommitPoints` is the lowest not-yet-durable
+  offset per partition (what may be committed), and `Keep` drops everything a
+  rebalance handed to another replica. Offsets therefore move past a record
+  only when it reached a durable outcome; a crash replays what was still in
+  flight instead of skipping it.
 - `internal/store` – PostgreSQL access: control data and the inbox
   (`Park`, `FetchParked`, `AckParked`, `CountParked`, `DeleteExpiredParked`,
-  `UpdateSubscription`, `EnsureInboxPartitions`).
+  `UpdateSubscription`, `EnsureInboxPartitions`). Subscriptions are deleted
+  softly since migration 004 (`deleted_at`): `Subscriptions` returns the live
+  set only, `DeleteSubscription` stamps the row, `UpdateSubscription` refuses
+  a deleted one, and `SubscriptionExists(owner, id)` — the status API's
+  existence and ownership check — counts deleted rows on purpose, so the
+  history of a deleted subscription stays attributable.
 - `internal/filter` – CEL filters. `CompileAttribute` (variables: `attributes`,
   `id`, `source`, `type`, `subject`) and `CompileData` (variable: `data`).
   `Matches(attr, data, attrs, json)` evaluates both, with the equality index of
@@ -125,7 +142,9 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   moment later). The subscription *count* is deliberately not reported — it
   would be a candidate count that ignores CEL filters and would read like a
   delivery forecast.
-- `GET /healthz` – no auth.
+- `GET /healthz` (liveness) and `GET /readyz` (readiness: PostgreSQL
+  reachable and the registry index younger than `REGISTRY_STALE_AFTER`,
+  30 s); no auth.
 
 ### registry-api (port 8080)
 
@@ -145,6 +164,12 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - Rejects subscriptions with data filters or a projection for non-JSON event
   types (section 5), validates CEL and projection paths, applies the defaults
   of the delivery policy table (section 7).
+- DELETE is a **soft** delete (migration 004, `deleted_at`): the row stays so
+  that parked deliveries, status records and replays keep their subject, while
+  GET, PUT, a second DELETE and the list treat it as gone — 404, exactly as
+  if the row had been removed.
+- `GET /healthz` (liveness) and `GET /readyz` (readiness: PostgreSQL
+  reachable); no auth.
 
 ### router (health port 8085)
 
@@ -216,6 +241,16 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   rate limit, `max_in_flight` per delivery mode (section 7).
 - On circuit-open, rate-limit overflow or queue overflow: park in the inbox and
   emit pending with the reason; live-class events are never parked.
+- Offsets are committed as a **watermark** (`internal/offsetgate`), never per
+  record: a record's offset joins the watermark when it is polled and is
+  released only when its delivery reached a durable outcome — delivered,
+  dead-lettered, terminally dropped, or parked in the inbox. A record that is
+  still queued, retrying or waiting for a park that the store refused holds its
+  partition's commit point still, so a crash replays it instead of skipping it;
+  the duplicates are identified by the event reference (section 8). Parks that
+  fail are retried by a bounded background queue (backpressure, not memory),
+  and a payload that cannot be encoded for the inbox is the one deliberate
+  drop: terminal, with a `dropped`/`park_failed` status.
 - Drains the inbox at `drain_rate_per_s` when the subscription is healthy
   again; while draining, new events go to the inbox so that order holds.
 - Emits in_flight, retrying, delivered, dead_lettered, paused, dropped.
@@ -237,6 +272,13 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - Delivery stage: consumer group `sse-delivery` over `deliveries`, sse
   subscriptions only. With a live connection it writes to `sse-live` targeted
   at the owning node, otherwise it parks in the inbox.
+- Its offsets are committed as the same watermark as the dispatcher's
+  (`internal/offsetgate`): a record leaves the watermark when it is on
+  `sse-live` or in the inbox, and one whose park the store refused waits for
+  the bounded background retry while its partition's commit point stands
+  still. The status emit is the exception: a record whose status is its only
+  trace (dropped, expired) waits for the status produce, so nothing ends up
+  committed with no record of it anywhere.
 - Live consumer: one consumer group per node, starts at latest, drops messages
   without a local connection.
 - `Last-Event-ID` on `GET /sse` (header, or `?last_event_id=`): the gateway
@@ -250,6 +292,11 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   the event loop continues and the client's next reconnect retries.
 - `POST /sse/ack` acknowledges deliveries (Last-Event-ID or body); only an ack
   turns `sent` into `delivered` (section 9).
+- `GET /healthz` (liveness, with the node's connection and presence counts)
+  and `GET /readyz` (readiness: PostgreSQL reachable and the registry index
+  younger than `REGISTRY_STALE_AFTER`, 30 s); no auth. A delivery stage on a
+  frozen index resolves channels it should skip and skips ones it should take,
+  so staleness is a readiness question here, not only a latency one.
 
 ### status-writer (health port 8087)
 
@@ -292,6 +339,13 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   The Status API does not validate `?status=` (an unknown value
   simply matches no rows); the replay selector rejects an unknown one with a
   400.
+- The two subscription-scoped endpoints look the ID up in PostgreSQL first
+  (`store.SubscriptionExists`, deleted rows included): an unknown or foreign
+  ID answers 404 instead of an empty list, and a database error answers 500 —
+  the check fails closed, because "no rows" and "we could not check" must not
+  look alike. Soft-deleted subscriptions keep their history readable.
+- `GET /healthz` (liveness) and `GET /readyz` (readiness: PostgreSQL and
+  ClickHouse reachable); no auth.
 
 ### replay-api (port 8084)
 
@@ -324,6 +378,9 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   duplicates acceptable, losses not), `cancel_requested → cancelled`.
 - Transactional ID `replay-<host>-<pid>` so the replayer never fences the
   router's producer.
+- `GET /healthz` (liveness) and `GET /readyz` (readiness: PostgreSQL and
+  ClickHouse reachable, registry index younger than `REGISTRY_STALE_AFTER`);
+  no auth.
 
 ### harness
 

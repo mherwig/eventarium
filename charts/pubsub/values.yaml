@@ -46,8 +46,13 @@ resources:
     memory: 256Mi
 
 # Readiness gates a rolling update, so it must check what the service
-# actually needs: /readyz exists on the three worker services and fails when
-# PostgreSQL or ClickHouse is unreachable; the APIs only offer /healthz.
+# actually needs: every service answers /readyz and fails when a dependency
+# it cannot work without is unreachable - PostgreSQL for the APIs and the
+# gateway, plus ClickHouse for status-api and replay-api, plus a registry
+# index that is not standing still wherever one is loaded (publish-api,
+# replay-api, sse-gateway). /healthz stays liveness everywhere and keeps
+# answering while the stores are down, so a database outage never turns into
+# a restart storm.
 #
 # "port" is the container port and the value of HTTP_ADDR for that binary.
 # The defaults in cmd/ disagree for registry-api (it defaults to :8080), so
@@ -55,19 +60,19 @@ resources:
 components:
   publish-api:
     port: 8080
-    readyPath: /healthz
+    readyPath: /readyz
   registry-api:
     port: 8083
-    readyPath: /healthz
+    readyPath: /readyz
   status-api:
     port: 8081
-    readyPath: /healthz
+    readyPath: /readyz
   replay-api:
     port: 8084
-    readyPath: /healthz
+    readyPath: /readyz
   sse-gateway:
     port: 8082
-    readyPath: /healthz
+    readyPath: /readyz
     # NODE_ID decides which `sse-live-<NODE_ID>` consumer group this pod owns,
     # and it must be unique per pod - two pods sharing it would split that
     # group's partitions and each drop the messages aimed at the other. The
