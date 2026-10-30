@@ -114,6 +114,21 @@ From §16, minus what the spike answered:
 - **Backlog limit per subscription** — without one storage grows unbounded
   during outages; with one, `dropped` appears and conflicts with guaranteed
   delivery. Unresolved product decision.
+- **A 500 from publish-api does not mean the batch was rejected** — found by
+  the `kafka` chaos run. `ProduceSync` writes the whole request before
+  `publish-api` inspects the results, and the handler returns 500 on the first
+  failing record (after `cmd/publish-api/main.go:243`), so the other ~99 events
+  of that request are already in the log and get delivered while the client —
+  correctly, by HTTP semantics — discards all 100. Measured: 20 produce errors,
+  20 HTTP 500s, **1,000 events reported failed, 533 of those references seen
+  at the receiver**. Not loss, but the reply is untruthful about *which*
+  events, and F19 explicitly invites a retry on 5xx, which would duplicate the
+  99 that already landed. Three ways out, in increasing order of work: say so
+  (document that 5xx means *outcome unknown, inspect before retrying*); return
+  the accepted `event_ref`s alongside the error so a retry can be narrowed to
+  what genuinely failed; or put the batch in a Kafka transaction so 500 really
+  does mean all-or-nothing (the router already does this with
+  `kgo.NewGroupTransactSession`, so the pattern exists in the codebase).
 - **Commit-watermark scan is O(backlog)** — found while re-measuring the load
   test, not observed as latency. `offsetgate.advance` walks the whole `pending`
   map to find the lowest offset, and `prune` walks `epochs`, so one `Settle`
@@ -294,6 +309,167 @@ the change it produced. Two of them were real data-loss paths.
    distinct error with the consecutive count and the index age, plus the
    recovery line — one line per attempt would bury the log exactly while the
    database is down.
+
+## Chaos during load: crashed replicas and dead infrastructure (§17)
+
+Four scenarios, each "publish at 200 ev/s for 60 s, inject one fault in the
+middle, let it drain, then ask the oracle". Same topology as the load test:
+4 types, 40 subscriptions (20 webhook, 20 SSE), 20 SSE clients spread over
+three gateways, 12,000 events per run → `expected=58,366` deliveries. Unlike
+the load test, this runs on **nine replicas** — three routers, three
+dispatchers, three sse-gateways — because killing one of one is not a failure
+mode. The dispatcher's inbox duty elects a leader over a PostgreSQL advisory
+lock, the SSE drainer runs on `node-a` only, and each gateway owns its own
+`sse-live-<NODE_ID>` group.
+
+Every run seeds its own owner (`pods232146`, `pg231403`, …), which matters:
+the status table is cumulative and the oracle scopes its query to the run's
+publish window plus a minute of skew, so an earlier run whose `pub.jsonl` is
+gone leaks into the next one as `unexpected`. That is not hypothetical — an
+aborted scenario did exactly this and produced 18,432 phantom `unexpected`
+before the harness was fixed.
+
+The shape of every scenario (the driver that wraps this lives outside the
+repo, so the pieces are spelled out):
+
+```sh
+harness seed -api :8083 -owner $O -prefix $O -types 4 -subs 40 \
+  -webhook-url http://localhost:9090/hook > seed.json
+harness recv -addr :9090 -out recv.jsonl &          # one per scenario, fresh file
+harness sse -sub <id> -owner $O -addr http://localhost:8082 \  # 20, spread over
+  -duration 420s -out sse-<n>.jsonl &               # gateways :8082/8182/8282
+# publish in the background, then inject the fault ~10 s in:
+API=:8080 HARNESS_OWNER=$O harness pub -types "$O.type.0,..." \
+  -rate 200 -duration 60s -payload 1024 -out pub.jsonl &
+docker compose stop postgres          # | restart kafka | stop clickhouse
+kill -9 <dispatcher pid>              # and/or router, gateway
+# wait for queue_depth=0, then for the owner's inbox rows to reach 0:
+harness verify -owner $O -api :8083 -status-api :8081 \
+  -events pub.jsonl -received recv.jsonl -sse "$(ls sse-*.jsonl | tr '\n' ,)"
+```
+
+The two waits are not ceremony: judging before the queues drain reports work
+that is merely unfinished as lost, and judging before the inbox drains reports
+parked-but-durable deliveries as missing.
+
+| Scenario | fault | missing | unexpected | duplicates |
+| --- | --- | --- | --- | --- |
+| `pods` | `kill -9` one dispatcher, one router, one gateway | **0** | 0 | 5,732 |
+| `pg` | receiver offline **and** PostgreSQL down, 20 s overlap | **0** | 0 | 0 |
+| `ch` | ClickHouse down 20 s | **0** | 0 | 0 |
+| `kafka` | broker restart mid-run | **0** | 5,185 | 2,385 |
+
+**`missing=0` in all four** — the number this whole exercise exists for.
+
+### What the duplicates are, precisely
+
+In `pods`, the 5,732 duplicates land on **partitions 8, 9, 10 and 11 and
+nowhere else** — which is exactly the four partitions the killed dispatcher
+owned, verified against `kafka-consumer-groups.sh --describe` before the kill.
+Partitions owned by the two survivors show zero duplicates. Run twice, same
+picture. The `pg` and `ch` runs — where only a *store* died and no member
+left the group — show exactly zero; the `kafka` run, where a broker restart
+forces a rejoin, shows the same replay effect (2,385).
+
+The mechanism, confirmed end to end rather than assumed:
+
+- **It is replay, not re-production.** Consuming `deliveries` and grepping for
+  one duplicated `delivery_id` returns **1 record** while the receiver logged
+  it twice: the same Kafka record was consumed twice.
+- **The timing is franz-go's session timeout.** The first duplicate arrives
+  *exactly 45 s* after the kill — `sessionTimeout: 45000 * time.Millisecond`
+  is franz-go's default. `first_dup − 45 s` lands on the kill within the
+  script's own sleep. Nothing happens *at* the kill; the group waits out the
+  dead member, then the survivors resume from the last committed offset and
+  repeat whatever was in flight.
+- **The size is the commit watermark's unflushed tail.** Marks are flushed on
+  an interval, so the kill loses up to one flush interval of committed
+  progress — plus, on partition 11, everything the two `rate_limit_per_s=50`
+  subscriptions had caused to sit below the watermark. That is why one
+  partition carries ~2,200 duplicates while its neighbours carry ~225: the
+  watermark is per partition, and a slow subscription holds *its whole
+  partition* back. Duplicate volume therefore tracks "how far behind was that
+  partition", not "how big was the crash".
+
+This is fix 1 from the previous section working as designed: the alternative
+to these 5,732 duplicates was dropping them. The webhook receiver is where
+replay shows up at all — the SSE client deduplicates by event reference
+(§8) before writing, so its file reports 0 by construction and proves nothing
+about what the gateway sent.
+
+### `kafka`: `missing=0` but `unexpected=5,185`
+
+The only non-clean row, and the fault is publish-api's, not the pipeline's.
+The publisher reported `sent=12000 ok=10900 failed=1100 (5xx=1000
+timeouts=100)` — yet 533 event references that the client recorded as failed
+turn up at the receiver, and they account for the whole `unexpected` count.
+
+The mechanism is visible in publish-api's own log for exactly those requests:
+**20 record-level produce errors, 20 HTTP 500s, and 1,000 events reported
+failed** — i.e. ~10 failed requests of 100 events each, with ~1 produce error
+per request. `ProduceSync` produces the whole batch and returns a result per
+record; `publish-api` then returns 500 on the *first* error it sees (after
+line 243), so the other ~99 records of that request are already in the log.
+The client, correctly by HTTP semantics, discards all 100.
+
+So the platform delivered events the publisher was told failed. Nothing is
+lost — it is the mirror image of the bug class we spent this whole exercise
+on — but the 500 is a lie about *which* events, and a caller that retries the
+batch on 500 (F19 explicitly allows republishing) will duplicate the 99 that
+already landed. Open point, below.
+
+### Readiness, observed rather than asserted
+
+- During the PostgreSQL outage, `dispatcher /readyz` → **503** while
+  `/healthz` stayed **200**, on all three replicas; recovery confirmed back to
+  200 afterwards.
+- During the ClickHouse outage, `status-api /readyz` → **503** while its
+  liveness stayed 200 *and the dispatcher stayed ready at 200* — the
+  dependency boundary is where it should be, and deliveries continued
+  untouched (`missing=0`, zero duplicates).
+- A registry that stopped reloading says so with its age:
+  `{"error":"registry index is 9s old (limit 5s)"}`.
+- The outage also exercises the park path end to end: `offsets_in_flight=4,307`
+  while both the receiver and PostgreSQL were down, `parking recovered,
+  retries drained` once the store returned, then the inbox drained to 0 rows
+  and the oracle read `expected=58366 received=58366 missing=0`.
+
+### Two bugs the chaos runs found (both fixed)
+
+1. **Status records stamped the wrong source position** — `emitStatus` wrote
+   `it.seq` (the delivery's position on the *deliveries* topic) into
+   `SrcPartition`/`SrcOffset`, which mean the event's position on the *events*
+   topic. One delivery's history disagreed with itself: `pending` said
+   `events:4:4113`, `in_flight`/`delivered` said `deliveries:2:133500`. 33.1%
+   of deliveries in every pre-fix run; 0% after. Replay only survived because
+   `argMin(src_partition, ts)` happens to pick the router's `pending` row,
+   which has the earliest ts. Regression tests in
+   `internal/dispatch/status_test.go`.
+2. **The oracle made a delivery *more* missing the further it got** —
+   `{delivered, sent, pending}` was the accounted list, but `in_flight`,
+   `retrying` and `paused` all come *after* `pending`. A delivery parked
+   during the PostgreSQL outage read as `missing` while sitting in the inbox.
+   That is exactly the run that had to prove the opposite. Now any status
+   except `filtered` counts as accounted.
+
+### What the harness itself got wrong (worth repeating)
+
+Three of these cost real time and all three are harness faults, not platform
+faults — the reason they matter is that each one let a scenario *pass without
+testing anything*:
+
+- `$DOCKER` was unquoted in the scenario script and the path contains a
+  space, so every `docker compose stop` exited 127 into `/dev/null`. The first
+  `pg` run reported success with PostgreSQL never stopped. Fixed by quoting
+  **and** by `assert_down`/`assert_up`, which fail the run unless the fault is
+  observed to have landed (`probe` also has to fail on a non-200 — `curl` exits
+  0 on a 503, so a naive probe makes the assertion vacuous).
+- The receiver was killed at scenario end, so the inbox could never drain and
+  the judge read parked deliveries as missing. Fixed: `wait_inbox` waits for
+  the owner's parked rows to reach 0 before the oracle is allowed to speak.
+- Scenarios shared one owner across runs, so a previous run's events fell into
+  the next run's status window. Fixed: unique owner per invocation, plus a
+  `trap … EXIT` so an aborted scenario cannot leave a publisher running.
 
 ## Fault injection: dispatcher, SSE gateway and cursor recovery (§17 test plan)
 

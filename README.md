@@ -451,7 +451,7 @@ export API=http://localhost:8083        # seed/verify talk to the control plane
   -types harness.type.0,harness.type.1,harness.type.2,harness.type.3,harness.type.4,harness.type.5 \
   -out pub.jsonl
 ./bin/harness verify -owner team-a -api http://localhost:8083 \
-  -events pub.jsonl -received recv.jsonl
+  -events pub.jsonl -received recv.jsonl -sse sse.jsonl
 ```
 
 Notes that cost me time:
@@ -783,6 +783,33 @@ Stability hardening is verified live as well, scenario by scenario
 - **SSE path.** 100 published / 100 received live through the gateway, and a
   parked batch of 100 with no connection — the rewritten park, status and
   commit path.
+- **Chaos during load, on nine replicas.** Three routers, three dispatchers,
+  three gateways; 12,000 events per run fanning out to 58,366 deliveries, with
+  one fault injected mid-publish:
+
+  | fault | missing | unexpected | duplicates |
+  | --- | --- | --- | --- |
+  | `kill -9` a dispatcher, a router and a gateway | **0** | 0 | 5,732 |
+  | receiver offline **and** PostgreSQL down (20 s overlap) | **0** | 0 | 0 |
+  | ClickHouse down 20 s | **0** | 0 | 0 |
+  | Kafka broker restart | **0** | 5,185 | 2,385 |
+
+  The duplicates track whether a **consumer left the group**, not whether
+  something broke: the crash run's 5,732 fall on **partitions 8–11 only —
+  exactly the killed dispatcher's assignment** — and on no other partition, on
+  both runs. A broker restart forces a rejoin and produces the same kind of
+  replay (2,385). The two runs where only a *store* died — PostgreSQL and
+  ClickHouse — show **zero**, because no member left the group and the
+  offsets kept advancing throughout. Duplicates arrive ~45 s after a `kill -9`
+  (franz-go's default session timeout), and reading one duplicated
+  `delivery_id` out of Kafka returns a single record: it is replay of
+  uncommitted work, not re-production, which is the whole point of fix 1.
+  `unexpected` in the broker run is publish-api's fault, not the
+  pipeline's — its 500 after a partial batch (open point below).
+
+Full numbers, the status-record bug these runs found, and the three times the
+*harness* passed a scenario that had tested nothing:
+[docs/deviations-and-open-points.md](docs/deviations-and-open-points.md#chaos-during-load-crashed-replicas-and-dead-infrastructure-17).
 
 Not exercised yet: the soak test, restart-mid-job recovery of the replay
 worker, the multi-day offline scenario and multi-node SSE gateway failover.
@@ -809,8 +836,15 @@ subscriptions, plus 20 connected SSE clients. 1 KiB JSON payloads, batch mode
   -types load1.type.0,load1.type.1,load1.type.2,load1.type.3 \
   -payload 1024 -out pub.jsonl
 ./bin/harness verify -owner load1 -api http://localhost:8083 \
-  -status-api http://localhost:8081 -events pub.jsonl -received recv.jsonl
+  -status-api http://localhost:8081 -events pub.jsonl -received recv.jsonl \
+  -sse "$(ls sse-*.jsonl | tr '\n' ',' | sed 's/,$//')"
 ```
+
+`-sse` is optional but worth passing: without it the SSE half of the fan-out
+is checked only against what the Status API *claims*, so a delivery written to
+`sse-live` and never read by a client would not be caught. With it, `RECEIVED`
+covers both channels — that is what makes `received` equal `expected` in the
+results below rather than webhook-only.
 
 Result (re-run after the stability hardening — the commit watermark, the
 background park retry and the new `/readyz` checks all sit on or near this
