@@ -33,13 +33,14 @@ const runWindowSkew = time.Minute
 // 15.1: the system never verifies itself. It recomputes the expected delivery
 // set per subscription locally — the CEL attribute filter is evaluated with
 // internal/filter, never by asking the platform — and compares it with the
-// union of what the webhook receiver recorded and what the Status API reports
-// as delivered, sent or pending. It exits non-zero when anything is missing or
-// unexpected.
+// union of what the webhook receiver recorded, what the SSE clients recorded
+// (-sse, when given) and what the Status API reports as delivered, sent or
+// pending. It exits non-zero when anything is missing or unexpected.
 func runVerify(ctx context.Context, args []string) int {
 	fs := newFlagSet("verify")
 	events := fs.String("events", envStr("EVENTS", ""), "file of published events written by pub -out (env HARNESS_EVENTS)")
 	received := fs.String("received", envStr("RECEIVED", ""), "file written by recv -out (env HARNESS_RECEIVED)")
+	sse := fs.String("sse", envStr("SSE_RECEIVED", ""), "optional file of sse -out files, comma separated; their receipts count like the webhook ones (env HARNESS_SSE_RECEIVED)")
 	statusAPI := fs.String("status-api", envStr("STATUS_API", "http://localhost:8081"), "base URL of the Status API (env HARNESS_STATUS_API)")
 	subFlag := fs.String("subscription", envStr("SUBSCRIPTION", ""), "comma separated subscription ids, default every subscription of the owner (env HARNESS_SUBSCRIPTION)")
 	api := fs.String("api", apiDefault(), "base URL of the registry API (env API)")
@@ -65,6 +66,34 @@ func runVerify(ctx context.Context, args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "harness verify:", err)
 		return 1
+	}
+	// SSE receipts are optional but worth passing: without them the SSE side
+	// is judged only by what the Status API claims, which cannot notice a
+	// delivery that was written to sse-live and then never read. An sse -out
+	// line carries delivery_id = "event_ref/subscription_id", from which the
+	// subscription is recovered the same way the gateway builds it.
+	if *sse != "" {
+		for _, path := range strings.Split(*sse, ",") {
+			if strings.TrimSpace(path) == "" {
+				continue
+			}
+			lines, err := loadLines[sseRecord](strings.TrimSpace(path))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "harness verify:", err)
+				return 1
+			}
+			for _, s := range lines {
+				sub := sseSubscriptionOf(s.DeliveryID)
+				if sub == "" || s.EventRef == "" {
+					continue
+				}
+				recvs = append(recvs, recvRecord{
+					EventRef:       s.EventRef,
+					SubscriptionID: sub,
+					ReceivedAt:     s.ReceivedAt,
+				})
+			}
+		}
 	}
 	unverifiable := 0
 	for _, r := range pubs {
@@ -159,9 +188,7 @@ func runVerify(ctx context.Context, args []string) int {
 			if _, got := recvCounts[ref]; got {
 				continue
 			}
-			switch statusRefs[ref] {
-			case status.Delivered, status.Sent, status.Pending:
-			default:
+			if !accounted(statusRefs[ref]) {
 				missing[ref] = true
 			}
 		}
@@ -172,11 +199,8 @@ func runVerify(ctx context.Context, args []string) int {
 			}
 		}
 		for ref, st := range statusRefs {
-			switch st {
-			case status.Delivered, status.Sent, status.Pending:
-				if !expected[ref] {
-					unexpected[ref] = true
-				}
+			if accounted(st) && !expected[ref] {
+				unexpected[ref] = true
 			}
 		}
 		dup := 0
@@ -211,6 +235,32 @@ func runVerify(ctx context.Context, args []string) int {
 	}
 	fmt.Println("harness verify: OK")
 	return 0
+}
+
+// sseSubscriptionOf recovers the subscription from a delivery id of the form
+// "event_ref/subscription_id" (section 5), which is how an sse -out line
+// identifies its subscription. An id without a slash names none, and the
+// caller skips it rather than attributing a receipt to the wrong subscription.
+func sseSubscriptionOf(deliveryID string) string {
+	i := strings.Index(deliveryID, "/")
+	if i < 0 || i == len(deliveryID)-1 {
+		return ""
+	}
+	return deliveryID[i+1:]
+}
+
+// accounted reports whether the platform still holds a record of this
+// delivery, which is the only question "missing" should ask. Anything other
+// than an absent or `filtered` status counts: `in_flight`, `retrying` and
+// `paused` are later in the lifecycle than `pending`, so the previous list of
+// {delivered, sent, pending} made a delivery turn *more* missing the further
+// it progressed - a parked delivery during a PostgreSQL outage read as lost
+// while it was sitting in the inbox. `filtered` stays out because it means no
+// delivery exists at all: if the oracle's own filter evaluation put the event
+// in `expected` and the platform filtered it, that disagreement is worth
+// seeing rather than absorbing.
+func accounted(st string) bool {
+	return st != "" && st != status.Filtered
 }
 
 // expectedSet recomputes locally which of the published events must reach the

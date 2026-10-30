@@ -228,8 +228,12 @@ func eventData(e *cloudevents.Event) []byte {
 }
 
 // emitStatus sends one status transition for the item to the status topic
-// (section 9). SrcPartition/SrcOffset carry the deliveries-topic sequence, the
-// dispatcher's position of record, which matches the pubsub-seq header.
+// (section 9). SrcPartition/SrcOffset carry the *event's* position in the
+// events topic, taken from the delivery message - the same value the router
+// stamps into `pending` and that replay resolve.go reads back to re-read the
+// original event. The dispatcher's own deliveries-topic sequence is a
+// different coordinate and stays out of these two fields; it is what the
+// pubsub-seq header carries.
 //
 // TS is stamped here, at the transition, and not left to the producer: the
 // emitter queues records and flushes them in batches of 512 or 50 ms, and
@@ -254,7 +258,19 @@ func (d *Dispatcher) emitStatus(it *item, st, reason string, attempt uint16, cod
 		LatencyMS:      uint32(latency / time.Millisecond),
 		ReplayID:       msg.ReplayID,
 		RetentionClass: msg.RetentionClass,
-		SrcPartition:   it.seq.Partition,
-		SrcOffset:      it.seq.Offset,
+		// The event's position in the events topic, not the delivery's on the
+		// deliveries topic: it.seq is the sequence number of section 6.3 and
+		// names a different topic entirely (delivery.Message.SrcPartition is
+		// documented as "partition of the events topic"). Stamping it.seq here
+		// made one delivery's history report two different source positions -
+		// the router's `pending` row said events:4:4113 while the dispatcher's
+		// `in_flight`/`delivered` said deliveries:2:133500 - and it silently
+		// corrupted every status record the dispatcher emits, which replay
+		// resolve.go reads back with argMin(src_partition, ts) to re-read the
+		// original event. Found by the chaos run (docs/deviations-and-open-
+		// points.md), because only a broker restart produced enough status
+		// records for one delivery to make the mismatch visible.
+		SrcPartition: msg.SrcPartition,
+		SrcOffset:    msg.SrcOffset,
 	})
 }
