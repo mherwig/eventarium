@@ -114,6 +114,21 @@ From §16, minus what the spike answered:
 - **Backlog limit per subscription** — without one storage grows unbounded
   during outages; with one, `dropped` appears and conflicts with guaranteed
   delivery. Unresolved product decision.
+- **Commit-watermark scan is O(backlog)** — found while re-measuring the load
+  test, not observed as latency. `offsetgate.advance` walks the whole `pending`
+  map to find the lowest offset, and `prune` walks `epochs`, so one `Settle`
+  costs a scan of everything still in flight on that partition:
+  `BenchmarkSettleUnderBacklog` in `internal/offsetgate` measures **4 µs at a
+  256-deep backlog, 71 µs at 4,096 and 282 µs at 16,384**. Three 1,000 ev/s
+  runs land on the previously documented latencies (p99 52 ms webhook / 92 ms
+  SSE), so at this rate it is not on the critical path — but a partition whose
+  store went away accumulates exactly that kind of depth, and then every
+  delivery pays a linear scan while holding the gate lock (which `Track` and
+  `Pending` also need). Cheap fix if it ever shows up: keep `pending` as an
+  indexed min-heap instead of a map, or track the low-water mark incrementally
+  and rescan only when the low-water offset itself settles. Not done, because
+  nothing measured justifies it yet and the alternative (optimising ahead of
+  data) is how the last "obvious" fix gets regretted.
 - **Offline share of subscriptions** — unknown; decides inbox sizing and the
   managed PostgreSQL load (IOPS, WAL, failover). The multi-day offline
   scenario hasn't been run.

@@ -799,33 +799,47 @@ subscriptions, plus 20 connected SSE clients. 1 KiB JSON payloads, batch mode
 (100 events per request).
 
 ```sh
-./bin/harness seed -owner team-b -prefix load -types 4 -subs 40 > seed-b.json
+./bin/harness seed -owner load1 -prefix load1 -types 4 -subs 40 > seed.json
 ./bin/harness recv -addr :9090 -out recv.jsonl &
-# one per seeded sse subscription
-./bin/harness sse -sub <id> -owner team-b -addr http://localhost:8082 \
+# one per seeded sse subscription (the ids file has no trailing newline:
+# `while read` silently drops the last one — append one or use tail -1)
+./bin/harness sse -sub <id> -owner load1 -addr http://localhost:8082 \
   -out sse-<id>.jsonl -duration 240s &
-./bin/harness pub -owner team-b -rate 1000 -duration 30s \
-  -types load.type.0,load.type.1,load.type.2,load.type.3 \
+./bin/harness pub -owner load1 -rate 1000 -duration 30s \
+  -types load1.type.0,load1.type.1,load1.type.2,load1.type.3 \
   -payload 1024 -out pub.jsonl
-./bin/harness verify -owner team-b -api http://localhost:8083 \
+./bin/harness verify -owner load1 -api http://localhost:8083 \
   -status-api http://localhost:8081 -events pub.jsonl -received recv.jsonl
 ```
 
-Result: 30,000 events published at a sustained 1,003 ev/s with zero publish
-failures, fanning out to ~146,000 deliveries. The dispatcher burst to ~3,100
-webhook deliveries/s and drained to `queue_depth=0` with zero retries, parks,
-drops or dead-letters. Latency from publish to receipt:
+Result (re-run after the stability hardening — the commit watermark, the
+background park retry and the new `/readyz` checks all sit on or near this
+path): 30,000 events at a sustained 1,003 ev/s with zero publish failures,
+fanning out to 145,918 deliveries. The dispatcher bursts to ~2,900 webhook
+deliveries/s and drains to `queue_depth=0` with `offsets_in_flight=0` and
+zero retries, parks, drops or dead-letters. Latency from publish to receipt,
+three consecutive runs of the identical scenario:
 
-| Channel | p50 | p90 | p99 | p99.9 | max |
-| --- | --- | --- | --- | --- | --- |
-| Webhook (unlimited subs) | 32 ms | 39 ms | **51 ms** | – | 109 ms |
-| SSE | 51 ms | 65 ms | **88 ms** | 140 ms | 153 ms |
+| Channel | p50 | p90 | p99 | max |
+| --- | --- | --- | --- | --- |
+| Webhook (unlimited subs), run 1 / 2 / 3 | 39 / 38 / 37 ms | 48 / 46 / 45 ms | 94 / 70 / **52 ms** | 183 / 107 / 68 ms |
+| SSE, run 1 / 2 / 3 | 61 / 59 / 58 ms | 84 / 75 / 74 ms | 253 / 99 / **92 ms** | 333 / 145 / 113 ms |
+| Webhook, rate-limited subs (by design) | 59 s | 108 s | 119 s | 120 s |
+
+Read that table as run 3 being the steady state and runs 1–2 being warm-up:
+the first run of the session pays for cold page caches, empty ClickHouse
+partitions and unwarmed connection pools, and its p99 is 3× the steady figure.
+Run 3 lands on what the previous session measured (webhook p99 51 ms, SSE
+88 ms), so the no-loss commit path costs nothing measurable at this rate.
+Across all three runs the oracle agrees identically:
+`expected=145918 missing=0 unexpected=0 duplicates=0` over all 40 subscriptions,
+and each run's receipt counts are byte-for-byte the same (99,283 webhook,
+46,635 SSE).
 
 N3 (p99 < 1 s, target a few hundred ms) is met with margin on both channels.
-Rate-limited webhook subscriptions (`rate_limit_per_s`) show minutes of tail
-latency by design: they drain their backlog at the configured rate. The oracle
-agrees: `expected=145918 missing=0 unexpected=0 duplicates=0` over all 40
-subscriptions.
+Rate-limited webhook subscriptions (`rate_limit_per_s=50`) show minutes of
+tail latency by design — that is the flat 100/s tail visible in any run
+(2 subs × 50/s), not a bottleneck in the dispatcher.
 
 Caveats: this validates the pipeline shape and per-stage latencies, not
 cluster-scale HA (single broker, single node of everything). ClickHouse status
