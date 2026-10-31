@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -72,6 +73,14 @@ func main() {
 	}
 	defer client.Close()
 
+	// Batches get their own client: a transactional client refuses every
+	// produce made outside a transaction, so it cannot share the single-event
+	// path. The ID and the replacement rules live with openTxnClient.
+	txnClient, err := openTxnClient(brokers)
+	if err != nil {
+		fatal("connecting the transactional kafka client", err)
+	}
+
 	validator, err := auth.NewHMAC(
 		config.Str("JWT_SECRET", "dev-secret"),
 		config.Str("JWT_ISSUER", "dev"),
@@ -81,7 +90,24 @@ func main() {
 		fatal("building token validator", err)
 	}
 
-	api := &publishAPI{auth: validator, registry: reg, kafka: client, maxBytes: maxBytes}
+	api := &publishAPI{
+		auth:     validator,
+		registry: reg,
+		kafka:    client,
+		txn:      txnClient,
+		txnClose: txnClient.Close,
+		openTxn: func() (transactionalProducer, func(), error) {
+			cl, err := openTxnClient(brokers)
+			if err != nil {
+				return nil, nil, err
+			}
+			return cl, cl.Close, nil
+		},
+		maxBytes: maxBytes,
+	}
+	// Deliberately api.closeTxn and not txnClient.Close: a latched client may
+	// have been replaced since, and this closes whichever one is current.
+	defer api.closeTxn()
 	// Readiness is more than "the process is up": the publish path needs
 	// PostgreSQL (the registry poll) and an index that is not standing still.
 	// /healthz stays answering while they are down - restarting the process
@@ -126,11 +152,74 @@ func main() {
 	slog.Info("publish-api stopped")
 }
 
+const (
+	// batchProduceTimeout bounds the produce phase of a transactional batch.
+	// franz-go retries a failing produce for 30s by default and a transaction
+	// is dropped by the broker after 40s, so a batch still running past this
+	// point would be doomed anyway - and while it waited it would hold the
+	// batch lock, queueing every other batch behind it. Turning "the broker
+	// is down" into a 15s 500 instead of a 30s stall that then loses the
+	// transaction is the better trade.
+	batchProduceTimeout = 15 * time.Second
+
+	// txnEndTimeout bounds the commit and the rollback. franz-go asks that
+	// these contexts not be cancelled underneath the call - a cancelled
+	// EndTransaction leaves the outcome unknowable - so they are deliberately
+	// independent of the HTTP request's context.
+	txnEndTimeout = 10 * time.Second
+)
+
+// errUnconfirmedWrite marks a failure where the transaction could not be
+// rolled back and so could not be ruled out either. The caller must not be
+// told "nothing was written" here: that would be the same lie this change
+// removes, just rarer and whole-batch instead of partial.
+var errUnconfirmedWrite = errors.New("the transaction could not be rolled back, so the outcome is unknown")
+
+// producer is the slice of a Kafka client this service uses. It exists so the
+// write paths can be exercised without a broker; *kgo.Client implements both
+// it and transactionalProducer.
+type producer interface {
+	ProduceSync(ctx context.Context, rs ...*kgo.Record) kgo.ProduceResults
+}
+
+// transactionalProducer adds the transaction protocol on top.
+type transactionalProducer interface {
+	producer
+	BeginTransaction() error
+	EndTransaction(ctx context.Context, try kgo.TransactionEndTry) error
+}
+
 // publishAPI holds the dependencies of the single write endpoint.
 type publishAPI struct {
 	auth     *auth.Validator
 	registry *registry.Registry
-	kafka    *kgo.Client
+	// kafka is the plain client, used for single-record publishes. One record
+	// is atomic on its own - it lands or it does not - so the usual case
+	// keeps the path it always had and pays for no transaction.
+	kafka producer
+	// txn is the transactional client, used for batches. It cannot serve
+	// single records: a transactional client fails every produce made outside
+	// a transaction, which is why this is a second client rather than a flag
+	// on the first.
+	txn transactionalProducer
+	// txnClose disposes of the current transactional client and openTxn builds
+	// a replacement. Both are needed because a transactional client can be
+	// latched into a state it never leaves (see beginTxn), and only a new one
+	// recovers. main wires them; tests inject the client and leave them nil.
+	txnClose func()
+	openTxn  func() (transactionalProducer, func(), error)
+	// txnMu serialises batches. A producer runs one transaction at a time and
+	// BeginTransaction must not be called concurrently with the client's other
+	// work; single-record publishes use kafka and are never delayed by it.
+	txnMu sync.Mutex
+	// txnStale records a rollback that failed, which leaves the client still
+	// inside a transaction and every later BeginTransaction failing with it.
+	// Without clearing it first, one bad abort would take the batch path down
+	// for the rest of the process's life (see writeBatch). It is set only
+	// after a successful Begin, so it always implies a live client to roll
+	// back - beginTxn returns before the deferred rollback is armed, which is
+	// what keeps "stale" and "no client" from ever being true together.
+	txnStale bool
 	maxBytes int64
 }
 
@@ -240,12 +329,13 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	// F19: publish is not deduplicated. Publishing the same message again is
 	// allowed and simply creates another event with a new reference.
-	for _, res := range a.kafka.ProduceSync(r.Context(), records...) {
-		if res.Err != nil {
-			slog.Error("producing event", "topic", res.Record.Topic, "err", res.Err)
-			httpx.Error(w, http.StatusInternalServerError, "producing event failed")
-			return
-		}
+	//
+	// A batch is written in one Kafka transaction, so a 500 can be trusted to
+	// mean nothing of the request was written — see writeBatch.
+	if err := a.write(r.Context(), records); err != nil {
+		slog.Error("producing event", "err", err, "events", len(records))
+		httpx.Error(w, http.StatusInternalServerError, writeFailure(len(records), err))
+		return
 	}
 	for _, res := range results {
 		slog.Debug("event accepted", "owner", owner, "ref", res.EventRef,
@@ -258,6 +348,249 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, results[0])
+}
+
+// openTxnClient builds a transactional client for batches. The transactional
+// ID is stable per process so a replacement client fences whatever the previous
+// one left behind - and must be unique to this process, because two producers
+// sharing one fence each other into permanent ProducerFenced errors, which at N
+// replicas would be a self-inflicted outage.
+func openTxnClient(brokers []string) (*kgo.Client, error) {
+	return kafkautil.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.TransactionalID(txnID()),
+	)
+}
+
+// txnID is this process's transactional ID; see openTxnClient for the rules it
+// follows and why fencing a *previous* run is deliberately not a goal (a
+// zombie publish-api committing its own well-formed events is harmless,
+// unlike a stale consume-modify-produce session).
+func txnID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return "publish-api-" + host + "-" + strconv.Itoa(os.Getpid())
+}
+
+// write puts every record of one request into Kafka. One record needs no
+// transaction — there is nothing for it to be partial about — so the usual
+// case keeps the plain path and pays for nothing extra. Two or more go in a
+// single transaction, so the request lands completely or not at all.
+func (a *publishAPI) write(ctx context.Context, records []*kgo.Record) error {
+	if len(records) < 2 {
+		return firstProduceError(a.kafka.ProduceSync(ctx, records...))
+	}
+	return a.writeBatch(ctx, records)
+}
+
+// writeBatch produces the request's records inside one Kafka transaction.
+//
+// What it replaces: the handler produced the whole request and then returned
+// 500 on the first record that errored — by which time the rest were already
+// in the log and on their way to subscribers, while the caller was told
+// "failed" for events it could find in the platform. An F19-compliant retry
+// then duplicated every one of them. Measured on the `kafka` chaos run: 1,000
+// events reported failed, 533 of their references seen at the receiver,
+// 5,185 deliveries nobody expected.
+//
+// Here a produce error aborts instead of committing, so none of the request
+// becomes visible. The one thing this cannot fix is a commit or a rollback
+// whose own confirmation is lost on the wire: that is reported as
+// errUnconfirmedWrite rather than dressed up as "failed".
+func (a *publishAPI) writeBatch(ctx context.Context, records []*kgo.Record) (err error) {
+	// One transaction at a time: a producer has exactly one in flight and
+	// BeginTransaction must not be called concurrently with the client's other
+	// work. Batches queue here; single-record publishes use the other client
+	// and are never held up by this lock.
+	a.txnMu.Lock()
+	defer a.txnMu.Unlock()
+
+	// A rollback that failed leaves the client still "in a transaction", and
+	// every BeginTransaction after that fails with it — one bad abort would
+	// otherwise disable the batch path for the rest of the process's life.
+	// Clear it first; if that fails too, report and let the next request try.
+	if a.txnStale {
+		if abErr := a.endTxn(kgo.TryAbort); abErr != nil {
+			return fmt.Errorf("the previous batch is still open and could not be rolled back: %w", abErr)
+		}
+		a.txnStale = false
+	}
+
+	if err := a.beginTxn(); err != nil {
+		// Nothing was produced, so this is a known outcome regardless of how
+		// bad the message looks.
+		return err
+	}
+	committed := false
+	// commitAttempted marks the one case where an aborted rollback really does
+	// leave the caller not knowing: a commit that was put on the wire and not
+	// confirmed can have landed. Until a commit is attempted the records live
+	// in an open transaction only - uncommitted transactions are invisible and
+	// the broker drops them at the transaction timeout - so even a rollback
+	// that fails cannot make them appear.
+	commitAttempted := false
+	// produced counts the records the broker acknowledged, for the log line.
+	produced := 0
+	defer func() {
+		if committed {
+			return
+		}
+		if abErr := a.endTxn(kgo.TryAbort); abErr != nil {
+			a.txnStale = true
+			slog.Error("publish-api: rolling back a batch", "err", abErr,
+				"records_produced", produced, "commit_attempted", commitAttempted)
+			if commitAttempted {
+				err = errUnconfirmedWrite
+			}
+		}
+	}()
+
+	// ProduceSync waits for every record, so by here the whole request has an
+	// answer and `produced` counts the successes across all of them. A single
+	// failure is enough to abort: committing the other 99 is the bug.
+	pctx, cancel := context.WithTimeout(ctx, batchProduceTimeout)
+	defer cancel()
+	var produceErr error
+	for _, res := range a.txn.ProduceSync(pctx, records...) {
+		if res.Err != nil {
+			if produceErr == nil {
+				produceErr = fmt.Errorf("%s: %w", res.Record.Topic, res.Err)
+			}
+			continue
+		}
+		produced++
+	}
+	if produceErr != nil {
+		return produceErr
+	}
+
+	// Commit only while the caller is still there to be told it happened. If
+	// their request context is already done they saw no 201 and will retry, so
+	// writing events they believe failed would be the same disagreement as the
+	// one this removes — just with the platform ahead instead of behind.
+	if ctx.Err() != nil {
+		return fmt.Errorf("request abandoned before the commit: %w", ctx.Err())
+	}
+	// EndTransaction takes a context of its own: franz-go warns that
+	// cancelling it leaves the outcome unknowable, and the request context
+	// dies with the caller.
+	commitAttempted = true
+	if err := a.endTxn(kgo.TryCommit); err != nil {
+		return fmt.Errorf("committing transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// endTxn ends the open transaction on a context independent of the caller's,
+// bounded by txnEndTimeout. It is used for both commit and rollback.
+func (a *publishAPI) endTxn(try kgo.TransactionEndTry) error {
+	ctx, cancel := context.WithTimeout(context.Background(), txnEndTimeout)
+	defer cancel()
+	return a.txn.EndTransaction(ctx, try)
+}
+
+// beginTxn opens a transaction, replacing the client when opening one fails.
+//
+// This exists for one verified failure, and the reason is worth spelling out
+// because it is invisible without it: franz-go latches a connection that dies
+// during ApiVersions — exactly what a broker restart does — into a
+// producer-ID state it labels "fatal, unrecoverable", and then refuses
+// BeginTransaction instantly and forever. Nothing in the library clears that
+// state; only a fresh client re-runs InitProducerID from scratch. Left alone,
+// one broker restart permanently killed the batch path: 99 latched
+// BeginTransaction calls, 9,900 of 12,000 requests failing in 0.5 ms each for
+// the rest of the run, while the plain single-record client — which re-inits
+// lazily and never calls this path — was completely unaffected.
+//
+// The replacement is followed by one retry so that the request which detects
+// the latch often succeeds rather than failing: if the broker is back, this
+// publish goes through; if it is still down, the new client latches too and
+// the next request replaces it again. Called with txnMu held.
+func (a *publishAPI) beginTxn() error {
+	if a.txn == nil {
+		// A previous replacement failed to open. Try again rather than
+		// refusing forever: "the broker was down once" must not become a
+		// permanently dead batch path either.
+		a.replaceTxn()
+		if a.txn == nil {
+			return errors.New("no transactional client could be opened")
+		}
+	}
+	err := a.txn.BeginTransaction()
+	if err == nil {
+		return nil
+	}
+	a.replaceTxn()
+	if a.txn == nil {
+		return fmt.Errorf("beginning transaction: %w (and no replacement could be opened)", err)
+	}
+	if err2 := a.txn.BeginTransaction(); err2 != nil {
+		return fmt.Errorf("beginning transaction: %w", err2)
+	}
+	return nil
+}
+
+// replaceTxn throws the current transactional client away and opens another.
+// It must be called with txnMu held. Tests inject the client and leave openTxn
+// nil; then there is nothing to open, txn itself is left untouched, and the
+// retry in beginTxn fails with the original error instead of dereferencing a
+// nil.
+func (a *publishAPI) replaceTxn() {
+	if a.txnClose != nil {
+		a.txnClose() // the old client is already failing; a close error changes nothing
+		a.txnClose = nil
+	}
+	if a.openTxn == nil {
+		return
+	}
+	cl, closeFn, err := a.openTxn()
+	if err != nil {
+		slog.Error("publish-api: reopening the transactional client", "err", err)
+		a.txn = nil
+		return
+	}
+	a.txn, a.txnClose = cl, closeFn
+}
+
+// closeTxn disposes of whichever transactional client is current. main defers
+// this instead of closing the client it opened, because a replacement may have
+// taken its place since.
+func (a *publishAPI) closeTxn() {
+	if a.txnClose != nil {
+		a.txnClose()
+		a.txnClose = nil
+	}
+}
+
+// firstProduceError returns the first failing record's error, tagged with its
+// topic so the log still says where the write went wrong.
+func firstProduceError(results kgo.ProduceResults) error {
+	for _, res := range results {
+		if res.Err != nil {
+			return fmt.Errorf("%s: %w", res.Record.Topic, res.Err)
+		}
+	}
+	return nil
+}
+
+// writeFailure words a 500 by what is actually known — the whole point of the
+// transaction is that, for a batch, "nothing was written" is finally a true
+// statement.
+func writeFailure(records int, err error) string {
+	switch {
+	case errors.Is(err, errUnconfirmedWrite):
+		return "producing event failed: the outcome could not be confirmed, " +
+			"the events may or may not have been written"
+	case records > 1:
+		return "producing event failed: no event of this request was written"
+	default:
+		// A single record: an error means the write was not acknowledged, and
+		// for one record that is the whole of what can be known.
+		return "producing event failed"
+	}
 }
 
 // isBatch reports whether the request used the batch media type.
