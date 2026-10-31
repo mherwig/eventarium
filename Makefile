@@ -1,7 +1,7 @@
 GO    ?= go
 export PATH := $(HOME)/.local/go/bin:$(PATH)
 
-.PHONY: build check up down logs infra admin token test tidy fmt clean
+.PHONY: build check up down logs infra admin token test tidy fmt clean stack chaos
 
 ## build compiles every service into bin/
 build:
@@ -39,6 +39,19 @@ admin:
 token:
 	@test -n "$(OWNER)" || (echo "usage: make token OWNER=team-a"; exit 1)
 	$(GO) run ./cmd/minttoken -owner "$(OWNER)" $(if $(SCOPES),-scopes $(SCOPES)) $(if $(TTL),-ttl $(TTL))
+
+## stack starts the whole platform locally: five services plus three replicas
+## of each consumer. Always rebuilds first, so what runs is what was just
+## written. Run `make infra` first; this replaces the single-instance commands
+## of README §3 rather than adding to them.
+stack:
+	./scripts/stack.sh $(MODE)
+
+## chaos SCEN=pods runs one failure scenario against a running stack and judges
+## it with the harness oracle: SCEN is one of pods | pg | kafka | ch.
+chaos:
+	@test -n "$(SCEN)" || (echo "usage: make chaos SCEN=pods   (pods|pg|kafka|ch)"; exit 1)
+	./scripts/chaos.sh $(SCEN)
 
 test:
 	$(GO) test ./...

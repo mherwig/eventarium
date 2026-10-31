@@ -737,6 +737,35 @@ go vet ./... && gofmt -l cmd internal migrations   # both should be silent
 go test ./...                                       # unit tests for chquery and harness
 ```
 
+### Chaos scenarios
+
+```sh
+make infra            # Kafka, PostgreSQL, ClickHouse plus topics and schemas
+make stack            # five services, three replicas of each consumer
+make chaos SCEN=pods  # pods | pg | kafka | ch
+```
+
+| `SCEN` | what it breaks mid-publish |
+| --- | --- |
+| `pods` | `kill -9` one dispatcher, one router and one gateway |
+| `pg` | receiver offline **and** PostgreSQL down, overlapping by 20 s |
+| `ch` | ClickHouse down for 20 s |
+| `kafka` | broker restart |
+
+Each one publishes at 200 ev/s for 60 s with its own seeded owner, injects the
+fault, waits for the queues and the owner's inbox to drain, then runs the
+oracle. It exits non-zero when anything was lost — `missing > 0`,
+`unexpected > 0`, or `received` short of `expected`, which is the case a plain
+`missing=0` cannot see: a delivery that is only *tracked* (parked, status
+`pending`) counts as accounted even though it never reached a receiver.
+
+`./scripts/stack.sh` always rebuilds first, refuses to start a service whose
+port already answers, and the driver refuses to run without the full topology —
+a scenario that passes because a replica was missing proves nothing. Two of its
+three load-bearing properties exist because the harness once passed runs it had
+not really performed; see
+[docs/deviations-and-open-points.md](docs/deviations-and-open-points.md#chaos-during-load-crashed-replicas-and-dead-infrastructure-17).
+
 ## Where the spike stands
 
 A full harness run verifies with zero missing, zero unexpected and zero

@@ -153,17 +153,6 @@ From §16, minus what the spike answered:
   death — an unnecessary rebalance, and with the commit watermark another
   round of replay duplicates. This should be a `kafkautil.NewClient` option
   with the tradeoff written next to it, not a number inherited from a library.
-- **The chaos driver lives outside the repo** — the four scenarios are
-  reproducible from the prose in this document, but the script that runs them
-  sits in `/tmp`, and it carries the parts that actually mattered: the fault
-  assertions that fail a run unless the fault is observed to have landed, the
-  wait for the owner's inbox to reach 0 before judging, and the per-run owner
-  that stops one run's events leaking into the next run's status window.
-  Without those, three of the scenarios passed while testing nothing (see
-  below) — so the gap is not cosmetic, it is the difference between the
-  results here and someone else silently getting green runs. Committing it
-  means splitting what is portable (the scenario bodies) from what is not (the
-  docker binary path, `/tmp/opencode`).
 - **The ClickHouse scenario never asserted status-row completeness** — its
   `missing=0` is evidence about *deliveries*: the receivers recorded all
   58,366 of them, so the oracle had no way to notice a status row lost while
@@ -367,28 +356,56 @@ gone leaks into the next one as `unexpected`. That is not hypothetical — an
 aborted scenario did exactly this and produced 18,432 phantom `unexpected`
 before the harness was fixed.
 
-The shape of every scenario (the driver that wraps this lives outside the
-repo, so the pieces are spelled out):
+The driver is committed rather than described — `scripts/chaos.sh`, against the
+topology `scripts/stack.sh` starts:
+
+```sh
+make infra            # Kafka, PostgreSQL, ClickHouse plus topics and schemas
+make stack            # five services, three replicas of each consumer
+make chaos SCEN=pods  # pods | pg | kafka | ch
+```
+
+Its shape, spelled out for anyone who would rather read the four screens than
+the script:
 
 ```sh
 harness seed -api :8083 -owner $O -prefix $O -types 4 -subs 40 \
-  -webhook-url http://localhost:9090/hook > seed.json
-harness recv -addr :9090 -out recv.jsonl &          # one per scenario, fresh file
-harness sse -sub <id> -owner $O -addr http://localhost:8082 \  # 20, spread over
-  -duration 420s -out sse-<n>.jsonl &               # gateways :8082/8182/8282
-# publish in the background, then inject the fault ~10 s in:
+  -webhook-url http://localhost:9090/hook > seed.json   # own owner per run
+harness recv -addr :9090 -out recv.jsonl &              # fresh file per run
+harness sse -sub <id> -owner $O -addr http://localhost:8082 \
+  -duration 1800s -out sse-<n>.jsonl &  # 20, over :8082/:8182/:8282
 API=:8080 HARNESS_OWNER=$O harness pub -types "$O.type.0,..." \
   -rate 200 -duration 60s -payload 1024 -out pub.jsonl &
 docker compose stop postgres          # | restart kafka | stop clickhouse
 kill -9 <dispatcher pid>              # and/or router, gateway
-# wait for queue_depth=0, then for the owner's inbox rows to reach 0:
+# assert the fault actually landed, then wait for queue_depth=0 and for the
+# owner's inbox rows to reach 0:
 harness verify -owner $O -api :8083 -status-api :8081 \
   -events pub.jsonl -received recv.jsonl -sse "$(ls sse-*.jsonl | tr '\n' ,)"
 ```
 
+Three properties in the driver are load-bearing, and each one exists because
+getting it wrong produced a result that looked fine:
+
+- **Faults are asserted, not assumed** (`assert_down` / `assert_up`). An
+  unquoted `$DOCKER` word-split once made every `docker compose stop` exit 127
+  into `/dev/null`, and the first `pg` run reported success with PostgreSQL
+  never stopped.
+- **The judge waits for the queues *and* the owner's inbox to reach 0.**
+  Judging early reports work that is merely unfinished as lost. It also
+  matters because `missing=0` only means *tracked*: `accounted()` counts
+  `pending`, so the driver separately fails the run when `received` falls short
+  of `expected` — parked-but-undelivered deliveries would otherwise pass.
+- **Each run seeds its own owner**, so an earlier run's events cannot leak into
+  the next run's status window as `unexpected`.
+
 The two waits are not ceremony: judging before the queues drain reports work
 that is merely unfinished as lost, and judging before the inbox drains reports
-parked-but-durable deliveries as missing.
+parked-but-durable deliveries as missing. The SSE clients get `-duration 1800s`
+for the same reason — the waits alone can run 13 minutes, and a client that
+exits mid-wait strands its parked rows with nothing left to drain to (which is
+exactly what the first `ch` run of the committed script did: 81 rows and a
+`received` 81 short of `expected`).
 
 | Scenario | fault | missing | unexpected | duplicates |
 | --- | --- | --- | --- | --- |
