@@ -1,7 +1,7 @@
 GO    ?= go
 export PATH := $(HOME)/.local/go/bin:$(PATH)
 
-.PHONY: build check up down logs infra admin token test tidy fmt clean stack chaos
+.PHONY: build check up down logs infra admin token test tidy fmt clean stack chaos chaos-test
 
 ## build compiles every service into bin/
 build:
@@ -48,10 +48,16 @@ stack:
 	./scripts/stack.sh $(MODE)
 
 ## chaos SCEN=pods runs one failure scenario against a running stack and judges
-## it with the harness oracle: SCEN is one of pods | pg | kafka | ch.
+## it with the harness oracle: SCEN is one of pods | pg | kafka | ch | rebalance
+## (rebalance also measures how long a killed replica's partitions stay
+## unowned, against KAFKA_SESSION_TIMEOUT).
 chaos:
-	@test -n "$(SCEN)" || (echo "usage: make chaos SCEN=pods   (pods|pg|kafka|ch)"; exit 1)
+	@test -n "$(SCEN)" || (echo "usage: make chaos SCEN=pods   (pods|pg|kafka|ch|rebalance)"; exit 1)
 	./scripts/chaos.sh $(SCEN)
+
+## chaos-test runs the chaos driver's own tests (pure helpers, no Docker)
+chaos-test:
+	./scripts/chaos_test.sh
 
 test:
 	$(GO) test ./...

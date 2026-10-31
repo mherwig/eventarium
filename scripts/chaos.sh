@@ -6,10 +6,12 @@
 #
 #   ./scripts/chaos.sh <pods|pg|kafka|ch>
 #
-#   pods   kill -9 one dispatcher, one router and one gateway mid-run
-#   pg     receiver offline AND PostgreSQL down, overlapping by 20s
-#   ch     ClickHouse down for 20s (observability only)
-#   kafka  broker restart mid-run
+#   pods      kill -9 one dispatcher, one router and one gateway mid-run
+#   pg        receiver offline AND PostgreSQL down, overlapping by 20s
+#   ch        ClickHouse down for 20s (observability only)
+#   kafka     broker restart mid-run
+#   rebalance kill -9 one dispatcher mid-run and measure how long its
+#             partitions stay unowned, against the configured session timeout
 #
 # Prerequisites: 'make infra' for the databases, then './scripts/stack.sh' for
 # the replica topology. The driver checks both and refuses to run otherwise -
@@ -53,8 +55,8 @@ STATUS_API="${STATUS_API:-http://localhost:8081}"
 RECEIVER="${RECEIVER:-http://localhost:9090}"
 
 case "$SCEN" in
-pods|pg|kafka|ch) ;;
-*) echo "usage: $0 <pods|pg|kafka|ch>" >&2; exit 2 ;;
+pods|pg|kafka|ch|rebalance) ;;
+*) echo "usage: $0 <pods|pg|kafka|ch|rebalance>" >&2; exit 2 ;;
 esac
 
 D="$BASE/$SCEN"
@@ -91,6 +93,14 @@ for n in d1 d2 d3 r1 r2 r3 g1 g2 g3; do
 done
 
 # Each run gets its own owner - see the header.
+# The script's exit status. It has to be accumulated explicitly: the last
+# statement after the case is cleanup_clients, which deliberately returns 0, so
+# a bare `verify` at the end of a scenario would have made every run exit 0 -
+# the driver would have been incapable of failing. scenarios call judged(),
+# which ORs the oracle's verdict into this.
+FAIL=0
+judged() { verify || FAIL=1; }
+
 OWNER="${SCEN}$(date +%H%M%S)"
 RECV_PID="$BASE/recv.pid"
 PUB_PID="$D/pub.pid"
@@ -164,6 +174,64 @@ kafka_up() {
     /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1
 }
 
+# session_seconds turns KAFKA_SESSION_TIMEOUT into whole seconds for the
+# rebalance bound. It understands plain seconds ("45s", "45") and whole minutes
+# ("1m"); an unrecognised shape falls back to the 45s default rather than
+# producing arithmetic that fails inside the test.
+session_seconds() {
+  local v="${KAFKA_SESSION_TIMEOUT:-45s}" num unit
+  num=${v%[a-z]}
+  unit=${v#"$num"}
+  case "$num" in ''|*[!0-9]*) echo 45; return ;; esac
+  # 0 is numeric but not a usable session timeout (franz-go rejects it below
+  # 100ms), and it would make the failover bound a nonsense 15s - fall back to
+  # the tested default rather than asserting against a broken value.
+  [ "$num" -gt 0 ] || { echo 45; return; }
+  case "$unit" in
+    ""|s) echo "$num" ;;
+    m)    echo $(( num * 60 )) ;;
+    h)    echo $(( num * 3600 )) ;;
+    *)    echo 45 ;;
+  esac
+}
+
+# assignment prints one line per group member: "<consumer-id> <partition> ...",
+# sorted. A partition nobody owns shows as "-", which is how the rebalance
+# scenario tells "taken over by a live member" apart from "still owned by the
+# dead one" and "in transit, owned by nobody".
+assignment() {
+  "$DOCKER" exec pubsub-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server localhost:9092 --describe --group dispatcher 2>/dev/null \
+    | awk 'NR>1 && $3 ~ /^[0-9]+$/ { p[$7] = p[$7] " " $3 }
+           END { for (k in p) print k p[k] }' | sort
+}
+
+# unowned_count counts the partitions whose owner is "-".
+unowned_count() {
+  printf '%s\n' "$1" | tr ' ' '\n' | grep -c '^-$'
+}
+
+# handover_complete reports whether a post-kill assignment shows a *completed*
+# handover: $1 is the assignment before the kill, $2 the one measured now.
+#
+# Every condition exists because leaving one out reads as success at the wrong
+# moment: unchanged means the group has not noticed the death yet; a "-"
+# anywhere means the group is mid-rebalance and those partitions are owned by
+# nobody, which is the state that actually stops delivery. Accepting either
+# would report a fast failover that had not happened.
+# partition_count counts the partitions named across the assignment, so a
+# shrunken answer cannot look complete.
+partition_count() {
+  printf '%s\n' "$1" | tr ' ' '\n' | grep -c '^[0-9][0-9]*$'
+}
+
+handover_complete() {
+  [ -n "$2" ] || return 1                            # no answer at all
+  [ "$1" != "$2" ] || return 1                       # still the pre-kill assignment
+  [ "$(unowned_count "$2")" = "0" ] || return 1      # someone still in transit
+  [ "$(partition_count "$2")" -ge "$(partition_count "$1")" ]  # nothing dropped
+}
+
 # ---------------------------------------------------------------------------
 # counters and waits
 # ---------------------------------------------------------------------------
@@ -234,7 +302,61 @@ subs = json.load(open(sys.argv[1]))
 open(sys.argv[2], "w").write("\n".join(s["id"] for s in subs if s.get("channel") == "sse") + "\n")
 PYEOF
   echo "  owner=$OWNER subs=$(grep -c . "$D/all_ids.txt") sse=$(grep -c . "$D/sse_ids.txt")"
+  wait_for_sse_visibility
 }
+
+# wait_for_sse_visibility holds setup until every gateway's in-memory index
+# knows the subscriptions that were just created.
+#
+# The window is real and measured at 50-60 ms after the API returns 201 (the
+# NOTIFY fast path, not the 1 s poll). It matters because the harness's SSE
+# client treats HTTP 404 as fatal - and so does a browser: EventSource stops
+# for good on a 4xx rather than retrying - so a client that connects inside
+# that window dies at once, never reconnects, and its whole subscription's
+# deliveries then park as no_connection with nobody left to drain them. Seeding
+# and connecting back to back cost four of twenty clients and 3,187
+# undelivered rows in the first rebalance run; the oracle reported
+# received=55179 of 58366 and failed the run, which is the correct verdict on
+# a race the *setup* caused rather than the fault under test.
+#
+# /sse/ack answers the existence question without opening a stream: 404 means
+# the index has not caught up, anything else means it has. All three gateways
+# must agree, since each keeps its own index.
+wait_for_sse_visibility() {
+  local last tok t0 code pending
+  # The LAST SSE subscription created, not the first. A reload swaps the whole
+  # index, so seeing the last one proves each gateway read it after every
+  # insert and therefore holds all twenty. Probing the first one passes
+  # instantly - it was visible long before the others existed - and proves
+  # nothing, which is how this check first gave false confidence while two
+  # clients still got 404.
+  last=$(tail -1 "$D/sse_ids.txt")
+  tok=$("$BIN/minttoken" -owner "$OWNER" -scopes subscribe 2>/dev/null) || true
+  [ -n "$tok" ] || { echo "  cannot mint a probe token - skipping the visibility check"; return 0; }
+  t0=$(date +%s)
+  while :; do
+    pending=""
+    for port in 8082 8182 8282; do
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X POST \
+        -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+        -d "{\"subscription_id\":\"$last\",\"sequence\":\"0:0\"}" \
+        "http://localhost:$port/sse/ack" 2>/dev/null)
+      [ "$code" = "404" ] && pending="$pending :$port"
+    done
+    if [ -z "$pending" ]; then
+      echo "  all three gateways know the newest subscription"
+      return 0
+    fi
+    if [ $(( $(date +%s) - t0 )) -ge 5 ]; then
+      echo "  SETUP FAILED: gateways$pending still answer 404 after 5s" >&2
+      echo "    a client connecting now would be rejected for good, so the" >&2
+      echo "    run would fail for a reason that is not the fault under test" >&2
+      exit 4
+    fi
+    sleep 0.1
+  done
+}
+
 
 # start_receiver [extra harness recv flags]. One receiver per run, tracked by
 # pid file across scenarios - never by pkill pattern.
@@ -296,12 +418,22 @@ wait_publish() {
 # the run says so and fails.
 verify() {
   echo "--- oracle ($SCEN, owner $OWNER) ---"
-  local out line expected received
+  local out rc line expected received
+  # Declared separately from the assignment on purpose: `local out=$(...)`
+  # would make $? report local's status, not the oracle's.
   out=$(JWT_SECRET="$JWT_SECRET" "$BIN/harness" verify -owner "$OWNER" -api "$REGISTRY_API" \
     -status-api "$STATUS_API" \
     -events "$D/pub.jsonl" -received "$D/recv.jsonl" \
     -sse "$(ls "$D"/sse-*.jsonl 2>/dev/null | tr '\n' ',' | sed 's/,$//')" 2>&1)
+  rc=$?
   echo "$out" | tail -6
+  # The oracle's own verdict first: it fails on missing AND on unexpected, and
+  # unexpected alone can leave received == expected, which the check below
+  # would happily pass.
+  if [ "$rc" != "0" ]; then
+    echo "ORACLE FAILED (exit $rc) - see the table above." >&2
+    return 3
+  fi
   line=$(echo "$out" | grep -o 'subscriptions=[0-9]* expected=[0-9]* received=[0-9]*.*' | tail -1)
   # The leading space matters: bare 'expected=[0-9]*' also matches inside
   # 'unexpected=0', which made $expected two lines long and turned a perfect
@@ -348,7 +480,7 @@ pods)
   echo "  sse clients reconnected: $(grep -l reconnect "$D"/sse-*.log 2>/dev/null | wc -l) of 20 logs show a reconnect"
   wait_drained 300
   wait_inbox
-  verify
+  judged
   ;;
 
 pg)
@@ -381,7 +513,7 @@ pg)
   wait_drained 300
   echo "  final offsets_in_flight: $(inflight)"
   wait_inbox
-  verify
+  judged
   ;;
 
 kafka)
@@ -397,7 +529,7 @@ kafka)
   wait_publish
   wait_drained 300
   wait_inbox
-  verify
+  judged
   ;;
 
 ch)
@@ -420,8 +552,60 @@ ch)
   wait_publish
   wait_drained 300
   wait_inbox
-  verify
+  judged
+  ;;
+
+rebalance)
+  seed_owner
+  echo "== rebalance: kill -9 a dispatcher mid-run, measure its handover =="
+  start_receivers
+  publish_bg 200 60s
+  sleep 10
+
+  BEFORE=$(assignment)
+  MEMBERS=$(printf '%s\n' "$BEFORE" | grep -c .)
+  DEAD_PID=$(cat "$LOG/d1.pid")
+  T0=$(date +%s)
+  echo "  t=10s  kill -9 d1 (pid $DEAD_PID); the group had $MEMBERS members"
+  kill -9 "$DEAD_PID" 2>/dev/null || { echo "  could not kill d1" >&2; FAIL=1; }
+
+  SESSION=$(session_seconds)
+  # 15s of slack: polling runs every 2s and each kafka-consumer-groups call
+  # costs a second or two of its own, so the measurement trails reality.
+  BOUND=$(( SESSION + 15 ))
+  failover=""; unowned=0; now=0
+  while :; do
+    now=$(( $(date +%s) - T0 ))
+    cur=$(assignment)
+    unowned=$(unowned_count "$cur")
+    # See handover_complete: "the dead id is gone" on its own would also
+    # accept a rebalance still in flight with partitions owned by nobody.
+    if handover_complete "$BEFORE" "$cur"; then
+      failover=$now
+      break
+    fi
+    [ "$now" -ge "$BOUND" ] && break
+    sleep 2
+  done
+
+  if [ -z "$failover" ]; then
+    echo "  FAILOVER TOO SLOW: $unowned partition(s) still unowned after ${now}s" >&2
+    echo "    bound ${BOUND}s = session ${SESSION}s + 15s of polling slack" >&2
+    echo "    (nothing is lost - Kafka holds the records - but an unowned" >&2
+    echo "    partition delivers nothing until the handover completes)" >&2
+    FAIL=1
+  else
+    echo "  failover: all partitions owned again after ${failover}s (bound ${BOUND}s = session ${SESSION}s + 15s)"
+  fi
+
+  echo "  restarting d1"
+  start_bin dispatcher d1 HTTP_ADDR=:8086
+  wait_publish
+  wait_drained 300
+  wait_inbox
+  judged
   ;;
 esac
 
 cleanup_clients
+exit "$FAIL"
