@@ -5,12 +5,15 @@ package kafkautil
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+
+	"pubsub/internal/config"
 )
 
 // Topic names (section 3 of the spec).
@@ -31,6 +34,66 @@ const (
 
 // Classes lists the retention classes in no particular order.
 var Classes = []string{ClassLive, ClassShort, ClassDay, ClassWeek}
+
+// Failover timing: one pair, two values that are only correct together.
+//
+// SessionTimeout is how long Kafka waits for a group member to stop
+// heartbeating before it calls the member dead and rebalances. It is the crash
+// floor: after a `kill -9`, an OOMKill or a lost node, the dead member's
+// partitions belong to nobody until it expires, and only then move. Measured on
+// the three-dispatcher group (docs/deviations-and-open-points.md): 43 s until
+// the partitions were owned again with the default, against 3 s for a graceful
+// SIGTERM - which is why a rolling update feels instant and a crash does not.
+// The records are never at risk while the group waits; the costs are latency on
+// a third of the partitions and, on recovery, the replay duplicates.
+//
+// TransactionTimeout must stay *below* SessionTimeout, or a
+// consume-modify-produce transaction can outlive the member that owns it.
+// franz-go states that rule and enforces neither end of it, so Timeouts()
+// clamps the pair - and unlike a session timeout below Kafka's floor, which
+// fails loudly when the member tries to join, a transaction that outlives its
+// member fails silently. Heartbeats, for the record, run in franz-go's own
+// background group goroutine rather than in the application's poll loop, so a
+// slow publish or a long GC pause does not by itself miss them; a process
+// frozen or partitioned for longer than the value does, and evicting that one
+// is the point.
+//
+// Both are configurable (KAFKA_SESSION_TIMEOUT, KAFKA_TRANSACTION_TIMEOUT) so
+// the choice can be made without a rebuild. The defaults are the values this
+// codebase has actually been measured with - changing either means re-running
+// the rebalance scenario, not just editing a comment.
+const (
+	DefaultSessionTimeout     = 45 * time.Second // franz-go's own default
+	DefaultTransactionTimeout = 40 * time.Second // franz-go's own default, below the session
+	transactionHeadroom       = 5 * time.Second  // the gap the clamp keeps
+)
+
+// Timeouts returns the session and transaction timeouts as a pair, honouring
+// KAFKA_SESSION_TIMEOUT / KAFKA_TRANSACTION_TIMEOUT and enforcing
+// txn < session. Callers that are group members and callers that write inside
+// a transaction both take their values from here, so the two can never be
+// configured apart - they live in kafkautil precisely because franz-go's
+// coupling of them lives in a library comment.
+//
+// A transaction timeout that is not below the session timeout is not rejected,
+// it is adjusted: refusing would take a service down over an environment
+// variable, while passing the pair through unclamped would risk a transaction
+// finishing after a rebalance - the failure its own documentation warns about
+// and nothing else checks. The adjustment is logged, never silent.
+func Timeouts() (session, txn time.Duration) {
+	session = config.Duration("KAFKA_SESSION_TIMEOUT", DefaultSessionTimeout)
+	txn = config.Duration("KAFKA_TRANSACTION_TIMEOUT", DefaultTransactionTimeout)
+	if txn >= session {
+		adj := session - transactionHeadroom
+		if adj <= 0 {
+			adj = session / 2 // an absurdly small session still needs a positive txn
+		}
+		slog.Warn("kafkautil: KAFKA_TRANSACTION_TIMEOUT must be below KAFKA_SESSION_TIMEOUT, using the smaller value",
+			"session", session, "requested_txn", txn, "using_txn", adj)
+		txn = adj
+	}
+	return session, txn
+}
 
 // ValidClass reports whether class is a known retention class.
 func ValidClass(class string) bool {
@@ -114,12 +177,19 @@ func envOr(key, def string) string {
 // that are never written transactionally (the event logs) are unaffected,
 // because uncommitted records do not exist there.
 func NewClient(extra ...kgo.Opt) (*kgo.Client, error) {
+	// Both timeouts are set for every client, transactional or not: the
+	// session one only takes effect for group members and the transaction one
+	// only inside a transaction, and setting them together is what stops the
+	// pair from being configured apart (see Timeouts).
+	session, txn := Timeouts()
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokerList()...),
 		kgo.ProducerLinger(2 * time.Millisecond),
 		kgo.ProducerBatchMaxBytes(4 << 20),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+		kgo.SessionTimeout(session),
+		kgo.TransactionTimeout(txn),
 	}
 	opts = append(opts, extra...)
 	return kgo.NewClient(opts...)

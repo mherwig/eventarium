@@ -132,6 +132,12 @@ func newSession(topics []string) (*kgo.GroupTransactSession, error) {
 	if err != nil || host == "" {
 		host = "unknown"
 	}
+	// This is the one client where both halves of the failover pair matter: it
+	// is a group member *and* a transactional producer, so a transaction must
+	// not be able to outlive the membership carrying it. Taking both from
+	// kafkautil.Timeouts keeps that rule from being configured away - a
+	// session timeout chosen independently here would silently decouple it.
+	session, txn := kafkautil.Timeouts()
 	return kgo.NewGroupTransactSession(
 		kgo.SeedBrokers(kafkautil.Bootstrap()...),
 		kgo.ConsumerGroup(group),
@@ -140,6 +146,8 @@ func newSession(topics []string) (*kgo.GroupTransactSession, error) {
 		kgo.TransactionalID(fmt.Sprintf("%s-%d", host, os.Getpid())),
 		kgo.ProducerLinger(2*time.Millisecond),
 		kgo.ProducerBatchMaxBytes(4<<20),
+		kgo.SessionTimeout(session),
+		kgo.TransactionTimeout(txn),
 		// Without this, franz-go's logs are discarded and an aborted
 		// transaction is a bare "committed=false": the reason (a revoke,
 		// a failed heartbeat, an abortable offset commit) is only ever
