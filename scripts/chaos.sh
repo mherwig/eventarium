@@ -114,8 +114,34 @@ stop_publisher() {
   [ -e "$PUB_PID" ] && { kill "$(cat "$PUB_PID")" 2>/dev/null; rm -f "$PUB_PID"; }
   return 0
 }
+
+# port_holder lists the pids listening on a port.
+port_holder() {
+  ss -ltnp 2>/dev/null | awk -v p=":$1" '$4 ~ p"$" {print}' | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u | tr '\n' ' '
+}
+
+# is_harness_recv reports whether a pid is a `harness recv` - the only process
+# this driver will ever kill by port.
+is_harness_recv() {
+  tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q 'harness recv'
+}
+
 stop_receiver() {
+  local p
   [ -e "$RECV_PID" ] && { kill "$(cat "$RECV_PID")" 2>/dev/null; rm -f "$RECV_PID"; }
+  # A receiver from an earlier run - or one started by hand - holding :9090
+  # makes every receiver since fail to bind, and it fails *quietly*: the new
+  # process exits, recv.jsonl stays empty, and the shortfall only surfaces at
+  # the oracle minutes later as a mystery missing=39713. Clear the port here,
+  # where the intent is unambiguous. Only a process that is itself a
+  # `harness recv` is touched; anything else keeps the port and is reported
+  # by wait_for_receiver.
+  for p in $(port_holder 9090); do
+    if is_harness_recv "$p"; then
+      echo "  stopping a leftover delivery receiver on :9090 (pid $p)"
+      kill "$p" 2>/dev/null
+    fi
+  done
   return 0
 }
 cleanup_clients() {
@@ -175,23 +201,27 @@ kafka_up() {
 }
 
 # session_seconds turns KAFKA_SESSION_TIMEOUT into whole seconds for the
-# rebalance bound. It understands plain seconds ("45s", "45") and whole minutes
-# ("1m"); an unrecognised shape falls back to the 45s default rather than
-# producing arithmetic that fails inside the test.
+# rebalance bound. It understands plain seconds ("15s", "15") and whole minutes
+# ("1m"); an unrecognised shape falls back to the Go default rather than
+# producing arithmetic that fails inside the test. That fallback is pinned to
+# kafkautil.DefaultSessionTimeout by TestSessionSecondsFallbackMatchesDefault,
+# because a stale copy here once printed a 60s bound for a 15s session - the
+# measurement was right and the number printed next to it was four times too
+# generous, which is worse than no number at all.
 session_seconds() {
-  local v="${KAFKA_SESSION_TIMEOUT:-45s}" num unit
+  local v="${KAFKA_SESSION_TIMEOUT:-15s}" num unit
   num=${v%[a-z]}
   unit=${v#"$num"}
-  case "$num" in ''|*[!0-9]*) echo 45; return ;; esac
+  case "$num" in ''|*[!0-9]*) echo 15; return ;; esac
   # 0 is numeric but not a usable session timeout (franz-go rejects it below
   # 100ms), and it would make the failover bound a nonsense 15s - fall back to
   # the tested default rather than asserting against a broken value.
-  [ "$num" -gt 0 ] || { echo 45; return; }
+  [ "$num" -gt 0 ] || { echo 15; return; }
   case "$unit" in
     ""|s) echo "$num" ;;
     m)    echo $(( num * 60 )) ;;
     h)    echo $(( num * 3600 )) ;;
-    *)    echo 45 ;;
+    *)    echo 15 ;;
   esac
 }
 
@@ -366,6 +396,37 @@ start_receiver() {
     > "$D/recv.log" 2>&1 &
   echo $! > "$RECV_PID"
   echo $! > "$D/recv.pid"
+  wait_for_receiver
+}
+
+# wait_for_receiver refuses to continue until the receiver really is listening.
+# A failed bind used to be invisible until the oracle: the process exits, its
+# log gets one line nobody reads, and every webhook delivery of the run is
+# silently never received - the run then fails minutes later as a shortfall
+# that looks like the platform dropped them. Failing here, loudly, with the
+# reason, is the whole improvement.
+wait_for_receiver() {
+  local pid t0 now holder
+  pid=$(cat "$RECV_PID")
+  t0=$(date +%s)
+  while :; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "SETUP FAILED: the delivery receiver exited at startup:" >&2
+      sed 's/^/    /' "$D/recv.log" >&2
+      exit 4
+    fi
+    holder=$(port_holder 9090)
+    case " $holder " in
+      *" $pid "*) return 0 ;;
+    esac
+    now=$(( $(date +%s) - t0 ))
+    if [ "$now" -ge 5 ]; then
+      echo "SETUP FAILED: :9090 is held by pid(s) ${holder:-nothing} and our receiver ($pid) never bound." >&2
+      echo "  Stop whatever holds the port and re-run." >&2
+      exit 4
+    fi
+    sleep 0.2
+  done
 }
 
 # start_sse_clients spreads the run's SSE clients over the three gateways, so

@@ -2,11 +2,15 @@
 # chaos_test.sh - tests for the pure helpers in scripts/chaos.sh.
 #
 # No Docker and no running stack: these are the parts of the driver that are
-# decisions rather than I/O, and they are the parts that went wrong first. Two
-# of them were caught by a one-off test while the driver was being written -
-# session_seconds returning 0 for KAFKA_SESSION_TIMEOUT=0, which would have
-# made the failover bound a nonsense 15s, and a handover check that would have
-# accepted a rebalance still in flight. Worth keeping.
+# decisions rather than I/O, and they are the parts that went wrong first.
+# Three things were caught by tests while the driver was being written:
+# session_seconds returning 0 for KAFKA_SESSION_TIMEOUT=0 (which would have
+# made the failover bound a nonsense 15s), a handover check that would have
+# accepted a rebalance still in flight, and - the expensive one - the fallback
+# session timeout drifting away from kafkautil.DefaultSessionTimeout, which let
+# the scenario measure a correct 16s handover and print it against a four
+# times too generous 60s bound. TestSessionSecondsFallbackMatchesDefault in
+# internal/kafkautil pins the two together; the text assertions below agree.
 #
 # Run with `make chaos-test`. Exits non-zero on the first failure.
 set -u
@@ -24,7 +28,7 @@ extract() { # function name
   sed -n "/^$1()/,/^}/p" "$HERE/chaos.sh"
 }
 # shellcheck disable=SC1090
-source <(extract session_seconds; extract unowned_count; extract partition_count; extract handover_complete)
+source <(extract session_seconds; extract unowned_count; extract partition_count; extract handover_complete; extract is_harness_recv)
 
 echo "session_seconds"
 t_session() { # env-value want
@@ -34,15 +38,16 @@ t_session() { # env-value want
   if [ "$got" = "$want" ]; then pass "${v:-unset} -> $got"
   else fail_case "${v:-unset} -> $got, want $want"; fi
 }
-t_session ""   45
+t_session ""   15   # the shipped default, pinned to kafkautil by a Go test
 t_session 45s  45
 t_session 45   45
-t_session 15s  15   # the value a tuned deployment would set
+t_session 15s  15
+t_session 45s  45   # the conservative pair a deployment may still choose
 t_session 10s  10
 t_session 1m   60
-t_session 0    45   # not a usable session timeout: default, not bound=15
-t_session bogus 45  # an unrecognised shape must not break the arithmetic
-t_session 1m30s 45  # mixed units: fall back rather than guess
+t_session 0    15   # not a usable session timeout: default, not bound=15
+t_session bogus 15  # an unrecognised shape must not break the arithmetic
+t_session 1m30s 15  # mixed units: fall back rather than guess
 unset KAFKA_SESSION_TIMEOUT
 
 echo "unowned_count"
@@ -81,6 +86,27 @@ kgo-b 4 5 6
 t_handover 'kgo-a 1 2 3
 kgo-b 4 5 6 7 8 9' 0 "took over every partition - the real handover"
 t_handover '' 1 "no assignment reported at all"
+
+echo "is_harness_recv"
+# The driver kills by port - but only a process that is itself a `harness
+# recv`. Getting that predicate wrong is the difference between clearing a
+# leftover receiver and killing whatever the operator happens to have on
+# :9090, so it is checked against a real process whose argv0 has been renamed
+# to look like the harness. Launched detached and found again by ps: a plain
+# background job dies with the command substitution that spawned it, which is
+# how this test first reported a nonexistent pid as a failure.
+setsid bash -c 'exec -a "harness recv" sleep 8' >/dev/null 2>&1 </dev/null &
+sleep 0.5
+fake=$(ps -eo pid,args | grep -m1 '[h]arness recv 8' | awk '{print $1}')
+if [ -z "$fake" ]; then
+  fail_case "could not start a fake receiver to test against"
+else
+  if is_harness_recv "$fake"; then pass "a process named \'harness recv\' is recognised"
+  else fail_case "a process named \'harness recv\' was NOT recognised"; fi
+  if is_harness_recv "$$"; then fail_case "this test shell was mistaken for a receiver"
+  else pass "an unrelated process is not a receiver"; fi
+  kill "$fake" 2>/dev/null
+fi
 
 [ "$fail" = "0" ] || { echo "chaos helper tests FAILED" >&2; exit 1; }
 echo "all chaos helper tests passed"
