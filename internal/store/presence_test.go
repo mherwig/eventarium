@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -88,6 +89,82 @@ func TestVisiblePresenceRequiresAFreshLease(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("presence rows after the lease expired = %d, want 1 (expiry hides, it must not delete)", n)
+	}
+}
+
+// TestVisiblePresenceCarriesTheLeaseHeartbeat: pick() breaks its tie between
+// two routable connections on the node that heartbeated most recently, so the
+// heartbeat has to arrive with the row rather than only being used to filter.
+//
+// The distinction it exists for is the one gwfail ran into: a gateway that is
+// `kill -9`ed keeps its rows routable for the rest of the lease, so a view can
+// legitimately hold both the dead connection and the client's new one on a
+// survivor. Filtering alone cannot separate them - both pass - and the old
+// tie-break (the first entry of a map range) chose the dead one 7 times in 8
+// and lost six deliveries for it.
+//
+// Both rows here stay *visible* on purpose: the lease is what decides
+// visibility and it has not expired for either. What is asserted is that the
+// reader can tell them apart, which is strictly more than the filter needed.
+func TestVisiblePresenceCarriesTheLeaseHeartbeat(t *testing.T) {
+	st := presenceStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const (
+		freshNode = "test-heartbeat-fresh"
+		staleNode = "test-heartbeat-stale"
+	)
+	cleanup(t, ctx, st, freshNode)
+	cleanup(t, ctx, st, staleNode)
+	t.Cleanup(func() {
+		cleanup(t, ctx, st, freshNode)
+		cleanup(t, ctx, st, staleNode)
+	})
+
+	for i, node := range []string{freshNode, staleNode} {
+		if err := st.TouchNode(ctx, node); err != nil {
+			t.Fatalf("TouchNode(%s): %v", node, err)
+		}
+		if err := st.UpsertPresence(ctx, store.PresenceRow{
+			SubscriptionID: fmt.Sprintf("00000000-0000-4000-8000-0000000000%02d", 21+i),
+			ConnectionID:   fmt.Sprintf("00000000-0000-4000-8000-0000000000%02d", 31+i),
+			NodeID:         node,
+			ConsumerID:     fmt.Sprintf("consumer-hb-%d", i),
+		}); err != nil {
+			t.Fatalf("UpsertPresence(%s): %v", node, err)
+		}
+	}
+	// Age one lease, but only by less than the TTL: it must stay visible, and
+	// it must be recognisably older than the other one. Backdating rather than
+	// sleeping keeps the test instant and deterministic.
+	if _, err := st.Pool.Exec(ctx,
+		`UPDATE sse_presence_nodes SET last_seen = now() - interval '3 seconds' WHERE node_id = $1`,
+		staleNode); err != nil {
+		t.Fatalf("backdating the lease: %v", err)
+	}
+
+	rows, err := st.VisiblePresence(ctx, 6*time.Second)
+	if err != nil {
+		t.Fatalf("VisiblePresence: %v", err)
+	}
+	seen := map[string]time.Time{}
+	for _, r := range rows {
+		if r.NodeID == freshNode || r.NodeID == staleNode {
+			seen[r.NodeID] = r.NodeLastSeen
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("VisiblePresence returned %d of the 2 seeded rows, want 2 (both inside the lease)", len(seen))
+	}
+	for node, ts := range seen {
+		if ts.IsZero() {
+			t.Errorf("%s: NodeLastSeen is zero - pick() would have nothing to break its tie on", node)
+		}
+	}
+	if !seen[freshNode].After(seen[staleNode]) {
+		t.Errorf("fresh node's last_seen %v is not after the aged one's %v - the reader cannot tell a live node from a stale one",
+			seen[freshNode], seen[staleNode])
 	}
 }
 

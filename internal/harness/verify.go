@@ -143,8 +143,13 @@ func runVerify(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	// What the receiver recorded, per subscription: event ref -> count.
+	// What the receiver recorded, per subscription: event ref -> count, and
+	// event ref -> when it arrived. The timestamp is what lets the status
+	// check judge a delivery only when the query window can actually see its
+	// status row (withinWindow); a repeated receipt keeps the latest one,
+	// which is the one a terminal status would line up with.
 	recvBySub := map[string]map[string]int{}
+	recvAt := map[string]map[string]time.Time{}
 	for _, r := range recvs {
 		if r.SubscriptionID == "" || r.EventRef == "" {
 			continue
@@ -155,11 +160,19 @@ func runVerify(ctx context.Context, args []string) int {
 			recvBySub[r.SubscriptionID] = m
 		}
 		m[r.EventRef]++
+		a := recvAt[r.SubscriptionID]
+		if a == nil {
+			a = map[string]time.Time{}
+			recvAt[r.SubscriptionID] = a
+		}
+		if prev, ok := a[r.EventRef]; !ok || r.ReceivedAt.After(prev) {
+			a[r.EventRef] = r.ReceivedAt
+		}
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "SUBSCRIPTION\tCHANNEL\tMODE\tEXPECTED\tRECEIVED\tMISSING\tUNEXPECTED\tDUPLICATES\tSTATUS")
-	var totExp, totRec, totMiss, totUnexp, totDup int
+	var totExp, totRec, totMiss, totUnexp, totDup, totUnrec int
 	failed := false
 	for i := range subs {
 		sub := &subs[i]
@@ -210,15 +223,44 @@ func runVerify(ctx context.Context, args []string) int {
 			}
 		}
 
+		// The half of completeness missing= cannot ask about: a delivery the
+		// receiver *did* get must have a status row for it. missing= only
+		// looks at deliveries that did not arrive, and only asks whether one
+		// exists - so if the store had lost every row of a received delivery,
+		// missing= would stay 0 and both sides would be looking at different
+		// truths.
+		//
+		// Two guards keep this from inventing failures: receipts outside the
+		// query window are not judged (see withinWindow), and a failed status
+		// query is not judged at all (with statusErr the refs are partial, and
+		// every absence would be an artefact of the query rather than of the
+		// store).
+		unrec := map[string]bool{}
+		if statusErr == nil {
+			at := recvAt[sub.ID]
+			for ref := range recvCounts {
+				if t, ok := at[ref]; ok && withinWindow(t, from, to) && statusRefs[ref] == "" {
+					unrec[ref] = true
+				}
+			}
+		}
+
 		if len(missing) > 0 || len(unexpected) > 0 {
 			failed = true
 			sampleSet("missing", sub.ID, missing)
 			sampleSet("unexpected", sub.ID, unexpected)
 		}
+		if len(unrec) > 0 {
+			failed = true
+			sampleSet("received but unrecorded", sub.ID, unrec)
+			fmt.Fprintf(os.Stderr, "harness verify: subscription %s: %d received delivery(ies) have no status row in the store\n",
+				sub.ID, len(unrec))
+		}
 		totExp += len(expected)
 		totRec += len(recvCounts)
 		totMiss += len(missing)
 		totUnexp += len(unexpected)
+		totUnrec += len(unrec)
 		totDup += dup
 		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\n",
 			sub.ID, sub.Channel, sub.DeliveryMode,
@@ -227,8 +269,8 @@ func runVerify(ctx context.Context, args []string) int {
 	}
 	_ = w.Flush()
 
-	fmt.Printf("harness verify: subscriptions=%d expected=%d received=%d missing=%d unexpected=%d duplicates=%d\n",
-		len(subs), totExp, totRec, totMiss, totUnexp, totDup)
+	fmt.Printf("harness verify: subscriptions=%d expected=%d received=%d missing=%d unexpected=%d duplicates=%d unrecorded=%d\n",
+		len(subs), totExp, totRec, totMiss, totUnexp, totDup, totUnrec)
 	if failed {
 		fmt.Println("harness verify: FAIL")
 		return 1
@@ -261,6 +303,24 @@ func sseSubscriptionOf(deliveryID string) string {
 // seeing rather than absorbing.
 func accounted(st string) bool {
 	return st != "" && st != status.Filtered
+}
+
+// withinWindow reports whether a receipt falls inside the Status API query
+// window the oracle uses.
+//
+// Only deliveries inside it can be judged against the status store: the API
+// scopes every query to [from, to], so a delivery received after `to` has its
+// terminal row outside the window even though the row exists in ClickHouse.
+// Treating "not visible to this query" as "lost" was exactly the trap - the
+// `pg` scenario delivers a third of its receipts minutes after publishing has
+// stopped (rate-limited tails, drained backlog), and 30,028 of 39,719 of them
+// landed past `to`. Judging only what the window can see turns that from
+// 30,028 false alarms into zero.
+func withinWindow(t, from, to time.Time) bool {
+	if t.IsZero() {
+		return false // no timestamp: nothing to place in the window, so nothing to assert
+	}
+	return !t.Before(from) && !t.After(to)
 }
 
 // expectedSet recomputes locally which of the published events must reach the

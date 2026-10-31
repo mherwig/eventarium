@@ -12,6 +12,8 @@
 #   kafka     broker restart mid-run
 #   rebalance kill -9 one dispatcher mid-run and measure how long its
 #             partitions stay unowned, against the configured session timeout
+#   gwfail    kill -9 one gateway and leave it down: its clients must land on
+#             a survivor and its subscriptions must become routable again
 #
 # Prerequisites: 'make infra' for the databases, then './scripts/stack.sh' for
 # the replica topology. The driver checks both and refuses to run otherwise -
@@ -55,8 +57,8 @@ STATUS_API="${STATUS_API:-http://localhost:8081}"
 RECEIVER="${RECEIVER:-http://localhost:9090}"
 
 case "$SCEN" in
-pods|pg|kafka|ch|rebalance) ;;
-*) echo "usage: $0 <pods|pg|kafka|ch|rebalance>" >&2; exit 2 ;;
+pods|pg|kafka|ch|rebalance|gwfail) ;;
+*) echo "usage: $0 <pods|pg|kafka|ch|rebalance|gwfail>" >&2; exit 2 ;;
 esac
 
 D="$BASE/$SCEN"
@@ -99,7 +101,14 @@ done
 # the driver would have been incapable of failing. scenarios call judged(),
 # which ORs the oracle's verdict into this.
 FAIL=0
-judged() { verify || FAIL=1; }
+# judged settles the status store, then asks the oracle. The settle comes first
+# because the oracle reads ClickHouse through the Status API, and a verdict
+# taken while status-writer is still catching up would report in-flight rows as
+# lost - or, worse, pass a run whose rows are still sitting in Kafka.
+judged() {
+  status_settled 60 || FAIL=1
+  verify || FAIL=1
+}
 
 OWNER="${SCEN}$(date +%H%M%S)"
 RECV_PID="$BASE/recv.pid"
@@ -286,6 +295,15 @@ visible_subs() {
     | grep -o '"presence":[0-9]*' | cut -d: -f2
 }
 
+# visible_nodes <port> prints the nodes a gateway currently routes to, from
+# /healthz's routable_nodes. Unlike visible_subs this is per *node*, which is
+# what a lease assertion needs: a dead node's subscriptions may have been
+# re-registered elsewhere, hiding its disappearance from any count.
+visible_nodes() {
+  curl -s --max-time 3 "http://localhost:$1/healthz" 2>/dev/null \
+    | grep -o '"routable_nodes":\[[^]]*\]' | sed 's/.*://'
+}
+
 # wait_presence_drop <before> <ports...> waits until every surviving gateway
 # counts fewer routable subscriptions than before the kill, and prints the new
 # count. The lease TTL bounds how long a dead node may stay visible, the reload
@@ -309,9 +327,202 @@ wait_presence_drop() {
   done
 }
 
+# lag_total sums the LAG column of a kafka-consumer-groups listing on stdin.
+# A partition that has records but no committed offset reports "-" rather than
+# a number; its whole log end is behind, so it counts as that many. A partition
+# with nothing produced is settled at zero however it is displayed.
+lag_total() {
+  awk 'NR>1 && $3 ~ /^[0-9]+$/ {
+         if ($6 ~ /^[0-9]+$/) s += $6
+         else if ($5 ~ /^[0-9]+$/ && $5+0 > 0) s += $5
+       }
+       END { print s+0 }'
+}
+
+# status_writer_commit_trouble counts the offset-commit failures status-writer
+# has logged. Any of them makes lag an unsound completeness signal, and this is
+# the only place that fact is visible:
+#
+#   - flushOnce inserts before it commits, so a commit that fails does not mean
+#     the rows are missing - they are in ClickHouse already.
+#   - Once commits fail maxCommitFailures times the offsets are dropped on
+#     purpose (cmd/status-writer: the partitions were revoked, the commit can
+#     never succeed, the records may be re-consumed, the table is append-only),
+#     and from then on the committed offset sits behind by exactly those
+#     records. Lag then counts what may be *re-read*, not what has *not been
+#     inserted*, and it grows by one scenario's production per run.
+#   - A later successful commit would jump the offset forward again, but that
+#     path only logs at debug level, so the writer cannot tell us when it
+#     happened. After a broker restart it does not happen at all: the writer
+#     keeps inserting from its stale assignment while the group reports no
+#     active members, which is how lag reached 1.8M with unrecorded=0.
+#
+# Kafka lag itself cannot make this distinction - it is one number for two
+# different conditions - so the row-level check (unrecorded) is what gates the
+# verdict, and this only decides whether lag is allowed to fail a run.
+status_writer_commit_trouble() {
+  local n
+  n=$(grep -c -E "committing offsets|dropping offsets" "$LOG/status-writer.log" 2>/dev/null)
+  echo "${n:-0}"
+}
+
+# status_settled waits until status-writer has caught up on delivery-status,
+# then says so; exits non-zero only if it fails to catch up in <seconds> *and*
+# the lag still means what lag usually means.
+#
+# Lag 0 is a sound sufficient claim, and it is the one the ch scenario exists
+# to test: status-writer commits an offset only *after* the insert into
+# ClickHouse succeeded (cmd/status-writer), so while lag reads 0 nothing can be
+# left in Kafka - including the rows written while ClickHouse was down. Judging
+# before that would read "still in flight" as "lost".
+#
+# The converse does not hold, and asserting it produced a false failure on
+# every scenario that rebalances. flushOnce inserts and then commits; when the
+# commit keeps failing with UNKNOWN_MEMBER_ID - which is what a broker restart
+# leaves behind - status-writer deliberately gives up on those offsets after
+# maxCommitFailures, on purpose and documented there: the partitions were
+# revoked, the commit can never succeed, the records may be re-consumed and the
+# table is append-only. From that moment on, lag counts what may be *re-read*,
+# not what has *not been inserted*, and it grows by one scenario's production
+# per run while the rows are in ClickHouse the whole time - which is exactly
+# why the oracle prints unrecorded=0 in the same breath as a five-digit lag.
+#
+# So a non-zero lag is reported as incomplete only when the group still has a
+# member, i.e. when it can only mean un-inserted rows. When the writer is not
+# in its group, this says so and hands the verdict to the row-level check
+# (unrecorded), which does not depend on offsets at all.
+status_settled() {
+  local want=${1:-60} t0 now lag
+  t0=$(date +%s)
+  while :; do
+    lag=$(status_lag)
+    if [ "$lag" = "0" ]; then
+      echo "  status-writer caught up: delivery-status lag=0"
+      return 0
+    fi
+    now=$(( $(date +%s) - t0 ))
+    if [ "$now" -ge "$want" ]; then
+      if [ "$(status_writer_commit_trouble)" -gt 0 ]; then
+        echo "  lag=${lag} is not a statement about the store: status-writer has reported"
+        echo "    offset-commit failures, it inserts before it commits, and dropped offsets"
+        echo "    (cmd/status-writer, maxCommitFailures) leave the committed offset behind"
+        echo "    by exactly those records. What may be re-read is not what is missing."
+        echo "    Completeness is decided by unrecorded= below, which reads rows, not offsets."
+        return 0
+      fi
+      echo "  STATUS INCOMPLETE: delivery-status still ${lag} record(s) behind after ${now}s" >&2
+      echo "    status-writer is in its group and still committing, so these are rows" >&2
+      echo "    ClickHouse has not received - the status store lost them" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# wait_presence_rise <target> <ports...> waits until every named gateway
+# reports at least <target> routable subscriptions. The mirror of
+# wait_presence_drop: after a gateway dies its subscriptions leave every view
+# (the lease), and they only come back when their clients have reconnected to
+# a *surviving* gateway - which is what makes this the failover assertion
+# rather than a presence assertion.
+wait_presence_rise() {
+  local target=$1 t0 now v port
+  shift
+  t0=$(date +%s)
+  while :; do
+    now=$(( $(date +%s) - t0 ))
+    v=""
+    for port in "$@"; do
+      v=$(visible_subs "$port")
+      [ -n "$v" ] && [ "$v" -ge "$target" ] || { v=""; break; }
+    done
+    [ -n "$v" ] && { echo "$v"; return 0; }
+    [ "$now" -ge 60 ] && return 1
+    sleep 1
+  done
+}
+
+# clients_moved <gateway-url> counts the run's SSE clients that were assigned
+# to a gateway and whose own log shows they dialled a different one.
+clients_moved() {
+  local gw=$1 f log n=0
+  for f in "$D"/sse-*.gw; do
+    [ -e "$f" ] || continue
+    [ "$(cat "$f")" = "$gw" ] || continue
+    log="${f%.gw}.log"
+    grep -q "trying http" "$log" 2>/dev/null && n=$((n+1))
+  done
+  echo "$n"
+}
+
+# assigned_to <gateway-url> counts the clients that started on a gateway.
+assigned_to() {
+  local gw=$1 f n=0
+  for f in "$D"/sse-*.gw; do
+    [ -e "$f" ] || continue
+    [ "$(cat "$f")" = "$gw" ] && n=$((n+1))
+  done
+  echo "$n"
+}
+
+# wait_node_excluded <port> <node> <seconds> waits until the gateway on <port>
+# no longer lists <node> among the nodes its view routes to.
+#
+# This is the lease assertion that does not depend on the routable
+# *subscription* count falling - which it may not, when the dead node's
+# clients have already reconnected elsewhere and re-registered there. What
+# must stop is routing to a node that is not answering: the rows stay (a
+# kill -9 writes no disconnect), the view must stop counting them.
+wait_node_excluded() {
+  local port=$1 node=$2 want=$3 t0 now
+  t0=$(date +%s)
+  while :; do
+    if ! visible_nodes "$port" | grep -q "$node"; then
+      echo "  $node no longer routed to from :$port (rows kept, lease expired)"
+      return 0
+    fi
+    now=$(( $(date +%s) - t0 ))
+    if [ "$now" -ge "$want" ]; then
+      echo "  PRESENCE LEASE FAILED: :$port still routes to $node after ${now}s" >&2
+      echo "    view: $(visible_nodes "$port")" >&2
+      echo "    deliveries aimed there go to a consumer group nobody is in" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+# status_lost_total sums the dispatchers' own counter of status records they
+# could never hand to Kafka: the emitter's buffer filled, or shutdown gave up
+# on them. This is the one link in the status path that neither lag nor the
+# oracle can see - the record never reached the topic, so Kafka-to-ClickHouse
+# completeness says nothing about it and no row is missing yet, only late to
+# exist.
+#
+# The heartbeat counter is cumulative and the logs outlive a scenario, so a
+# run snapshots it before publishing and asserts the delta after - the same
+# reason park_base exists.
+status_lost_total() {
+  local sum=0 f v
+  for f in "$LOG"/d1.log "$LOG"/d2.log "$LOG"/d3.log; do
+    [ -e "$f" ] || continue
+    v=$(grep -ohE 'status_lost=[0-9]+' "$f" 2>/dev/null | cut -d= -f2 | sort -n | tail -1)
+    sum=$((sum + ${v:-0}))
+  done
+  echo "$sum"
+}
+
 # The dispatcher logs are shared by every scenario, so counters are cumulative
 # across them; park_base snapshots them here to report this run's own delta.
 park_base() { grep -h 'parking recovered' "$LOG"/d*.log 2>/dev/null | wc -l; }
+
+# status_lag sums status-writer's lag on delivery-status: how many status
+# records have been produced but not yet inserted into ClickHouse.
+status_lag() {
+  "$DOCKER" exec pubsub-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server localhost:9092 --describe --group status-writer 2>/dev/null \
+    | lag_total
+}
 
 # inflight is the worst currently-reported value across the dispatcher
 # replicas. Taking "the last line of d1..d3" instead reports whichever file the
@@ -475,30 +686,59 @@ wait_for_receiver() {
 
 # start_sse_clients spreads the run's SSE clients over the three gateways, so
 # that a gateway kill takes out a third of them instead of all of them.
+# start_sse_clients [fallback-gateway-url ...]
+#
+# Each client keeps its own gateway first, so the initial spread is exactly
+# what it always was; the extra addresses are what a client behind a load
+# balancer gets anyway - a way out when its gateway dies. Without them a client
+# pins one address forever and a permanently dead gateway strands it, which is
+# the state the gwfail scenario exists to move past.
+#
+# The assignment is by groups of three clients, not one. `harness seed` cycles
+# delivery mode with j%3 and puts SSE on the odd j, so consecutive SSE clients
+# are ordered, key_ordered, unordered, ordered, ... A gateway cycle of one
+# therefore aliased onto the mode cycle exactly: one gateway ended up with
+# every key_ordered client and nothing else. That made the first gwfail run
+# pass vacuously - it killed the gateway holding seven clients whose filter
+# rejected all 3000 events, so nothing was ever at risk of being lost. Three
+# consecutive clients are one of each mode, so a group of three gives every
+# gateway the same mix whatever the seed's cycles do.
 start_sse_clients() {
-  local i=0 id gw
+  local i=0 id gw addrs fallback
   for id in $(cat "$D/sse_ids.txt"); do
     i=$((i+1))
-    case $((i % 3)) in
+    case $(( (i-1)/3 % 3 )) in
       0) gw=http://localhost:8082 ;;
       1) gw=http://localhost:8182 ;;
       2) gw=http://localhost:8282 ;;
     esac
+    addrs="$gw"
+    for fallback in "$@"; do
+      [ "$fallback" = "$gw" ] && continue
+      addrs="$addrs,$fallback"
+    done
     # 30 minutes, not the 7 the first draft used: the scenario's waits alone
     # (wait_drained 300 + wait_inbox 480) can run for 13 minutes, and a client
     # that exits mid-wait strands its parked rows - there would be nothing left
     # to drain to. cleanup_clients kills them at the end regardless.
-    nohup "$BIN/harness" sse -sub "$id" -owner "$OWNER" -addr "$gw" \
+    nohup "$BIN/harness" sse -sub "$id" -owner "$OWNER" -addr "$addrs" \
       -duration 1800s -out "$D/sse-$i.jsonl" > "$D/sse-$i.log" 2>&1 &
     echo $! > "$D/sse-$i.pid"
+    # Which gateway this client was assigned: without it the only trace of
+    # "who had to move" is the client's own log, grepped after the fact.
+    echo "$gw" > "$D/sse-$i.gw"
   done
   sleep 5
   echo "  sse clients connected: $(grep -l consuming "$D"/sse-*.log 2>/dev/null | wc -l)/$(grep -c . "$D/sse_ids.txt")"
 }
 
+# start_receivers [fallback-gateway-url ...] starts the webhook receiver and
+# the SSE clients, passing any fallback gateways on to them (see
+# start_sce_clients). Forwarded rather than repeated by a scenario, so no
+# scenario can accidentally start two sets of clients.
 start_receivers() {
   start_receiver
-  start_sse_clients
+  start_sse_clients "$@"
 }
 
 publish_bg() { # rate duration
@@ -512,7 +752,14 @@ publish_bg() { # rate duration
 
 wait_publish() {
   wait "$(cat "$PUB_PID")" 2>/dev/null
-  tail -1 "$D/pub.log"
+  # Both summary lines, not only the last. The second is how many events
+  # actually reached publish-api, and the kafka scenario deliberately shows
+  # fewer than were sent: its broker is down mid-run and a failed batch writes
+  # nothing - which is the whole point of batches being transactional. Printing
+  # only the achieved rate hides those behind "achieved=181.5 ev/s", where they
+  # read like a slow publisher instead of the injected fault doing its job, and
+  # the run's smaller expected= never gets an explanation next to it.
+  grep -E "^harness pub: (sent=|target=)" "$D/pub.log" | tail -2
 }
 
 # verify runs the oracle and then adds the check the oracle deliberately does
@@ -531,6 +778,10 @@ verify() {
     -events "$D/pub.jsonl" -received "$D/recv.jsonl" \
     -sse "$(ls "$D"/sse-*.jsonl 2>/dev/null | tr '\n' ',' | sed 's/,$//')" 2>&1)
   rc=$?
+  # Kept so a scenario can ask per-subscription questions of the verdict, not
+  # just the totals: gwfail needs to know that the clients it moved were
+  # carrying deliveries, which the summary line cannot express.
+  echo "$out" > "$D/oracle.txt"
   echo "$out" | tail -6
   # The oracle's own verdict first: it fails on missing AND on unexpected, and
   # unexpected alone can leave received == expected, which the check below
@@ -672,6 +923,7 @@ ch)
   start_receivers
   publish_bg 200 60s
   sleep 10
+  LOST0=$(status_lost_total)
   echo "  t=10s  stop clickhouse"
   "$DOCKER" compose stop clickhouse >/dev/null 2>&1
   sleep 2
@@ -683,9 +935,34 @@ ch)
   echo "  t=30s  start clickhouse"
   "$DOCKER" compose start clickhouse >/dev/null 2>&1
   assert_up "status-api /readyz" probe http://localhost:8081/readyz
+
+  # Assert the writer's claim while the outage is still the subject rather
+  # than history: status-writer commits an offset only after the insert
+  # succeeded, so lag 0 means every status record produced during the outage -
+  # including the ones buffered while ClickHouse was down - reached the store.
+  # Checked here, before the drain adds thousands more rows that could mask it,
+  # and again in judged() where the oracle reads.
+  if status_settled 90; then :; else FAIL=1; fi
+
   wait_publish
   wait_drained 300
   wait_inbox
+
+  # And the other half, from the producer side: records the dispatcher could
+  # never hand to Kafka are invisible to lag (they are not in Kafka) and to the
+  # oracle (no row exists to be missing), so only the emitter's own counter
+  # sees them.
+  LOST1=$(status_lost_total)
+  if [ "$LOST1" -gt "$LOST0" ]; then
+    echo "  STATUS ROWS LOST BY THE DISPATCHER: $((LOST1 - LOST0))" >&2
+    echo "    these never reached Kafka, so no later check can see them:" >&2
+    echo "    the emitter's buffer filled or shutdown gave up on the batch" >&2
+    echo "    (was $LOST0, now $LOST1)" >&2
+    FAIL=1
+  else
+    echo "  status records the dispatchers failed to write: 0 (of $LOST1 total)"
+  fi
+
   judged
   ;;
 
@@ -738,6 +1015,113 @@ rebalance)
   wait_drained 300
   wait_inbox
   judged
+  ;;
+
+gwfail)
+  seed_owner
+  echo "== gwfail: kill -9 a gateway and leave it down, clients must move =="
+  # The counterpart of `pods`, which restarts the gateway it kills and so
+  # proves only that the same node comes back. Here node-b never returns
+  # during the run, which is the case an operator actually meets: a pod that
+  # is replaced by one with a *new* identity, while the clients that were on
+  # it have to land somewhere else.
+  #
+  # Every client is given all three gateways as its address list: it keeps
+  # its own first, so the spread before the kill is unchanged, and the other
+  # two are the way out when it dies - there is no load balancer in the stack
+  # to redirect them for us.
+  start_receivers http://localhost:8082 http://localhost:8182 http://localhost:8282
+  publish_bg 200 60s
+  sleep 10
+
+  VIS_BEFORE=$(visible_subs 8082)
+  ASSIGNED=$(assigned_to http://localhost:8182)
+  echo "  t=10s  kill -9 g2 (node-b), left down; $ASSIGNED clients were on it"
+  kill -9 "$(cat "$LOG/g2.pid")" 2>/dev/null || { echo "  could not kill g2" >&2; FAIL=1; }
+
+  # Two halves of the same claim, and either alone would pass for the wrong
+  # reason: the rows must still be there (a kill -9 writes no disconnect), and
+  # they must have stopped being routed to (the lease is what makes a dead
+  # node stop receiving deliveries). The count cannot show the second half
+  # here - the clients re-register on a survivor within a second or two, so
+  # the number of routable subscriptions never dips - which is exactly why
+  # the node list, not the count, is what gets asserted.
+  NODEB_ROWS=$(presence_rows node-b)
+  echo "  presence rows still claiming node-b: ${NODEB_ROWS} (kill -9 wrote no disconnect)"
+  if [ "${NODEB_ROWS:-0}" -le 0 ]; then
+    echo "  presence rows for node-b = ${NODEB_ROWS}, want > 0: nothing left to prove visibility from" >&2
+    FAIL=1
+  fi
+
+  if wait_node_excluded 8082 node-b 30; then :; else FAIL=1; fi
+
+  # And the other half: the clients that were on the dead gateway must have
+  # actually reached a survivor, with its subscriptions routable again.
+  # Bounded because a client reconnects about once a second.
+  MOVED=""
+  for _ in $(seq 1 30); do
+    MOVED=$(clients_moved http://localhost:8182)
+    [ "${MOVED:-0}" -ge "$ASSIGNED" ] 2>/dev/null && break
+    sleep 1
+  done
+  echo "  clients that reconnected to another gateway: ${MOVED:-0}/${ASSIGNED}"
+  if [ "${MOVED:-0}" -lt "$ASSIGNED" ] 2>/dev/null; then
+    echo "  CLIENT FAILOVER FAILED: only ${MOVED:-0} of $ASSIGNED reached a surviving gateway" >&2
+    FAIL=1
+  fi
+
+  if RISE=$(wait_presence_rise "$VIS_BEFORE" 8082 8282); then
+    echo "  routable subscriptions back to ${VIS_BEFORE} on the survivors (:8082, :8282)"
+  else
+    echo "  FAILOVER FAILED: routable subscriptions never returned to $VIS_BEFORE" >&2
+    echo "    after 60s: $(visible_subs 8082) on :8082, $(visible_subs 8282) on :8282" >&2
+    FAIL=1
+  fi
+
+  wait_publish
+  echo "  publish done; node-b is still down, judging against that"
+  wait_drained 300
+  wait_inbox
+  judged
+
+  # The assertion the first draft of this scenario was missing, and the reason
+  # it passed while proving nothing: moving clients is not the claim. Moving
+  # clients that were carrying deliveries is. The oracle's table says how many
+  # events each subscription expected, so the deliveries the dead gateway was
+  # responsible for can be summed here - and if that sum is zero, this
+  # scenario just ran over idle subscriptions again and says so loudly rather
+  # than reporting success.
+  moved_deliveries() {
+    local f sub sum=0 exp
+    for f in "$D"/sse-*.gw; do
+      [ -e "$f" ] || continue
+      [ "$(cat "$f")" = "http://localhost:8182" ] || continue
+      sub=$(grep -o 'consuming [0-9a-f-]*' "${f%.gw}.log" 2>/dev/null | head -1 | awk '{print $2}')
+      [ -n "$sub" ] || continue
+      exp=$(awk -v s="$sub" '$1 == s {print $4}' "$D/oracle.txt" 2>/dev/null | head -1)
+      sum=$((sum + ${exp:-0}))
+    done
+    echo "$sum"
+  }
+  DELIVERED_MOVED=$(moved_deliveries)
+  if [ "${DELIVERED_MOVED:-0}" -gt 0 ]; then
+    echo "  deliveries the dead gateway was responsible for: ${DELIVERED_MOVED} (moved, not idle)"
+  else
+    echo "  VACUOUS RUN: the clients on the dead gateway expected 0 deliveries" >&2
+    echo "    failover of client *connections* was exercised, failover of the" >&2
+    echo "    deliveries behind them was not - the seed's mode cycle put only" >&2
+    echo "    filter-rejecting subscriptions on that gateway" >&2
+    FAIL=1
+  fi
+
+  # Restore the topology for the next scenario - after the verdict, so the run
+  # above really was judged with the gateway gone. The preflight of every
+  # scenario refuses to run against a half topology, so leaving it down would
+  # only break the next run rather than prove anything more.
+  echo "  restarting g2 (the verdict above was taken while it was down)"
+  start_bin sse-gateway g2 HTTP_ADDR=:8182 NODE_ID=node-b SSE_DRAINER=false
+  sleep 5
+  echo "  g2 back: $(probe_code http://localhost:8182/readyz) on /readyz"
   ;;
 esac
 

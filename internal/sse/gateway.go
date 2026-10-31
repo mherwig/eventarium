@@ -378,6 +378,12 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"connections":   n,
 		"presence":      len(g.view.subscriptions()), // connections on every node, not just this one
 		"subscriptions": g.reg.Len(),
+		// Which nodes the view still routes to. A gateway that has stopped
+		// listing a node has let its lease expire - the check the failover
+		// scenario asserts, and the question an operator asks first when a
+		// node disappears. Derived from the view, so it can never disagree
+		// with what pick() would return.
+		"routable_nodes": g.view.nodes(),
 	})
 }
 

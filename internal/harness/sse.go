@@ -38,6 +38,19 @@ type sseRecord struct {
 	Data       map[string]any `json:"data,omitempty"`
 }
 
+// splitBases parses -addr into one or more gateway base URLs, trimmed of
+// whitespace and trailing slashes. A single address behaves exactly as it did
+// before the list existed; several turn a dead gateway into a failover.
+func splitBases(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if b := strings.TrimRight(strings.TrimSpace(part), "/"); b != "" {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
 // runSSE implements `harness sse`: the simulated SSE client of section 15.2.
 // It opens GET /sse, parses the event stream (id:/event:/data: lines),
 // records every event and, when -ack is set, acknowledges each event with the
@@ -53,7 +66,7 @@ func runSSE(ctx context.Context, args []string) int {
 	fs := newFlagSet("sse")
 	sub := fs.String("sub", envStr("SUB", ""), "subscription id to consume (env HARNESS_SUB)")
 	owner := fs.String("owner", envStr("OWNER", "harness"), "owner reference for the minted token (env HARNESS_OWNER)")
-	addr := fs.String("addr", envStr("ADDR", "http://localhost:8082"), "base URL of the SSE gateway (env HARNESS_ADDR)")
+	addr := fs.String("addr", envStr("ADDR", "http://localhost:8082"), "base URL of the SSE gateway, or several comma separated to try in order (env HARNESS_ADDR)")
 	out := fs.String("out", envStr("OUT", ""), "append one JSON line per received event (env HARNESS_OUT)")
 	ack := fs.Bool("ack", envBool("ACK", true), "acknowledge every event with Last-Event-ID (env HARNESS_ACK)")
 	duration := fs.Duration("duration", envDur("DURATION", 0), "stop after this long, 0 runs until Ctrl-C (env HARNESS_DURATION)")
@@ -78,15 +91,27 @@ func runSSE(ctx context.Context, args []string) int {
 	defer lw.Close()
 
 	consumerID := "harness-" + uuid.NewString()[:8]
-	base := strings.TrimRight(*addr, "/")
-	streamURL := base + "/sse?subscription_id=" + url.QueryEscape(*sub) + "&consumer_id=" + url.QueryEscape(consumerID)
+	// Several bases make the client behave like one behind a load balancer:
+	// when its gateway dies it lands on a survivor instead of retrying a dead
+	// address until -duration. The cursor travels with it - Last-Event-ID names
+	// a position on the deliveries topic, not a node - so a failover resumes
+	// the backlog from where it stopped (section 8).
+	bases := splitBases(*addr)
+	if len(bases) == 0 {
+		fmt.Fprintln(os.Stderr, "harness sse: -addr is empty")
+		return 2
+	}
+	base := 0
+	streamURL := func() string {
+		return bases[base] + "/sse?subscription_id=" + url.QueryEscape(*sub) + "&consumer_id=" + url.QueryEscape(consumerID)
+	}
 	if *duration > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, *duration)
 		defer cancel()
 	}
 
-	fmt.Fprintf(os.Stderr, "harness sse: consuming %s as %s (ack=%v)\n", *sub, consumerID, *ack)
+	fmt.Fprintf(os.Stderr, "harness sse: consuming %s as %s (ack=%v) via %s\n", *sub, consumerID, *ack, bases[0])
 	if cursor := strings.TrimSpace(*lastEventID); cursor != "" {
 		fmt.Fprintf(os.Stderr, "harness sse: initial Last-Event-ID %s\n", cursor)
 	}
@@ -147,7 +172,7 @@ func runSSE(ctx context.Context, args []string) int {
 			}
 		}
 		if *ack && sseID != "" {
-			if aerr := ackEvent(ctx, base, token, *sub, sseID); aerr != nil {
+			if aerr := ackEvent(ctx, bases[base], token, *sub, sseID); aerr != nil {
 				ackErrs.Add(1)
 				fmt.Fprintln(os.Stderr, "harness sse: ack:", aerr)
 			} else {
@@ -157,13 +182,18 @@ func runSSE(ctx context.Context, args []string) int {
 		sseID, event, data = "", "", nil
 	}
 
+	// established records whether the last attempt reached a stream, which is
+	// what tells "this address is gone" apart from "the server closed".
+	established := false
+
 	// connect performs one connection attempt and consumes the stream until it
 	// ends. The bool result marks a client-side HTTP error that retrying
 	// cannot fix (a 4xx other than 429), which ends the run; everything else —
 	// clean close, EOF, reset, refused, 5xx — is a reconnect case as long as
 	// the duration has not elapsed.
 	connect := func() (error, bool) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
+		established = false
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL(), nil)
 		if err != nil {
 			return err, true
 		}
@@ -177,15 +207,21 @@ func runSSE(ctx context.Context, args []string) int {
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
+			established = false
 			return err, false
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
+			// A rejected stream is not an address problem: 404/401 would fail
+			// on every node too, and rotating would turn a real error into a
+			// misleading one somewhere else.
+			established = true
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			err := fmt.Errorf("HTTP %d: %s", resp.StatusCode, errorBody(b))
 			fatal := resp.StatusCode/100 == 4 && resp.StatusCode != http.StatusTooManyRequests
 			return err, fatal
 		}
+		established = true
 
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 0, 64<<10), 16<<20)
@@ -233,6 +269,18 @@ func runSSE(ctx context.Context, args []string) int {
 			fmt.Fprintln(os.Stderr, "harness sse: stream error:", err)
 		}
 		reconnects.Add(1)
+		// Advance only when the attempt could not be made at all: a stream that
+		// ended is a server-side event and the same address is worth retrying,
+		// while an unreachable address is not. Rotation is what lets a client
+		// whose gateway died land on a survivor - the scenario that proves
+		// failover across nodes needs it, since no LB exists in the stack.
+		if len(bases) > 1 && !established {
+			next := (base + 1) % len(bases)
+			if next != base {
+				fmt.Fprintf(os.Stderr, "harness sse: %s unreachable, trying %s\n", bases[base], bases[next])
+				base = next
+			}
+		}
 		if cursor != "" {
 			fmt.Fprintf(os.Stderr, "harness sse: reconnecting with Last-Event-ID %s\n", cursor)
 		} else {

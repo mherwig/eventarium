@@ -2,6 +2,7 @@ package harness
 
 import (
 	"testing"
+	"time"
 
 	"pubsub/internal/cloudevents"
 	"pubsub/internal/filter"
@@ -114,5 +115,43 @@ func TestDataMemberIsJSON(t *testing.T) {
 		if recs[i].Data["seq"] != float64(i) {
 			t.Fatalf("record seq %v, want %d", recs[i].Data["seq"], i)
 		}
+	}
+}
+
+// TestWithinWindow decides which receipts the status check may judge at all.
+// This rule exists because getting it wrong produced 30,028 false alarms on
+// one scenario: `pg` keeps delivering long after publishing stops (a drained
+// backlog plus rate-limited tails), and 30,028 of its 39,719 receipts landed
+// after `to` - outside the Status API's query window, so their status rows
+// were invisible to a check that read absence as loss.
+//
+// The boundaries matter as much as the middle: a receipt a moment before
+// `to` is judged, one a moment after is not, because the row for the second
+// genuinely cannot be seen. A zero timestamp is not judged either - with no
+// receipt time there is nothing to place in the window, and guessing would
+// either invent a failure or hide one.
+func TestWithinWindow(t *testing.T) {
+	from := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	to := from.Add(2 * time.Minute)
+
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{"first publish", from, true},
+		{"during publishing", from.Add(30 * time.Second), true},
+		{"inside the padding", to.Add(-time.Second), true},
+		{"exactly at the bound", to, true},
+		{"after the window - the pg case", to.Add(time.Second), false},
+		{"minutes later", to.Add(5 * time.Minute), false},
+		{"before the window", from.Add(-time.Second), false},
+		{"no timestamp recorded", time.Time{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := withinWindow(tc.at, from, to); got != tc.want {
+				t.Errorf("withinWindow(%v) = %v, want %v", tc.at, got, tc.want)
+			}
+		})
 	}
 }

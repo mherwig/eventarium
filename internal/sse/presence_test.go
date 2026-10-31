@@ -17,6 +17,87 @@ func row(subID, connID, node string) store.PresenceRow {
 	}
 }
 
+// beatRow is row() with a lease heartbeat, which is the only thing that
+// distinguishes two otherwise identical candidates for one subscription.
+func beatRow(subID, connID, node string, lastSeen time.Time) store.PresenceRow {
+	r := row(subID, connID, node)
+	r.NodeLastSeen = lastSeen
+	return r
+}
+
+// TestViewPickPrefersTheNodeThatMostRecentlyHeartbeated is the fix for the
+// gwfail loss. When a gateway is killed its presence rows stay routable for
+// the whole lease, so the view offers both the dead connection and the
+// client's new one on a survivor. The old tie-break was the first entry of a
+// map range - arbitrary, and measurably biased: the run lost six deliveries
+// because the dead node won 7 times out of 8.
+//
+// A killed node stops beating, so preferring the freshest lease picks the
+// survivor. Two live nodes keep alternating, so neither starves.
+func TestViewPickPrefersTheNodeThatMostRecentlyHeartbeated(t *testing.T) {
+	now := time.Now()
+	v := newPresenceView()
+	v.replace([]store.PresenceRow{
+		// node-b was killed: its lease stopped advancing with the kill.
+		beatRow("sub1", "dead", "node-b", now.Add(-4*time.Second)),
+		// the client failed over here and node-a is still beating.
+		beatRow("sub1", "live", "node-a", now.Add(-300*time.Millisecond)),
+	}, nil)
+
+	rec, ok := v.pick("sub1", "node-c") // no local connection: the tie-break runs
+	if !ok {
+		t.Fatal("pick found no connection")
+	}
+	if rec.ConnectionID != "live" {
+		t.Errorf("pick chose %s on %s, want the connection on the node that is still heartbeating",
+			rec.ConnectionID, rec.NodeID)
+	}
+}
+
+// TestViewPickIgnoresTheOrderOfTheMap: the rule has to be a decision, not a
+// lucky hash layout. Both insertion orders must give the same answer, which is
+// what a lease comparison gives and a bare map range never did.
+func TestViewPickIgnoresTheOrderOfTheMap(t *testing.T) {
+	now := time.Now()
+	dead := beatRow("sub1", "dead", "node-b", now.Add(-4*time.Second))
+	live := beatRow("sub1", "live", "node-a", now)
+
+	for _, tc := range []struct {
+		name string
+		rows []store.PresenceRow
+	}{
+		{"dead first", []store.PresenceRow{dead, live}},
+		{"live first", []store.PresenceRow{live, dead}},
+	} {
+		v := newPresenceView()
+		v.replace(tc.rows, nil)
+		rec, ok := v.pick("sub1", "node-c")
+		if !ok {
+			t.Fatalf("%s: pick found no connection", tc.name)
+		}
+		if rec.ConnectionID != "live" {
+			t.Errorf("%s: pick chose %s, want live regardless of insertion order", tc.name, rec.ConnectionID)
+		}
+	}
+}
+
+// TestViewPickStillRoutesWhenNoLeaseIsKnown: a candidate with no heartbeat is
+// not a reason to refuse a delivery - it is only a reason to prefer a
+// competitor that has one. Callers that build records without a lease keep the
+// previous behaviour instead of losing their only route.
+func TestViewPickStillRoutesWhenNoLeaseIsKnown(t *testing.T) {
+	v := newPresenceView()
+	v.replace([]store.PresenceRow{row("sub1", "only", "node-b")}, nil)
+
+	rec, ok := v.pick("sub1", "node-a")
+	if !ok {
+		t.Fatal("pick refused a connection because its lease was unknown")
+	}
+	if rec.ConnectionID != "only" {
+		t.Errorf("pick returned %s, want only", rec.ConnectionID)
+	}
+}
+
 // TestViewPickPrefersTheLocalConnection is the routing rule: a delivery whose
 // connection sits on this node is served here and skips the sse-live hop
 // entirely; only a remote connection costs the extra produce.

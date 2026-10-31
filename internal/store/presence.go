@@ -9,13 +9,24 @@ import (
 // PresenceRow is one open SSE connection as PostgreSQL knows it: which
 // subscription it serves, which process holds it (node_id), and which client
 // it is (consumer_id). The join with sse_presence_nodes - done by
-// VisiblePresence, never by the caller - is what decides whether it counts.
+// VisiblePresence, never by the caller - is what decides whether it counts,
+// and it also hands over when that node last beat, so a caller choosing
+// between two rows can tell a live connection from one whose node was killed
+// but has not finished being reaped.
 type PresenceRow struct {
 	SubscriptionID string
 	ConnectionID   string
 	NodeID         string
 	ConsumerID     string
 	ConnectedAt    time.Time
+	// NodeLastSeen is the owning node's lease heartbeat, carried by
+	// VisiblePresence (which already joins the lease table to filter, and now
+	// keeps the value instead of discarding it). It is what tells two otherwise
+	// equal candidates apart: a node that stopped heartbeating keeps its rows
+	// visible for the whole lease, so both a live and a dead connection can be
+	// routable at once. UpsertPresence never writes it - the lease table has
+	// its own heartbeat - so it is zero on rows built by a writer.
+	NodeLastSeen time.Time
 }
 
 // UpsertPresence records an open connection. ON CONFLICT DO UPDATE, not
@@ -63,7 +74,7 @@ func (s *Store) DeletePresence(ctx context.Context, subscriptionID, connectionID
 func (s *Store) VisiblePresence(ctx context.Context, leaseTTL time.Duration) ([]PresenceRow, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT p.subscription_id::text, p.connection_id::text, p.node_id,
-		       p.consumer_id, p.connected_at
+		       p.consumer_id, p.connected_at, n.last_seen
 		FROM sse_presence p
 		JOIN sse_presence_nodes n ON n.node_id = p.node_id
 		WHERE n.last_seen > now() - make_interval(secs => $1)`,
@@ -76,7 +87,7 @@ func (s *Store) VisiblePresence(ctx context.Context, leaseTTL time.Duration) ([]
 	for rows.Next() {
 		var r PresenceRow
 		if err := rows.Scan(&r.SubscriptionID, &r.ConnectionID, &r.NodeID,
-			&r.ConsumerID, &r.ConnectedAt); err != nil {
+			&r.ConsumerID, &r.ConnectedAt, &r.NodeLastSeen); err != nil {
 			return nil, fmt.Errorf("store: scanning presence: %w", err)
 		}
 		out = append(out, r)

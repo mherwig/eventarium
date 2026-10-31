@@ -28,7 +28,7 @@ extract() { # function name
   sed -n "/^$1()/,/^}/p" "$HERE/chaos.sh"
 }
 # shellcheck disable=SC1090
-source <(extract session_seconds; extract unowned_count; extract partition_count; extract handover_complete; extract is_harness_recv)
+source <(extract session_seconds; extract unowned_count; extract partition_count; extract handover_complete; extract is_harness_recv; extract lag_total; extract status_writer_commit_trouble)
 
 echo "session_seconds"
 t_session() { # env-value want
@@ -108,5 +108,62 @@ else
   kill "$fake" 2>/dev/null
 fi
 
-[ "$fail" = "0" ] || { echo "chaos helper tests FAILED" >&2; exit 1; }
+echo "lag_total"
+# The kafka-consumer-groups listing, including the two shapes that are not a
+# plain number: "-" for a partition nothing has committed to yet, and the
+# blank line the command prints at the end. Getting either wrong turns "rows
+# ClickHouse never received" into "everything is fine".
+t_lag() { # stdin want label
+  local got
+  got=$(printf '%s' "$1" | lag_total)
+  if [ "$got" = "$2" ]; then pass "$3"
+  else fail_case "$3: got $got, want $2"; fi
+}
+t_lag 'GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG
+status-writer delivery-status 0 100 100 0
+status-writer delivery-status 1 99 99 0
+' 0 "settled: every partition caught up"
+t_lag 'GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG
+status-writer delivery-status 0 100 100 0
+status-writer delivery-status 1 90 100 10
+' 10 "two partitions, one behind"
+# "-" with records behind it counts as those records; with none, as zero.
+t_lag 'GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG
+status-writer delivery-status 0 - 7 -
+status-writer delivery-status 1 5 5 0
+' 7 "never committed but records exist counts as the whole log end"
+t_lag 'GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG
+status-writer delivery-status 0 - 0 -
+' 0 "never committed and nothing produced is settled"
+t_lag 'GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG
+status-writer delivery-status 0 10 10 0
+
+' 0 "trailing blank line is ignored"
+t_lag '' 0 "empty listing (group does not exist) reports zero"
+
+echo "status_writer_commit_trouble"
+# This one decides whether lag is allowed to fail a run, so it has to answer a
+# number in every case. A missing or silent log must read 0 - not an error and
+# not an empty string, because both are then used as `[ ... -gt 0 ]` and a
+# non-integer aborts the comparison instead of settling the run.
+t_trouble() { # $1 = log content (empty means: do not create the file), $2 = want, $3 = label
+  local d got
+  d=$(mktemp -d)
+  if [ -n "$1" ]; then printf '%s\n' "$1" > "$d/status-writer.log"; fi
+  got=$( (LOG="$d"; status_writer_commit_trouble) )
+  if [ "$got" = "$2" ]; then pass "$3"
+  else fail_case "$3: got $got, want $2"; fi
+  rm -rf "$d"
+}
+t_trouble "" 0 "a log that does not exist reports no trouble"
+t_trouble "time=... level=INFO msg=\"status-writer: started\"" 0 \
+  "a quiet log reports no trouble"
+t_trouble 'time=1 level=ERROR msg="status-writer: flush failed" err="committing offsets: UNKNOWN_MEMBER_ID: The coordinator is not aware of this member."' 1 \
+  "a failed commit counts as trouble"
+t_trouble 'time=1 level=ERROR msg="status-writer: flush failed" err="committing offsets: UNKNOWN_MEMBER_ID."
+time=2 level=ERROR msg="status-writer: dropping offsets after repeated commit failures"
+time=3 level=ERROR msg="status-writer: flush failed" err="committing offsets: UNKNOWN_MEMBER_ID."' 3 \
+  "failures and dropped offsets both count"
+
+
 echo "all chaos helper tests passed"
