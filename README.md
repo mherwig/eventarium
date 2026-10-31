@@ -136,6 +136,8 @@ Every service reads its configuration from the environment
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api |
 | `REGISTRY_POLL` | `1s` (`2s` in publish-api) — safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `REGISTRY_STALE_AFTER` | `30s` — how old the registry index may be before `/readyz` fails | publish-api, replay-api, sse-gateway |
+| `KAFKA_SESSION_TIMEOUT` | `45s` — how long a group waits for a member before evicting it: the **crash floor** (measured: 43 s to hand a `kill -9`ed replica's partitions over, 3 s for a graceful SIGTERM) | router, dispatcher, sse-gateway, status-writer |
+| `KAFKA_TRANSACTION_TIMEOUT` | `40s` — must stay *below* the session timeout so a transaction cannot outlive its member; enforced (clamped) in `kafkautil.Timeouts`, where the two are read together | router, publish-api |
 | `WEBHOOK_SIGNING_SECRET` | unset (no HMAC) | dispatcher |
 | `ALLOW_PRIVATE_WEBHOOKS` | true in the spike; set `0` for real deployments | dispatcher |
 | `DISPATCHER_MAX_ATTEMPTS` | `10` | dispatcher |
@@ -751,6 +753,26 @@ make chaos SCEN=pods  # pods | pg | kafka | ch
 | `pg` | receiver offline **and** PostgreSQL down, overlapping by 20 s |
 | `ch` | ClickHouse down for 20 s |
 | `kafka` | broker restart |
+| `rebalance` | `kill -9` one dispatcher, **and** measures how long its partitions stay unowned against `KAFKA_SESSION_TIMEOUT` + 15 s of polling slack |
+
+`rebalance` is the one that asserts a number rather than a verdict: it polls
+the group's assignment until every partition is owned by a live member, and
+fails if that takes longer than the configured session timeout allows. It is
+what turns "failover takes 45 s" from an observation into something an
+upgrade cannot silently change — twice against the default it measured 46 s
+and 45 s against a 60 s bound.
+
+Setup also waits for the gateways to know the subscriptions that were just
+created. A subscription is only reachable ~50–60 ms after the API returns 201,
+and the harness's SSE client (like a browser's `EventSource`) treats a 404 as
+final — connecting a millisecond early kills that client for the whole run and
+leaves its deliveries parked with nothing to drain them.
+
+The driver's own tests need no stack at all:
+
+```sh
+make chaos-test        # session parsing, partition counting, handover logic
+```
 
 Each one publishes at 200 ev/s for 60 s with its own seeded owner, injects the
 fault, waits for the queues and the owner's inbox to drain, then runs the

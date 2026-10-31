@@ -125,6 +125,25 @@ From §16, minus what the spike answered:
   latch is timing-dependent, so it looks like an unrelated flake when it fires,
   and it hits `NewGroupTransactSession` users too (the router escaped by luck
   in the run we measured).
+- **A subscription is unreachable for ~50-60 ms after it is created** — found
+  by the `rebalance` scenario, measured by polling `GET /sse/ack` on all three
+  gateways (the NOTIFY fast path; the 1 s poll is not what makes it this
+  small). Inside that window `GET /sse` answers `404: unknown subscription`.
+  For a retrying client an inconvenience; for one that does not, permanent -
+  the harness's SSE client exits on 404 (`elapsed=0.0s reconnects=0`) and so
+  does a browser, because `EventSource` stops for good on a 4xx instead of
+  reconnecting. A client dead at connect time never publishes presence, so its
+  whole subscription's deliveries then park as `no_connection` with nothing
+  left to drain them: 4 of 20 clients and 3,187 undelivered rows in one run.
+  The window is inherent - another process's in-memory index cannot be atomic
+  with your write - so the choice is only about how to live with it. The chaos
+  driver waits for visibility before starting clients (test side, done);
+  platform side, in increasing order of work: a **reload-on-miss** in the
+  gateway's 404 path (one extra query on an error path, ~50 ms to ~5 ms, but
+  it does not close the window), making it part of the API contract ("a
+  subscription may not be immediately connectable"), or having clients retry -
+  right for a fetch-based client, wrong for `EventSource`, so it only helps
+  some callers.
 - **Commit-watermark scan is O(backlog)** — found while re-measuring the load
   test, not observed as latency. `offsetgate.advance` walks the whole `pending`
   map to find the lowest offset, and `prune` walks `epochs`, so one `Settle`
@@ -174,9 +193,25 @@ From §16, minus what the spike answered:
   docs warn about. Kafka's floor (`group.min.session.timeout.ms`, 6 s by
   default, not overridden in this stack) is never the binding number.
 
-  Decision needed: choose a value, put it in `kafkautil.NewClient` alongside
-  `TransactionTimeout`, and write the tradeoff beside both rather than
-  inheriting either from a library.
+  **Partly addressed.** `kafkautil.Timeouts()` now reads both values together
+  (`KAFKA_SESSION_TIMEOUT`, `KAFKA_TRANSACTION_TIMEOUT`), clamps
+  `txn < session`, and every client takes them from there — including the
+  router, which builds its client through `NewGroupTransactSession` rather
+  than `kafkautil.NewClient` and is the one place where the pair actually
+  bites. The values themselves are unchanged (45 s / 40 s): what moved is that
+  they are a visible choice with the tradeoff written next to them, overridable
+  without a rebuild, instead of a default inherited from a library.
+
+  Still open: **the value.** The `rebalance` scenario in `scripts/chaos.sh`
+  measures the handover and fails beyond session + 15 s of polling slack, so
+  tuning it comes with a test instead of a hope; its helpers are covered by
+  `make chaos-test`, which needs no stack. Run twice against the default it
+  reported 46 s and 45 s against a 60 s bound, agreeing with the hand-rolled
+  measurement above. The obvious candidates are 15 s / 10 s, and they should
+  not be adopted without first confirming the router's
+  transactions normally complete well inside 10 s — see the txnTimeout
+  constraint above, which is the reason the two numbers cannot be chosen
+  separately.
 - **The ClickHouse scenario never asserted status-row completeness** — its
   `missing=0` is evidence about *deliveries*: the receivers recorded all
   58,366 of them, so the oracle had no way to notice a status row lost while
@@ -437,13 +472,15 @@ exactly what the first `ch` run of the committed script did: 81 rows and a
 | `pg` | receiver offline **and** PostgreSQL down, 20 s overlap | **0** | 0 | 0 |
 | `ch` | ClickHouse down 20 s | **0** | 0 | 0 |
 | `kafka` | broker restart mid-run | **0** | 0 | 2,746 |
+| `rebalance` | `kill -9` one dispatcher, handover measured against the session timeout | **0** | 0 | 16,554 |
 
-**`missing=0` and `unexpected=0` in all four** — the two numbers this whole
+**`missing=0` and `unexpected=0` in all five** — the two numbers this whole
 exercise exists for.
 
-All four rows are from one pass against the current code (owners `pods020953`,
-`pg021223`, `ch022133`, `kafka022326`), re-run after publish-api went
-transactional so the table would not mix binaries. The `kafka` row's
+The first four rows are from one pass against the current code (owners
+`pods020953`, `pg021223`, `ch022133`, `kafka022326`), re-run after publish-api
+went transactional so the table would not mix binaries; `rebalance` is
+`rebalance101220`, whose duplicate count is discussed below. The `kafka` row's
 `expected` is lower than the others (52,536 vs 58,366) because 1,200 events
 were *correctly* not written while the broker was restarting — see the
 `unexpected` discussion below, which is where that number used to go wrong.
@@ -487,6 +524,61 @@ to these duplicates was dropping them. The webhook receiver is where replay
 shows up at all — the SSE client deduplicates by event reference (§8) before
 writing, so its file reports 0 by construction and proves nothing about what
 the gateway sent.
+
+### rebalance: the handover, measured
+
+The scenario asserts a number rather than only a verdict: kill one dispatcher
+mid-publish, poll the group's assignment until every partition is owned by a
+live member, and fail beyond `KAFKA_SESSION_TIMEOUT + 15 s` of polling slack.
+Two runs, both passing the oracle (`received == expected == 58,366`,
+`missing=0`, `unexpected=0`):
+
+| run | handover | bound |
+| --- | --- | --- |
+| 1 | 46 s | 60 s |
+| 2 | 45 s | 60 s |
+
+That agrees with the hand-rolled measurement above (43 s) within the polling
+granularity, and it is now *enforced*: the bound is derived from
+`KAFKA_SESSION_TIMEOUT`, so tuning the value moves the bar with it, and a
+franz-go upgrade that changed the behaviour would fail the run instead of
+quietly moving the number.
+
+Duplicates were 16,554 in the second run — all webhook, none on SSE — against
+825 and 2,776 in two earlier runs of the same scenario. The spread is not
+noise in the platform; it is the watermark rule with a wider view of itself.
+Three seeded subscriptions carry `rate_limit_per_s=50`, so they are never
+finished inside a 60 s run and they hold *their partitions'* commit points
+back; everything delivered above a stalled watermark is replayed by whoever
+takes over. The eight subscriptions that each duplicated ~2,700 times are
+those three plus their neighbours — the same picture the `pods` runs showed
+one partition wide, wider here because this run's clients were all alive.
+Stranded clients had been hiding it: a client that dies at connect time makes
+its whole subscription park durably, which *moves* the watermark and shrinks
+the replay.
+
+### The subscription-visibility window (setup, not fault)
+
+Running the scenario surfaced a race the platform owns. A subscription is
+reachable **~50–60 ms after the API returns 201**, measured by polling
+`GET /sse/ack` on all three gateways — that is the NOTIFY fast path, not the
+1 s poll, so the machinery is working as designed. Inside that window
+`GET /sse` answers `404: unknown subscription`.
+
+For a client that retries, an inconvenience; for one that does not, permanent.
+The harness's SSE client exits on a 404 (`elapsed=0.0s reconnects=0`), and so
+does a browser — `EventSource` stops for good on a 4xx rather than
+reconnecting. The consequence then compounds: a client dead at connect time
+never publishes presence, so its whole subscription's deliveries park as
+`no_connection` with nothing left to drain them.
+
+Measured cost: seeding and connecting back to back lost **4 of 20 clients and
+3,187 undelivered rows** — the oracle reported `received=55179 of 58366` and
+failed the run, which is the correct verdict on a race the *setup* caused.
+After the driver waits for visibility, the same run lost none.
+
+The wait is the test-side fix; the platform-side options are an open point
+below.
 
 ### publish-api batches are now transactional (was `unexpected=5,185`)
 
