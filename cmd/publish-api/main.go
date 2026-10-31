@@ -112,7 +112,7 @@ func main() {
 	// PostgreSQL (the registry poll) and an index that is not standing still.
 	// /healthz stays answering while they are down - restarting the process
 	// would not fix a database - but /readyz then fails, so a rolling update
-	// does not add a replica that cannot serve (section: docs/SPIKE.md).
+	// does not add a replica that cannot serve (section: docs/contracts.md).
 	health := httpx.NewHealth(
 		func(ctx context.Context) error { return st.Pool.Ping(ctx) },
 		func(context.Context) error {

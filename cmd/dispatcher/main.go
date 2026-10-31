@@ -51,7 +51,7 @@ func main() {
 	}
 	defer producer.Close()
 
-	// Spike deviation per docs/SPIKE.md: the registry reads PostgreSQL, and a
+	// Spike deviation per docs/contracts.md: the registry reads PostgreSQL, and a
 	// NOTIFY from migration 003 refreshes the policy the moment it changes.
 	// REGISTRY_POLL (one second by default) is the safety net underneath.
 	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn))
@@ -84,7 +84,7 @@ func main() {
 		Store:       st,
 		Status:      producer,
 		MaxAttempts: config.Int("DISPATCHER_MAX_ATTEMPTS", 10),
-		// Empty secret: no signature header (docs/SPIKE.md).
+		// Empty secret: no signature header (docs/contracts.md).
 		SigningSecret: config.Str("WEBHOOK_SIGNING_SECRET", ""),
 		// ALLOW_PRIVATE_WEBHOOKS defaults to true because the local test
 		// harness (harness recv) listens on loopback; set it to 0 in real

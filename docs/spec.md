@@ -1,3 +1,9 @@
+---
+id: spec
+title: Specification
+sidebar_position: 99
+---
+
 # Event Platform – Specification (Draft)
 
 Oct 21, 2026 · @Mike H.
@@ -257,10 +263,10 @@ The BFF and any UI are out of scope. This API is the one required read interface
 
 | Endpoint | Purpose |
 | --- | --- |
-| GET /deliveries/{delivery\_id} | One delivery with its full history (attempts, codes, latencies, connection) |
-| GET /events/{event\_ref}/deliveries | All deliveries of one event across subscriptions |
-| GET /subscriptions/{id}/deliveries | Deliveries of a subscription, filterable by status, event type and time range, with keyset pagination |
-| GET /subscriptions/{id}/status-summary | Counts per status, backlog, mode, active connections (optional in the first version) |
+| `GET /deliveries/{delivery_id}` | One delivery with its full history (attempts, codes, latencies, connection) |
+| `GET /events/{event_ref}/deliveries` | All deliveries of one event across subscriptions |
+| `GET /subscriptions/{id}/deliveries` | Deliveries of a subscription, filterable by status, event type and time range, with keyset pagination |
+| `GET /subscriptions/{id}/status-summary` | Counts per status, backlog, mode, active connections (optional in the first version) |
 
 - Access is scoped by the owner reference in the caller's JWT (section 6.7): a caller sees only data that belongs to its own owner reference.
 - Data is available until expires\_at, at most 7 days.
@@ -272,10 +278,10 @@ Purpose: redeliver events to a subscription after a failure or a consumer-side p
 
 | Endpoint | Purpose |
 | --- | --- |
-| POST /subscriptions/{id}/replays | Creates an asynchronous replay job (returns 202 and a replay ID). Supports dry\_run and an Idempotency-Key header |
-| GET /replays/{replay\_id} | Progress: matched, enqueued, delivered, failed, not\_replayable |
-| POST /replays/{replay\_id}/cancel | Stops a running job |
-| GET /subscriptions/{id}/replays | Lists the jobs of a subscription |
+| `POST /subscriptions/{id}/replays` | Creates an asynchronous replay job (returns 202 and a replay ID). Supports dry\_run and an Idempotency-Key header |
+| `GET /replays/{replay_id}` | Progress: matched, enqueued, delivered, failed, not\_replayable |
+| `POST /replays/{replay_id}/cancel` | Stops a running job |
+| `GET /subscriptions/{id}/replays` | Lists the jobs of a subscription |
 
 - **Selector** (at least one): statuses (for example failed, dead\_lettered, dropped, delivered), a time range (by ingestion time), event types, explicit event references.
 - **How it works:** the replay service resolves the selector against the status store, re-reads the original events from the events topic of their retention class by the stored class, partition and offset, applies the subscription's current projection and delivery policy, and writes new deliveries marked with the replay ID.

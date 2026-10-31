@@ -41,7 +41,7 @@ type sseRecord struct {
 // runSSE implements `harness sse`: the simulated SSE client of section 15.2.
 // It opens GET /sse, parses the event stream (id:/event:/data: lines),
 // records every event and, when -ack is set, acknowledges each event with the
-// Last-Event-ID (docs/SPIKE.md: only an ack turns sent into delivered).
+// Last-Event-ID (docs/contracts.md: only an ack turns sent into delivered).
 //
 // It behaves like a browser that recovers from an outage (section 8): when
 // the stream ends before -duration elapsed, it reconnects automatically with
@@ -277,7 +277,7 @@ func fromSSEID(sseID, eventID string) (eventRef, deliveryID string) {
 	return sseID, sseID
 }
 
-// ackEvent acknowledges one delivery with the Last-Event-ID (docs/SPIKE.md,
+// ackEvent acknowledges one delivery with the Last-Event-ID (docs/contracts.md,
 // sse-gateway: Last-Event-ID or body).
 func ackEvent(ctx context.Context, base, token, subID, lastEventID string) error {
 	actx, cancel := context.WithTimeout(ctx, 5*time.Second)

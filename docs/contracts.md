@@ -1,7 +1,11 @@
-# Spike contracts
+---
+id: contracts
+title: Service contracts
+sidebar_position: 90
+---
 
-This document fixes the interfaces between the services of the spike so that
-they can be built independently. The full design is in `spec.md`; this file only
+This document fixes the interfaces between the services so that they can be
+built independently. The full design is in `spec.md`; this file only
 records what is already decided in code and what each service must implement.
 
 ## Repo layout
@@ -74,8 +78,8 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   the lifecycle rank every query uses to pick the latest record.
 - `internal/registry` – `EventType`, `Subscription`, `Entry` (subscription with
   compiled filters) and the in-memory `Registry` refreshed from PostgreSQL.
-  Spike deviation: the registry reads PostgreSQL instead of a compacted config
-  topic (section 6.1). Freshness has two paths: `REGISTRY_POLL` (1–2 s, the
+  Implementation deviation: the registry reads PostgreSQL instead of a compacted
+  config topic (section 6.1). Freshness has two paths: `REGISTRY_POLL` (1–2 s, the
   safety net) and, since migration 003, a `pg_notify` trigger on
   `event_types`/`subscriptions` that the registry LISTENs to — a committed
   write is in the index within milliseconds. Notifications are not replayed,
@@ -112,7 +116,7 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   `Matches(attr, data, attrs, json)` evaluates both, with the equality index of
   section 6.2 applied first.
 - `internal/project` – `Apply(data, allowlist)` keeps the listed dotted paths.
-- `internal/auth` – `Validator` (HS256 in the spike, JWKS later), `Authorize(w,
+- `internal/auth` – `Validator` (HS256 for now, JWKS later), `Authorize(w,
   r, scope)` writes the 401/403 itself. Scopes: publish, subscribe,
   status:read, replay. Owner comes from the `owner` claim, falling back to
   `sub`.

@@ -1,8 +1,12 @@
-# Deviations from the spec and open points
+---
+id: deviations-and-open-points
+title: Deviations and open points
+sidebar_position: 95
+---
 
-Status of this spike against [spec.md](spec.md). The inter-service contracts
-are in [SPIKE.md](SPIKE.md); the measured results are in the
-[README](../README.md#load-test-at-1000-eventss-spec-152-targets-n1n3).
+Status of Eventarium against [spec.md](spec.md). The inter-service contracts
+are in [contracts.md](contracts.md); the measured results are in
+[Performance](performance.md).
 
 ## Deviations from the spec, on purpose — five
 
@@ -49,8 +53,8 @@ One smaller gap on the same page: §9's "`failed` *or* `dead_lettered` —
 retries exhausted" is implemented as `dead_lettered` only. `failed` is part
 of the contract (the Status API filter and the replay selector both accept
 it) but the dispatcher never writes it, so it never appears in the data. All
-eleven status values are documented in the
-[README](../README.md#delivery-statuses).
+eleven status values are documented in
+[Reliability](reliability.md#the-eleven-statuses).
 
 A second *extension* is the `filtered` status (it required a new constant in
 the frozen `internal/status` — approved for this feature). §9 describes the
@@ -79,7 +83,7 @@ and `owner`, everything else rewritten. Details and the consequences for
 in-flight deliveries are in the
 [mutability section](#mutable-subscriptions-put-v1subscriptionsid) below.
 
-## Open points — answered by the spike
+## Open points — answered
 
 - *Load figures are estimates and must be measured early* (§16) — done:
   1,000 ev/s sustained, webhook p99 = 51 ms, SSE p99 = 88 ms, oracle clean.
@@ -92,8 +96,8 @@ in-flight deliveries are in the
   guaranteed across keys. Documented for consumers.
 - *Fixed partition count for the deliveries topic* — 12, fixed; the sequence
   `(partition, offset)` depends on it.
-- *Webhook security* (§16 calls it its own block of work) — spike has a real
-  first version: SSRF guard, no redirects, HMAC signatures, per-request
+- *Webhook security* (§16 calls it its own block of work) — Eventarium has a
+  real first version: SSRF guard, no redirects, HMAC signatures, per-request
   timeout.
 - *ClickHouse licence risk* — Apache 2.0; no issue.
 - *Failover latency is franz-go's default, nobody chose it* (§16) — now an
@@ -113,7 +117,7 @@ in-flight deliveries are in the
 
 ## Open points — still open
 
-From §16, minus what the spike answered:
+From §16, minus what Eventarium answered:
 
 - **Hot/cold handover and failover with ordering** — the spec itself calls
   this the most error-prone part: specify as state machines, test with fault
@@ -187,7 +191,7 @@ From §16, minus what the spike answered:
 - **Offline share of subscriptions** — unknown; decides inbox sizing and the
   managed PostgreSQL load (IOPS, WAL, failover). The multi-day offline
   scenario hasn't been run.
-- **Meaning of `delivered` for SSE** — the spike implements cumulative
+- **Meaning of `delivered` for SSE** — Eventarium implements cumulative
   `Last-Event-ID` acks (only an ack turns `sent` into `delivered`), but
   whether that is *the* semantics is still open. Related gap found during
   testing: the gateway only accepts tokens in the `Authorization` header, so

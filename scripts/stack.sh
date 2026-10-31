@@ -100,7 +100,7 @@ replicas)
   start dispatcher d3 HTTP_ADDR=:8286
 
   # Gateways: one sse-live group per node, drainer on node-a only - the
-  # arrangement docs/SPIKE.md specifies for a multi-node deployment.
+  # arrangement docs/contracts.md specifies for a multi-node deployment.
   start sse-gateway g1 HTTP_ADDR=:8082 NODE_ID=node-a SSE_DRAINER=true
   start sse-gateway g2 HTTP_ADDR=:8182 NODE_ID=node-b SSE_DRAINER=false
   start sse-gateway g3 HTTP_ADDR=:8282 NODE_ID=node-c SSE_DRAINER=false

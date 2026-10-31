@@ -318,7 +318,7 @@ func parseFilter(q url.Values) (chquery.Filter, error) {
 	return f, nil
 }
 
-// setupLogging sends slog to stderr at the configured level (docs/SPIKE.md).
+// setupLogging sends slog to stderr at the configured level (docs/contracts.md).
 func setupLogging() {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(strings.ToUpper(config.Str("LOG_LEVEL", "info")))); err != nil {

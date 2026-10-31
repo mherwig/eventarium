@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Eventarium">
+  <rect width="64" height="64" rx="14" fill="#4f46e5"/>
+  <g fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round">
+    <path d="M18 32 H34"/>
+    <path d="M34 32 C42 32 42 18 50 18"/>
+    <path d="M34 32 H50"/>
+    <path d="M34 32 C42 32 42 46 50 46"/>
+  </g>
+  <circle cx="18" cy="32" r="6" fill="#fff"/>
+  <circle cx="50" cy="18" r="4.5" fill="#fff"/>
+  <circle cx="50" cy="32" r="4.5" fill="#fff"/>
+  <circle cx="50" cy="46" r="4.5" fill="#fff"/>
+</svg>

@@ -14,7 +14,7 @@
 // produces replay deliveries plus their pending statuses transactionally,
 // batch by batch, in ingestion order (sections 11, 9 and 284).
 //
-// Environment (see docs/SPIKE.md): HTTP_ADDR (default :8084), PG_DSN,
+// Environment (see docs/contracts.md): HTTP_ADDR (default :8084), PG_DSN,
 // CH_DSN, KAFKA_BROKERS, JWT_SECRET, JWT_ISSUER, JWT_AUDIENCE,
 // REPLAY_MAX_EVENTS (default 10000), REGISTRY_POLL (1s) and LOG_LEVEL.
 package main
@@ -161,7 +161,7 @@ func main() {
 	slog.Info("replay-api: stopped")
 }
 
-// setupLogging sends slog to stderr at the configured level (docs/SPIKE.md).
+// setupLogging sends slog to stderr at the configured level (docs/contracts.md).
 func setupLogging() {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(strings.ToUpper(config.Str("LOG_LEVEL", "info")))); err != nil {

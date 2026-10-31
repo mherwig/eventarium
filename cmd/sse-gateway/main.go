@@ -8,7 +8,7 @@
 // through Kafka offsets and event references after a restart (8) and emits the
 // delivery status records that only an ack turns from sent into delivered (9).
 //
-// Environment (see docs/SPIKE.md): HTTP_ADDR (default :8082), PG_DSN,
+// Environment (see docs/contracts.md): HTTP_ADDR (default :8082), PG_DSN,
 // KAFKA_BROKERS, JWT_SECRET, JWT_ISSUER, JWT_AUDIENCE, NODE_ID (default:
 // hostname), plus SSE_HEARTBEAT (15s), SSE_MAX_CONNECTIONS (3) and
 // SSE_DRAINER (true; set to false on all but one node of a multi-node spike).

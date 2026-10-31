@@ -58,7 +58,7 @@ import (
 )
 
 // Options configures the gateway. cmd/sse-gateway maps the environment onto
-// this struct; every field falls back to the docs/SPIKE.md default.
+// this struct; every field falls back to the docs/contracts.md default.
 type Options struct {
 	HTTPAddr    string   // HTTP_ADDR, default :8082
 	NodeID      string   // NODE_ID, default: hostname

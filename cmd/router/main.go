@@ -58,7 +58,7 @@ func main() {
 	defer stop()
 
 	// Control data: the registry reads PostgreSQL (spike deviation from the
-	// compacted config topic of section 6.1, see docs/SPIKE.md); a NOTIFY from
+	// compacted config topic of section 6.1, see docs/contracts.md); a NOTIFY from
 	// the trigger of migration 003 refreshes it, the poll is the safety net.
 	dsn := config.Str("PG_DSN", "postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable")
 	st, err := store.Open(ctx, dsn)
