@@ -140,19 +140,43 @@ From §16, minus what the spike answered:
   and rescan only when the low-water offset itself settles. Not done, because
   nothing measured justifies it yet and the alternative (optimising ahead of
   data) is how the last "obvious" fix gets regretted.
-- **Failover latency is franz-go's default, nobody chose it** — the chaos
-  timing measurement (first duplicate at exactly *kill + 45 s*) is
-  `sessionTimeout: 45000 * time.Millisecond`, franz-go's default, and
-  `kafkautil.NewClient` sets nothing session-related — only seed brokers,
-  linger, batch size, acks and isolation level. So after an **ungraceful**
-  death (`kill -9`, OOMKill, node loss) the group waits out that window before
-  the survivors take the dead member's partitions, and everything that member
-  owned stalls for 45 s; a graceful SIGTERM leaves promptly, which is why a
-  rolling deploy feels instant and a crash does not. Lowering it takes
-  failover to seconds but makes a slow GC pause or a network blip look like a
-  death — an unnecessary rebalance, and with the commit watermark another
-  round of replay duplicates. This should be a `kafkautil.NewClient` option
-  with the tradeoff written next to it, not a number inherited from a library.
+- **Failover latency is franz-go's default, nobody chose it** — `sessionTimeout`
+  is `45000 ms` (franz-go's default), `heartbeatInterval` is 3 s, and
+  `kafkautil.NewClient` sets nothing session-related — only seed brokers, linger,
+  batch size, acks and isolation level. The number exists because a library
+  picked it.
+
+  Measured directly on the three-dispatcher group, polling
+  `kafka-consumer-groups.sh --describe` until the assignment changed:
+
+  | how the replica died | until its partitions were owned again |
+  | --- | --- |
+  | `kill -9` | **43 s**, during which its 4 of 12 partitions belonged to nobody — the other 8 kept working throughout |
+  | `SIGTERM` | **3 s** — but at t=1 s *all 12* were momentarily unowned, an eager rebalance stopping the world while one member leaves |
+
+  So the two paths differ in kind, not only in speed: an ungraceful death
+  costs a third of the partitions 43 s and leaves the rest untouched, a
+  graceful one costs everyone about two seconds. Kubernetes takes the graceful
+  path for a rolling update (`maxUnavailable: 0` surges first), so **43 s is
+  the crash floor** — OOMKill, node loss, a wedged process.
+
+  Lowering it shortens the crash path, and the usual objection applies less
+  than it usually does: franz-go heartbeats from a background goroutine in the
+  group's manage loop, not from the application's poll loop, so a slow publish
+  or a long GC pause does not by itself miss heartbeats. A process frozen or
+  network-partitioned for longer than the new value does — and evicting that
+  one is arguably the point. The binding constraint is not the false-positive
+  rate but `txnTimeout`, which defaults to **40 s** and which franz-go
+  documents must stay *below* the session timeout, so that a transaction cannot
+  outlive its group member. Dropping the session timeout below 40 s without
+  also dropping `TransactionTimeout` would risk the router's
+  consume-modify-produce completing after a rebalance — the failure its own
+  docs warn about. Kafka's floor (`group.min.session.timeout.ms`, 6 s by
+  default, not overridden in this stack) is never the binding number.
+
+  Decision needed: choose a value, put it in `kafkautil.NewClient` alongside
+  `TransactionTimeout`, and write the tradeoff beside both rather than
+  inheriting either from a library.
 - **The ClickHouse scenario never asserted status-row completeness** — its
   `missing=0` is evidence about *deliveries*: the receivers recorded all
   58,366 of them, so the oracle had no way to notice a status row lost while
