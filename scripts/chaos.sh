@@ -265,6 +265,50 @@ handover_complete() {
 # ---------------------------------------------------------------------------
 # counters and waits
 # ---------------------------------------------------------------------------
+# presence_rows <node> counts presence rows claiming a node, with no visibility
+# join: how many rows a kill -9 leaves behind. The process dies without
+# publishing a disconnect, so these stay - precisely the state the PostgreSQL
+# design has to handle, and the one the sse-presence topic could not (a key is
+# only ever superseded by a newer record for the same key, so a dead node's
+# entries outlived it).
+presence_rows() {
+  "$DOCKER" exec pubsub-postgres-1 psql -U pubsub -d pubsub -tAc \
+    "SELECT count(*) FROM sse_presence WHERE node_id = '$1'" 2>/dev/null
+}
+
+# visible_subs <port> reads one gateway's /healthz "presence": the number of
+# subscriptions its in-memory view can route to, counting connections on *every*
+# node. That view is what pick() answers from, so this number falling after a
+# node dies is the observable proof that the dead node's rows stopped being
+# routable - the whole point of the lease.
+visible_subs() {
+  curl -s --max-time 3 "http://localhost:$1/healthz" 2>/dev/null \
+    | grep -o '"presence":[0-9]*' | cut -d: -f2
+}
+
+# wait_presence_drop <before> <ports...> waits until every surviving gateway
+# counts fewer routable subscriptions than before the kill, and prints the new
+# count. The lease TTL bounds how long a dead node may stay visible, the reload
+# poll and the NOTIFY trigger are both faster than that bound, so 30s is
+# generous. Exits non-zero if the count never drops - which would mean the
+# dead node's connections are still being routed to.
+wait_presence_drop() {
+  local before=$1 t0 now v port
+  shift
+  t0=$(date +%s)
+  while :; do
+    now=$(( $(date +%s) - t0 ))
+    v=""
+    for port in "$@"; do
+      v=$(visible_subs "$port")
+      [ -n "$v" ] && [ "$v" -lt "$before" ] || { v=""; break; }
+    done
+    [ -n "$v" ] && { echo "$v"; return 0; }
+    [ "$now" -ge 30 ] && return 1
+    sleep 1
+  done
+}
+
 # The dispatcher logs are shared by every scenario, so counters are cumulative
 # across them; park_base snapshots them here to report this run's own delta.
 park_base() { grep -h 'parking recovered' "$LOG"/d*.log 2>/dev/null | wc -l; }
@@ -531,7 +575,36 @@ pods)
   sleep 10
   echo "  t=10s  kill -9 d1 (dispatcher)";  kill -9 "$(cat "$LOG/d1.pid")" 2>/dev/null; sleep 15
   echo "  t=25s  kill -9 r1 (router)";      kill -9 "$(cat "$LOG/r1.pid")" 2>/dev/null; sleep 15
+  # Sample the routable-subscription count before the kill: this is the number
+  # the presence lease has to bring down on its own, and it is read from the
+  # two gateways that survive (node-a on :8082, node-c on :8282). g2 is node-b
+  # on :8182.
+  VIS_BEFORE=$(visible_subs 8082)
   echo "  t=40s  kill -9 g2 (gateway)";     kill -9 "$(cat "$LOG/g2.pid")" 2>/dev/null; sleep 10
+
+  # Presence: the killed gateway wrote no disconnect (it could not - it was
+  # killed), so its rows are still in PostgreSQL. What has to change is whether
+  # anything routes to them. Both halves of that are asserted, because either
+  # one alone would pass for the wrong reason: rows still present proves the
+  # reaper has not silently made this test trivial, and the routable count
+  # falling proves the lease - not the deletion - is what stops deliveries
+  # being aimed at a connection nobody owns.
+  NODEB_ROWS=$(presence_rows node-b)
+  echo "  presence rows still claiming node-b: ${NODEB_ROWS} (kill -9 wrote no disconnect)"
+  if [ -z "$VIS_BEFORE" ]; then
+    echo "  SETUP FAILED: could not read presence from :8082 before the kill" >&2
+    FAIL=1
+  elif [ "${NODEB_ROWS:-0}" -le 0 ]; then
+    echo "  presence rows for node-b = ${NODEB_ROWS}, want > 0: nothing left to prove visibility from" >&2
+    FAIL=1
+  elif VIS_DROPPED=$(wait_presence_drop "$VIS_BEFORE" 8082 8282); then
+    echo "  routable subscriptions fell ${VIS_BEFORE} -> ${VIS_DROPPED} on both surviving gateways (lease expired, rows kept)"
+  else
+    echo "  PRESENCE LEASE FAILED: ${VIS_BEFORE} routable subscriptions before the kill, still ${VIS_BEFORE} after 30s" >&2
+    echo "    the dead node's connections are still being routed to - deliveries to them" >&2
+    echo "    are written to sse-live for a group nobody consumes" >&2
+    FAIL=1
+  fi
   wait_publish
   echo "  publish done; bringing the killed replicas back"
   start_bin dispatcher d1  HTTP_ADDR=:8086

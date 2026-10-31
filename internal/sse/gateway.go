@@ -5,9 +5,10 @@
 //     "sse" channel, enforces max_connections per subscription, heartbeats and
 //     ends a connection when the client goes away or its token expires
 //     (sections 6.5 and 6.7).
-//   - Presence: every connect and disconnect is published to the compacted
-//     sse-presence topic, and every node consumes that topic from the
-//     beginning to learn where each connection currently lives (6.5).
+//   - Presence: every connect and disconnect is written to the sse_presence
+//     table in PostgreSQL, and every node keeps the whole table in memory -
+//     with its own lease as the freshness clock - to learn where each
+//     connection currently lives (6.5).
 //   - Delivery stage and drainer: the consumer group "sse-delivery" over the
 //     deliveries topic assigns every sse delivery either to a live connection
 //     (through the sse-live topic, targeted at the owning node) or to the
@@ -86,14 +87,17 @@ type Gateway struct {
 	reg   *registry.Registry
 	auth  *auth.Validator
 
-	status      *status.Producer // delivery-status topic
-	presencePub *kgo.Client      // connect records and tombstones
-	livePub     *kgo.Client      // targeted deliveries for the gateway nodes
-	presenceCl  *kgo.Client      // no group: whole presence topic, from the start
-	deliveryCl  *kgo.Client      // group sse-delivery
-	liveCl      *kgo.Client      // group sse-live-<node>
+	status     *status.Producer // delivery-status topic
+	livePub    *kgo.Client      // targeted deliveries for the gateway nodes
+	deliveryCl *kgo.Client      // group sse-delivery
+	liveCl     *kgo.Client      // group sse-live-<node>
 
-	view *presenceView
+	// view is the in-memory mirror of sse_presence (presence.go). reloadMu
+	// serialises the reloads the notification listener and the poll ticker
+	// both drive, so a slow query cannot land after a newer one and undo it -
+	// the registry's rule for the same reason.
+	view     *presenceView
+	reloadMu sync.Mutex
 
 	mu    sync.Mutex
 	conns map[string]*connection            // connection ID -> connection
@@ -201,28 +205,20 @@ func New(opts Options) (*Gateway, error) {
 		cleanup()
 		return nil, err
 	}
-	if g.presencePub, err = kafkautil.NewClient(kgo.DefaultProduceTopic(kafkautil.TopicPresence)); err != nil {
-		cleanup()
-		return nil, err
-	}
 	if g.livePub, err = kafkautil.NewClient(kgo.DefaultProduceTopic(kafkautil.TopicSSELive)); err != nil {
 		cleanup()
 		return nil, err
 	}
-	// The presence view is a mirror, not work to split: pick() answers with a
-	// connection on *any* node, so every gateway needs the whole topic
-	// (section 6.5). A consumer group would hand each node only its slice of
-	// the partitions - one third of the map at three replicas - and the
-	// delivery stage would park deliveries that another node could have taken.
-	// Without a group nothing is committed and nothing is shared: every node
-	// consumes all partitions itself, and because there is no committed
-	// offset to resume from, every start rebuilds the map from the beginning
-	// of the compacted topic, including connections opened on other nodes
-	// while this one was down.
-	if g.presenceCl, err = kafkautil.NewClient(
-		kgo.ConsumeTopics(kafkautil.TopicPresence),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-	); err != nil {
+	// Presence is loaded before anything consumes, the way the registry index
+	// is: an empty view would park every delivery that arrives in the first
+	// second, and ClearNodePresence first drops whatever a previous life of
+	// this NODE_ID left behind - rows for connections that died with that
+	// process, which no tombstone ever reached (presence.go).
+	if err := g.store.ClearNodePresence(ctx, opts.NodeID); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if err := g.reloadPresence(ctx); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -282,7 +278,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 		}()
 	}
 	go g.reg.Run(ctx)
-	start("presence view", g.runPresenceView)
+	start("presence", g.runPresence)
 	start("delivery stage", g.runDeliveryStage)
 	start("live consumer", g.runLive)
 	start("inbox expiry", g.runInboxExpiry)
@@ -318,7 +314,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 	}
 
 	// Graceful shutdown: first tell every connection to reconnect, which makes
-	// the handlers publish their presence tombstones, then stop consuming,
+	// the handlers delete their presence rows, then stop consuming,
 	// then drain the HTTP server, and only then flush and close the producers.
 	close(g.shutdown)
 	cancel()
@@ -345,7 +341,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 // closeAll closes the Kafka clients and the database pool. The status producer
 // is closed last because it flushes what is still queued.
 func (g *Gateway) closeAll() {
-	for _, cl := range []*kgo.Client{g.deliveryCl, g.liveCl, g.presenceCl, g.presencePub, g.livePub} {
+	for _, cl := range []*kgo.Client{g.deliveryCl, g.liveCl, g.livePub} {
 		if cl != nil {
 			cl.Close()
 		}
@@ -461,25 +457,24 @@ func (g *Gateway) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	defer g.unregister(conn)
 
-	// Presence first: the record must be visible to the delivery stage before
-	// the first byte reaches the client, otherwise early deliveries are parked
-	// for no reason (they are drained back a tick later, but still).
-	pctx, pcancel := ctxTimeout(5 * time.Second)
-	err = g.publishPresence(pctx, conn, false)
+	// Presence first: the row must be committed and this node's view updated
+	// before the first byte reaches the client, otherwise early deliveries are
+	// parked for no reason (they are drained back a tick later, but still).
+	// The other gateways learn about it through the notification the insert
+	// queued - milliseconds, not the poll.
+	pctx, pcancel := ctxTimeout(presenceWriteBounds)
+	err = g.recordPresence(pctx, conn)
 	pcancel()
 	if err != nil {
-		g.log.Error("publishing presence", "err", err)
+		g.log.Error("recording presence", "err", err)
 		httpx.Error(w, http.StatusServiceUnavailable, "presence unavailable")
 		return
 	}
-	defer func() {
-		// The tombstone makes the compacted topic forget the connection.
-		ctx, cancel := ctxTimeout(5 * time.Second)
-		defer cancel()
-		if err := g.publishPresence(ctx, conn, true); err != nil {
-			g.log.Warn("publishing presence tombstone", "err", err, "connection", conn.id)
-		}
-	}()
+	// Deletion is best effort and runs on its own context: a defer during
+	// shutdown must not hang on a database that is already going away, and if
+	// the write is lost the lease still stops this row from being visible
+	// once this node stops heartbeating for it (presence.go).
+	defer g.forgetPresence(conn)
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")

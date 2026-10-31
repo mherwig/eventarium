@@ -20,8 +20,7 @@ import (
 const (
 	TopicDeliveries = "deliveries"
 	TopicStatus     = "delivery-status"
-	TopicPresence   = "sse-presence" // compacted: connection presence per subscription
-	TopicSSELive    = "sse-live"     // fan-out from the SSE delivery stage to gateway nodes
+	TopicSSELive    = "sse-live" // fan-out from the SSE delivery stage to gateway nodes
 )
 
 // Retention classes (section 12 of the spec).
@@ -154,7 +153,6 @@ func Specs() []TopicSpec {
 		{Name: TopicDeliveries, Partitions: DeliveryPartitions, RetentionMS: 24 * hour},
 		{Name: TopicStatus, Partitions: 6, RetentionMS: 48 * hour},
 		{Name: TopicSSELive, Partitions: 12, RetentionMS: 15 * 60 * 1000},
-		{Name: TopicPresence, Partitions: 12, Compact: true},
 	}
 }
 
@@ -231,15 +229,16 @@ func EnsureTopics(ctx context.Context, brokers []string, specs []TopicSpec) erro
 		t.ReplicationFactor = 1
 		var configs []kmsg.CreateTopicsRequestTopicConfig
 		set := func(k, v string) { configs = append(configs, kmsg.CreateTopicsRequestTopicConfig{Name: k, Value: &v}) }
-		if s.Compact {
-			set("cleanup.policy", "compact")
-			set("segment.ms", strconv.FormatInt(int64(time.Hour/time.Millisecond), 10))
-		} else {
-			set("cleanup.policy", "delete")
-			set("segment.ms", strconv.FormatInt(int64(time.Hour/time.Millisecond), 10))
-			if s.RetentionMS > 0 {
-				set("retention.ms", strconv.FormatInt(s.RetentionMS, 10))
-			}
+		// Set explicitly rather than left to the broker default: a topic
+		// created before a config changed must still come back with the
+		// config this code assumes. Every platform topic is a log with
+		// retention - the one exception (SSE presence) moved to PostgreSQL
+		// in migration 005, because a row only a live process can supersede
+		// needs a clock, not compaction.
+		set("cleanup.policy", "delete")
+		set("segment.ms", strconv.FormatInt(int64(time.Hour/time.Millisecond), 10))
+		if s.RetentionMS > 0 {
+			set("retention.ms", strconv.FormatInt(s.RetentionMS, 10))
 		}
 		t.Configs = configs
 		req.Topics = append(req.Topics, t)
