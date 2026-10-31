@@ -6,10 +6,12 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"pubsub/internal/registry"
@@ -382,12 +384,29 @@ func (s *Store) DeleteExpiredParked(ctx context.Context) (int64, error) {
 
 // EnsureInboxPartitions creates the daily partitions for the next days so that
 // an entire partition can be dropped at expiry (section 6.6). This is the
-// fallback job for providers without pg_partman.
+// fallback job for providers without pg_partman. Safe to call from several
+// processes at once - see the note on 42P07 in ensurePartitions.
 func (s *Store) EnsureInboxPartitions(ctx context.Context, days int) error {
 	if days <= 0 {
 		days = 8
 	}
-	day := time.Now().UTC().Truncate(24 * time.Hour)
+	return s.ensurePartitions(ctx, time.Now().UTC().Truncate(24*time.Hour), days)
+}
+
+// ensurePartitions creates the partitions for the days starting at day.
+//
+// The IF NOT EXISTS is not atomic for partitions, so two callers starting
+// together can both pass the name check and the loser gets "relation already
+// exists" - which is exactly the state the call asked for. Reproduced with six
+// concurrent creators of one fresh partition: five CREATE TABLE, one ERROR
+// 42P07. That error is therefore success here, not a failure.
+//
+// It has to be: this runs on start-up, so it fires on a first deploy or after
+// a day rollover - precisely the moments when every replica of a component is
+// starting at once. The dispatcher treated the loser's error as fatal and
+// exited, so a rolling update could shed a pod over a schema that was, by
+// then, already correct.
+func (s *Store) ensurePartitions(ctx context.Context, day time.Time, days int) error {
 	for i := 0; i < days+1; i++ {
 		from := day.AddDate(0, 0, i)
 		to := from.AddDate(0, 0, 1)
@@ -396,8 +415,17 @@ func (s *Store) EnsureInboxPartitions(ctx context.Context, days int) error {
 			`CREATE TABLE IF NOT EXISTS %s PARTITION OF inbox FOR VALUES FROM ('%s') TO ('%s')`,
 			name, from.Format("2006-01-02"), to.Format("2006-01-02")))
 		if err != nil {
+			if isAlreadyExists(err) {
+				continue
+			}
 			return fmt.Errorf("store: creating partition %s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// isAlreadyExists reports whether err is PostgreSQL's 42P07 (duplicate_table).
+func isAlreadyExists(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P07"
 }
