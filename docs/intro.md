@@ -93,8 +93,8 @@ Every component runs with any number of replicas. Kafka partitions do the
 work-splitting for consumers; the two pieces of work that are *not*
 partition-scoped are handled explicitly — the dispatcher's inbox duty runs
 under a PostgreSQL advisory-lock lease (exactly one drainer in the fleet), and
-the gateway's presence view consumes groupless so every node sees every node's
-connections.
+the gateway's presence view mirrors two PostgreSQL tables so every node sees
+every node's connections.
 
 ### Observability you can query
 

@@ -8,7 +8,7 @@ Status of Eventarium against [spec.md](spec.md). The inter-service contracts
 are in [contracts.md](contracts.md); the measured results are in
 [Performance](performance.md).
 
-## Deviations from the spec, on purpose — five
+## Deviations from the spec, on purpose — six
 
 1. **Registry distribution (§6.1): services read PostgreSQL instead of a
    compacted Kafka config topic — polled every 1–2 s and, since migration
@@ -40,6 +40,33 @@ are in [contracts.md](contracts.md); the measured results are in
    the connection lives elsewhere. Rendezvous hashing would assign
    *connections* to nodes up front; we went with "where the connection
    actually is".
+6. **Presence storage (§6.5): two PostgreSQL tables instead of a compacted
+   Kafka topic.** The spec asks gateways to "publish connect and disconnect
+   events to a compacted topic"; they write `sse_presence` and delete the row
+   on disconnect, and every node keeps the table in memory. The deciding
+   property is one a log cannot offer here: a compacted record is only ever
+   superseded by a newer record *for the same key*, and the key was
+   `<subscription>/<connection>` — so a gateway that died without a chance to
+   write its tombstone left an entry nothing would ever remove, because a
+   reconnect mints a new key instead of reusing the dead one. `pick()` could
+   then aim a delivery at a connection nobody owns, and the only thing that
+   recovered it was the client's own `Last-Event-ID` replay. A row plus a
+   lease needs no cooperation from the dying process: `sse_presence_nodes` is
+   refreshed every 2 s, a row counts only while its node's lease is younger
+   than 6 s, and the reader checks that clock on every reload.
+
+   Interface impact: none that crosses a service boundary — `sse-live`
+   targeting, `pick()`, the status records and every endpoint are unchanged.
+   The topic is simply no longer created (`kafkautil.Specs`), and migration
+   005 creates the tables. Propagation is a `pg_notify` trigger with a 1 s
+   poll as the safety net, the same shape as the registry's (deviation 1);
+   the heartbeat deliberately does not notify, since it would fire on every
+   node every 2 s and changes no routing answer.
+
+   Verified in the `pods` scenario, which now asserts both halves: after
+   `kill -9` of a gateway its rows are still present (no tombstone was
+   possible) *and* the surviving gateways' routable subscription count drops.
+   Earlier runs of that scenario would have passed on rows alone.
 
 One small *extension* appeared during load testing: the status-summary
 endpoint (§10, endpoint 4 — optional in the spec) gained an optional `since`
@@ -767,8 +794,9 @@ one.
 5. **SSE gateway hard-killed (SIGKILL) mid-stream with a live client, then
    restarted** (1,200 events at 20 ev/s). The client saw `unexpected EOF`
    after 201 events; the gateway restarted 4 s later. The consumer groups
-   (`sse-delivery`, the presence view, `sse-live-<node>`) re-joined only
-   after the dead member's ~45 s session expired; during that window
+   (`sse-delivery`, `sse-live-<node>`) re-joined only after the dead
+   member's ~45 s session expired — presence needs no rejoin, it is a table —
+   and during that window
    deliveries parked (999 rows, no client connected), and the reconnecting
    client drained all of them: client-side accounting `1200/1200,
    missing=0, duplicates=0`, oracle `delivered=1200, missing=0`. Notably

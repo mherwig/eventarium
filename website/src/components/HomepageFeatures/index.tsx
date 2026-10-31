@@ -90,8 +90,8 @@ const FeatureList: FeatureItem[] = [
       <>
         Any number of replicas of every service. Kafka partitions do the
         work-splitting; the two pieces it cannot partition are handled
-        explicitly — an inbox lease electing one drainer, and a groupless
-        presence view so every gateway sees every node's connections.
+        explicitly — an inbox lease electing one drainer, and a presence
+        view every gateway mirrors so each one sees every node's connections.
       </>
     ),
     link: '/docs/architecture',

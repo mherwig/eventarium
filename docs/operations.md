@@ -22,7 +22,7 @@ helm test pubsub                              # reaches /healthz and /readyz in-
 `pubsub-infra` is one Kafka, one PostgreSQL, one ClickHouse — deliberately
 (see `charts/pubsub-infra/values.yaml`); growing them is failover tooling, a
 different project from this one. `pubsub` runs **three replicas of every
-service**, which the inbox lease and the groupless presence view make safe,
+service**, which the inbox lease and the mirrored presence view make safe,
 plus:
 
 - `admin all` as a `pre-install`/`pre-upgrade` hook, so topics, migrations

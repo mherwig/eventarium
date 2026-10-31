@@ -49,8 +49,11 @@ Created by `bin/admin topics` (see `kafkautil.Specs()`). Retention classes:
 | `events-<class>` | partition key (string) | CloudEvent as structured JSON | one topic per retention class |
 | `deliveries` | subscription ID | `delivery.Message` JSON | fixed 12 partitions; the consumer assigns the sequence |
 | `delivery-status` | delivery ID | `status.Record` JSON | append-only, off the hot path |
-| `sse-presence` | `<subscription_id>/<connection_id>` | presence JSON, tombstone on disconnect | compacted |
 | `sse-live` | subscription ID | delivery JSON with target connection | written by the SSE delivery stage |
+
+There is no presence topic. Presence is two PostgreSQL tables
+(`sse_presence`, `sse_presence_nodes`, migration 005) because a log could not
+represent it correctly: see [architecture](architecture.md#presence-in-postgresql).
 
 Platform metadata travels in Kafka headers, never inside the CloudEvent
 (section 5). Header names are constants in `internal/kafkautil`:
@@ -280,13 +283,15 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 
 - `GET /sse?subscription_id=..&consumer_id=..` (scope `subscribe`), heartbeats,
   at most `max_connections` per subscription.
-- Publishes presence to `sse-presence` (tombstone on disconnect).
-- Presence view: consumes that topic **without a consumer group** (a plain
-  `ConsumeTopics` + `AtStart` client, nothing committed), so every node folds
-  all partitions from the beginning and rebuilds the full connection map -
-  including connections opened on other nodes while this one was down. A group
-  would give each node only its slice, and `pick()` (section 7) would then park
-  deliveries another node could have taken live.
+- Presence: writes `sse_presence` on connect and deletes it on disconnect,
+  before the first byte of the stream / before returning (section 6.5).
+- Heartbeats `sse_presence_nodes` every 2 s; clears its own leftover rows once
+  at startup; reaps rows whose lease passed 60 s.
+- Presence view: reloads the whole table — every node needs every node's
+  connections, and `pick()` (section 7) would park deliveries another node
+  could have taken live if it only had its own slice. Reloaded on
+  `sse_presence_changed` (migration 005, milliseconds) with a 1 s poll as the
+  safety net; a failed reload keeps the previous view rather than blanking it.
 - Delivery stage: consumer group `sse-delivery` over `deliveries`, sse
   subscriptions only. With a live connection it writes to `sse-live` targeted
   at the owning node, otherwise it parks in the inbox.

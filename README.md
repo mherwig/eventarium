@@ -30,7 +30,7 @@ outcome. Built in Go on Kafka, PostgreSQL and ClickHouse.
   consume-modify-produce are single Kafka transactions.
 - **Horizontal scale-out** — any number of replicas of every service; the two
   pieces of work Kafka cannot partition are handled explicitly (an inbox
-  lease, a groupless presence view).
+  lease, and a presence view every gateway mirrors from PostgreSQL).
 - **Replay** — resend what a subscription matched, selected by status, time
   window or event reference, with dry-run and idempotency keys.
 

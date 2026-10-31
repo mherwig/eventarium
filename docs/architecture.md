@@ -33,9 +33,8 @@ publish-api ─► Kafka events-<class> ─► router ─► Kafka deliveries �
 
 Kafka consumer groups: `router` (events-\*), `dispatcher` and `sse-delivery`
 (both on `deliveries`, by channel), one `sse-live-<NODE_ID>` per gateway node,
-`status-writer`. The presence view joins no group: every gateway node folds the
-whole `sse-presence` topic itself, because `pick()` has to know the connections
-of *all* nodes and a group would hand each node only its slice of them.
+`status-writer`. Presence joins no group and is not in Kafka at all — see
+[Presence](#presence-in-postgresql).
 
 ## Delivery modes
 
@@ -57,8 +56,8 @@ live in Kafka, and both stores are read/written off that path.
 
 | Store | Holds | Why there |
 | --- | --- | --- |
-| **Kafka** | `events-<class>` (the events themselves), `deliveries` (one record per subscription per event), `delivery-status`, `sse-live`, `sse-presence` | The data plane: buffering, fan-out, ordering per key, at-least-once replay from offsets |
-| **PostgreSQL** | `event_types` + `subscriptions` (the registry), `inbox` (parked deliveries), `replay_jobs` (replay job metadata) | Small, transactional, mutated: CRUD with constraints, and the inbox needs ordered per-subscription scans, batched deletes and partition drop at expiry |
+| **Kafka** | `events-<class>` (the events themselves), `deliveries` (one record per subscription per event), `delivery-status`, `sse-live` | The data plane: buffering, fan-out, ordering per key, at-least-once replay from offsets |
+| **PostgreSQL** | `event_types` + `subscriptions` (the registry), `inbox` (parked deliveries), `replay_jobs` (replay job metadata), `sse_presence` + `sse_presence_nodes` (which connection lives where) | Small, transactional, mutated: CRUD with constraints, and the inbox needs ordered per-subscription scans, batched deletes and partition drop at expiry |
 | **ClickHouse** | `delivery_status`: one append-only row per status transition (`pending → sent → delivered/failed/parked`) with attempt, HTTP code, latency, reason | High-volume append plus analytical reads (current status via the `(ts, attempt, rank)` latest key, distinct-delivery counts, keyset pagination), cheap expiry via partition TTL — the shape MergeTree is built for |
 
 The status table grows with traffic × fan-out × attempts (~20k rows/s at the
@@ -84,13 +83,61 @@ partition-scoped, and both are handled:
   would each `SELECT ... LIMIT` the same parked rows and deliver the backlog N
   times, exactly when a receiver has just recovered. Everything else in the
   dispatcher — parking, counting, acking — is per record and runs on every node.
-- **The presence view of the gateway** consumes groupless (above), so each node
-  sees the connections of every node instead of its own slice.
+- **The presence view of the gateway** is a mirror of two small tables rather
+  than a shared log, so there is nothing to split: every node reloads the same
+  rows (see [Presence](#presence-in-postgresql)), which is what lets `pick()`
+  answer with a connection on *any* node.
 
 Verified live with two dispatchers and two gateways: one lock row in
 `pg_locks`, takeover in one tick, both gateways reporting the same `presence`
 count while hosting different connections, and 40 parked rows drained to 40
 receipts — not 80.
+
+## Presence in PostgreSQL
+
+Two questions have to be answerable by *every* gateway, because the delivery
+stage runs wherever the `deliveries` partition is assigned rather than where
+the connection lives:
+
+1. which connection currently owns a subscription, and
+2. which node is holding it (so the delivery can be targeted at that node's
+   `sse-live-<NODE_ID>` group).
+
+Both live in `sse_presence` — one row per open connection — plus
+`sse_presence_nodes`, one row per gateway refreshed every 2 s. A presence row
+counts only while its node's lease is younger than 6 s, and the reader
+evaluates that on every reload rather than storing it:
+
+```sql
+SELECT p.* FROM sse_presence p
+JOIN sse_presence_nodes n ON n.node_id = p.node_id
+WHERE n.last_seen > now() - interval '6 seconds'
+```
+
+The timings are one mechanism in three numbers: heartbeat **2 s**, visibility
+**6 s** (three missed beats), reaping **60 s**. The gap between the last two
+is deliberate — visibility is what correctness depends on and it fails fast,
+while deletion is hygiene and fails slowly, so a gateway that was merely
+unreachable for a minute finds its rows still there when it returns.
+
+This replaced a compacted `sse-presence` topic, and the reason is a property of
+logs that this data cannot tolerate: a topic record is only superseded by a
+newer record **for the same key**, and the key was
+`<subscription>/<connection>` — so a process killed without a chance to write
+its tombstone left an entry that no compaction would ever remove, because a
+reconnect mints a new key rather than reusing the dead one. `pick()` would then
+route deliveries at a connection nobody owns, and the only recovery was the
+client's own `Last-Event-ID` replay. A lease needs no such cooperation: the dead
+node simply stops refreshing, and after 6 s its rows stop counting.
+
+Writes are few and specific — insert on connect, delete on disconnect — so both
+notify on `sse_presence_changed` (migration 005) exactly as the registry does,
+giving millisecond propagation with a 1 s poll as the safety net. The heartbeat
+deliberately does *not* notify: it would fire on every node every 2 s forever
+and changes no routing answer, since visibility is read from the clock.
+
+Nothing here is on the delivery hot path: `pick()` reads the in-memory mirror,
+and only connect, disconnect and the reload loop touch the database.
 
 ## Transactional boundaries
 
