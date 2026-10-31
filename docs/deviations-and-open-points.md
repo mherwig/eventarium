@@ -96,6 +96,20 @@ in-flight deliveries are in the
   first version: SSRF guard, no redirects, HMAC signatures, per-request
   timeout.
 - *ClickHouse licence risk* — Apache 2.0; no issue.
+- *Failover latency is franz-go's default, nobody chose it* (§16) — now an
+  explicit pair, `KAFKA_SESSION_TIMEOUT` / `KAFKA_TRANSACTION_TIMEOUT`, read
+  together in `kafkautil.Timeouts()` (which enforces franz-go's rule that the
+  transaction timeout stays *below* the session, and clamps rather than
+  rejects) and applied to every client including the router, which builds its
+  client through `NewGroupTransactSession` and is the one place where both
+  halves matter. Both were **lowered from 45 s / 40 s to 15 s / 10 s** on
+  measurement: the `rebalance` scenario reports a 13–16 s handover against
+  46–45 s at the inherited value, with an identical oracle
+  (`missing=0 unexpected=0`) and an identical abort count — one per run, the
+  documented cold-start case at 54 ms elapsed, `past_txn_timeout=false` at
+  both, so 10 s holds even at 1,000 ev/s. A transaction that does outlive its
+  budget is re-consumed, so the failure mode is duplicates, never loss. The
+  conservative pair stays one environment variable away.
 
 ## Open points — still open
 
@@ -159,59 +173,6 @@ From §16, minus what the spike answered:
   and rescan only when the low-water offset itself settles. Not done, because
   nothing measured justifies it yet and the alternative (optimising ahead of
   data) is how the last "obvious" fix gets regretted.
-- **Failover latency is franz-go's default, nobody chose it** — `sessionTimeout`
-  is `45000 ms` (franz-go's default), `heartbeatInterval` is 3 s, and
-  `kafkautil.NewClient` sets nothing session-related — only seed brokers, linger,
-  batch size, acks and isolation level. The number exists because a library
-  picked it.
-
-  Measured directly on the three-dispatcher group, polling
-  `kafka-consumer-groups.sh --describe` until the assignment changed:
-
-  | how the replica died | until its partitions were owned again |
-  | --- | --- |
-  | `kill -9` | **43 s**, during which its 4 of 12 partitions belonged to nobody — the other 8 kept working throughout |
-  | `SIGTERM` | **3 s** — but at t=1 s *all 12* were momentarily unowned, an eager rebalance stopping the world while one member leaves |
-
-  So the two paths differ in kind, not only in speed: an ungraceful death
-  costs a third of the partitions 43 s and leaves the rest untouched, a
-  graceful one costs everyone about two seconds. Kubernetes takes the graceful
-  path for a rolling update (`maxUnavailable: 0` surges first), so **43 s is
-  the crash floor** — OOMKill, node loss, a wedged process.
-
-  Lowering it shortens the crash path, and the usual objection applies less
-  than it usually does: franz-go heartbeats from a background goroutine in the
-  group's manage loop, not from the application's poll loop, so a slow publish
-  or a long GC pause does not by itself miss heartbeats. A process frozen or
-  network-partitioned for longer than the new value does — and evicting that
-  one is arguably the point. The binding constraint is not the false-positive
-  rate but `txnTimeout`, which defaults to **40 s** and which franz-go
-  documents must stay *below* the session timeout, so that a transaction cannot
-  outlive its group member. Dropping the session timeout below 40 s without
-  also dropping `TransactionTimeout` would risk the router's
-  consume-modify-produce completing after a rebalance — the failure its own
-  docs warn about. Kafka's floor (`group.min.session.timeout.ms`, 6 s by
-  default, not overridden in this stack) is never the binding number.
-
-  **Partly addressed.** `kafkautil.Timeouts()` now reads both values together
-  (`KAFKA_SESSION_TIMEOUT`, `KAFKA_TRANSACTION_TIMEOUT`), clamps
-  `txn < session`, and every client takes them from there — including the
-  router, which builds its client through `NewGroupTransactSession` rather
-  than `kafkautil.NewClient` and is the one place where the pair actually
-  bites. The values themselves are unchanged (45 s / 40 s): what moved is that
-  they are a visible choice with the tradeoff written next to them, overridable
-  without a rebuild, instead of a default inherited from a library.
-
-  Still open: **the value.** The `rebalance` scenario in `scripts/chaos.sh`
-  measures the handover and fails beyond session + 15 s of polling slack, so
-  tuning it comes with a test instead of a hope; its helpers are covered by
-  `make chaos-test`, which needs no stack. Run twice against the default it
-  reported 46 s and 45 s against a 60 s bound, agreeing with the hand-rolled
-  measurement above. The obvious candidates are 15 s / 10 s, and they should
-  not be adopted without first confirming the router's
-  transactions normally complete well inside 10 s — see the txnTimeout
-  constraint above, which is the reason the two numbers cannot be chosen
-  separately.
 - **The ClickHouse scenario never asserted status-row completeness** — its
   `missing=0` is evidence about *deliveries*: the receivers recorded all
   58,366 of them, so the oracle had no way to notice a status row lost while
@@ -472,7 +433,7 @@ exactly what the first `ch` run of the committed script did: 81 rows and a
 | `pg` | receiver offline **and** PostgreSQL down, 20 s overlap | **0** | 0 | 0 |
 | `ch` | ClickHouse down 20 s | **0** | 0 | 0 |
 | `kafka` | broker restart mid-run | **0** | 0 | 2,746 |
-| `rebalance` | `kill -9` one dispatcher, handover measured against the session timeout | **0** | 0 | 16,554 |
+| `rebalance` | `kill -9` one dispatcher, handover measured against the session timeout | **0** | 0 | 533–16,554 (see below) |
 
 **`missing=0` and `unexpected=0` in all five** — the two numbers this whole
 exercise exists for.
@@ -480,7 +441,8 @@ exercise exists for.
 The first four rows are from one pass against the current code (owners
 `pods020953`, `pg021223`, `ch022133`, `kafka022326`), re-run after publish-api
 went transactional so the table would not mix binaries; `rebalance` is
-`rebalance101220`, whose duplicate count is discussed below. The `kafka` row's
+`rebalance101220` and four later runs at both timeout pairs, whose duplicate
+counts are discussed below. The `kafka` row's
 `expected` is lower than the others (52,536 vs 58,366) because 1,200 events
 were *correctly* not written while the broker was restarting — see the
 `unexpected` discussion below, which is where that number used to go wrong.
@@ -530,13 +492,16 @@ the gateway sent.
 The scenario asserts a number rather than only a verdict: kill one dispatcher
 mid-publish, poll the group's assignment until every partition is owned by a
 live member, and fail beyond `KAFKA_SESSION_TIMEOUT + 15 s` of polling slack.
-Two runs, both passing the oracle (`received == expected == 58,366`,
+Every run below passed the oracle (`received == expected == 58,366`,
 `missing=0`, `unexpected=0`):
 
-| run | handover | bound |
-| --- | --- | --- |
-| 1 | 46 s | 60 s |
-| 2 | 45 s | 60 s |
+| pair | run | handover | bound |
+| --- | --- | --- | --- |
+| 45 s / 40 s | 1 | 46 s | 60 s |
+| 45 s / 40 s | 2 | 45 s | 60 s |
+| 45 s / 40 s | 3 | 46 s | 60 s |
+| **15 s / 10 s (shipped)** | 1 | 13 s | 30 s |
+| **15 s / 10 s (shipped)** | 2 | 16 s | 30 s |
 
 That agrees with the hand-rolled measurement above (43 s) within the polling
 granularity, and it is now *enforced*: the bound is derived from
@@ -544,18 +509,42 @@ granularity, and it is now *enforced*: the bound is derived from
 franz-go upgrade that changed the behaviour would fail the run instead of
 quietly moving the number.
 
-Duplicates were 16,554 in the second run — all webhook, none on SSE — against
-825 and 2,776 in two earlier runs of the same scenario. The spread is not
-noise in the platform; it is the watermark rule with a wider view of itself.
-Three seeded subscriptions carry `rate_limit_per_s=50`, so they are never
-finished inside a 60 s run and they hold *their partitions'* commit points
-back; everything delivered above a stalled watermark is replayed by whoever
-takes over. The eight subscriptions that each duplicated ~2,700 times are
-those three plus their neighbours — the same picture the `pods` runs showed
-one partition wide, wider here because this run's clients were all alive.
+Duplicates across those runs were 825, 2,776, 16,554 at the old pair and 628,
+533 at the new one — all webhook, none on SSE. The spread is not noise in the
+platform, nor a property of the session timeout; it is the watermark rule with
+a wider view of itself, and which subscriptions happen to hold their
+partitions' commit points back. Three seeded subscriptions carry
+`rate_limit_per_s=50`, so they are never finished inside a 60 s run and they
+hold *their partitions'* commit points; everything delivered above a stalled
+watermark is replayed by whoever takes over. The eight subscriptions that each
+duplicated ~2,700 times in one run were those three plus their neighbours —
+the same picture the `pods` runs showed one partition wide, wider there because
+this run's clients were all alive.
+
 Stranded clients had been hiding it: a client that dies at connect time makes
 its whole subscription park durably, which *moves* the watermark and shrinks
 the replay.
+
+Two bugs the scenario itself caught, both in the driver rather than the
+platform, and both fixed with a test that would have caught them:
+
+- **The bound printed a stale session timeout.** `session_seconds()` fell back
+  to a hardcoded 45 s when `KAFKA_SESSION_TIMEOUT` was unset — correct when it
+  was written, wrong the moment the defaults were lowered. One run measured a
+  right 16 s handover and printed it against a 60 s bound: four times too
+  generous, which is worse than no bound at all. The fallback now matches the
+  Go default, and `TestSessionSecondsFallbackMatchesDefault` in
+  `internal/kafkautil` reads `scripts/chaos.sh` and fails if the two ever
+  drift apart again.
+- **A receiver that could not bind failed the run as a mystery shortfall.** A
+  leftover delivery receiver on `:9090` (a previous run's, or one started by
+  hand) made the scenario's own receiver exit with `bind: address already in
+  use`; the log line went unread, `recv.jsonl` stayed empty, and eight minutes
+  later the oracle reported `received=18653 of 58366` — a platform-shaped
+  failure for a driver-shaped cause. `stop_receiver` now clears a leftover
+  `harness recv` on the port (only that pattern; anything else keeps it and is
+  named), and `wait_for_receiver` refuses to continue until the port is really
+  listening, exiting 4 with the bind error if it is not.
 
 ### The subscription-visibility window (setup, not fault)
 

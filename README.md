@@ -136,8 +136,8 @@ Every service reads its configuration from the environment
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api |
 | `REGISTRY_POLL` | `1s` (`2s` in publish-api) — safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `REGISTRY_STALE_AFTER` | `30s` — how old the registry index may be before `/readyz` fails | publish-api, replay-api, sse-gateway |
-| `KAFKA_SESSION_TIMEOUT` | `45s` — how long a group waits for a member before evicting it: the **crash floor** (measured: 43 s to hand a `kill -9`ed replica's partitions over, 3 s for a graceful SIGTERM) | router, dispatcher, sse-gateway, status-writer |
-| `KAFKA_TRANSACTION_TIMEOUT` | `40s` — must stay *below* the session timeout so a transaction cannot outlive its member; enforced (clamped) in `kafkautil.Timeouts`, where the two are read together | router, publish-api |
+| `KAFKA_SESSION_TIMEOUT` | `15s` — how long a group waits for a member before evicting it: the **crash floor**. Measured with the `rebalance` scenario: 13–16 s to hand a `kill -9`ed replica's partitions over, against 46 s at franz-go's default of 45 s (a graceful SIGTERM is ~3 s either way) | router, dispatcher, sse-gateway, status-writer |
+| `KAFKA_TRANSACTION_TIMEOUT` | `10s` — must stay *below* the session timeout so a transaction cannot outlive its member; enforced (clamped) in `kafkautil.Timeouts`, where the two are read together. Verified at 1,000 ev/s: no transaction outlived it | router, publish-api |
 | `WEBHOOK_SIGNING_SECRET` | unset (no HMAC) | dispatcher |
 | `ALLOW_PRIVATE_WEBHOOKS` | true in the spike; set `0` for real deployments | dispatcher |
 | `DISPATCHER_MAX_ATTEMPTS` | `10` | dispatcher |
@@ -758,15 +758,19 @@ make chaos SCEN=pods  # pods | pg | kafka | ch
 `rebalance` is the one that asserts a number rather than a verdict: it polls
 the group's assignment until every partition is owned by a live member, and
 fails if that takes longer than the configured session timeout allows. It is
-what turns "failover takes 45 s" from an observation into something an
-upgrade cannot silently change — twice against the default it measured 46 s
-and 45 s against a 60 s bound.
+what turns "failover takes 13 s" from an observation into something an upgrade
+cannot silently change — measured at 13 s and 16 s against a 30 s bound at the
+shipped `15s`, and at 46 s and 45 s against 60 s at franz-go's 45 s default,
+which is the pair of numbers that decided the value in the first place.
 
-Setup also waits for the gateways to know the subscriptions that were just
-created. A subscription is only reachable ~50–60 ms after the API returns 201,
-and the harness's SSE client (like a browser's `EventSource`) treats a 404 as
-final — connecting a millisecond early kills that client for the whole run and
-leaves its deliveries parked with nothing to drain them.
+Setup also waits for two things it used to take on trust. The gateways must
+already know the subscriptions just created — a subscription is only reachable
+~50–60 ms after the API returns 201, and the harness's SSE client (like a
+browser's `EventSource`) treats a 404 as final, so connecting a millisecond
+early kills that client for the whole run. And its own receiver must be
+listening: a leftover process on `:9090` used to make it fail to bind, with
+the run dying eight minutes later as a shortfall that looked like the
+platform's fault.
 
 The driver's own tests need no stack at all:
 
@@ -852,8 +856,9 @@ Stability hardening is verified live as well, scenario by scenario
   sub→partition map), while a broker restart forces a rejoin and shows the same
   kind of replay. The two runs where only a *store* died show **zero**, because
   no member left the group and the offsets kept advancing throughout.
-  Duplicates arrive ~45 s after a `kill -9` (franz-go's default session
-  timeout), and reading one duplicated `delivery_id` out of Kafka returns a
+  Duplicates arrive when the group finally hands over — ~45 s after a
+  `kill -9` at franz-go's default session timeout, ~13–16 s at the shipped
+  `15s` — and reading one duplicated `delivery_id` out of Kafka returns a
   single record: it is replay of uncommitted work, not re-production, which is
   the whole point of fix 1.
 
@@ -946,6 +951,15 @@ status table is cumulative, so re-running a load test for the same owner
 counts earlier runs' deliveries too — the harness scopes Status API queries to
 the run's publish window (`from`/`to`), keep that in mind when probing the API
 by hand.
+
+A run started immediately after a full stack restart is measurably slower in
+its **first ~10 s** and then settles: bucketing receipts by publish time at
+the shipped timeouts gave p99 1,101 ms for the first bucket against 65 / 77 /
+67 ms for the three that follow, so a whole-run p99 in the high hundreds of
+milliseconds says "cold start", not "steady state". It coincides with the
+router's one cold-start transaction abort (see the chaos section). Read the
+per-bucket view, or let a warm-up publish finish first, before treating a
+whole-run p99 above ~100 ms as a regression.
 
 The run found and fixed two real bugs, worth remembering when touching these
 paths:
