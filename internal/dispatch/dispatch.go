@@ -580,6 +580,13 @@ func (d *Dispatcher) heartbeat() {
 			// or waiting for a park. A number that only grows means the commit
 			// points are standing still while Kafka keeps the records.
 			"offsets_in_flight", d.gate.Pending(),
+			// Status records that never reached the topic: dropped because the
+			// emitter's buffer filled during a broker outage, or given up at
+			// shutdown. Deliveries are unaffected either way (the offset gate,
+			// not the status record, is what makes them durable) - but a
+			// non-zero and growing number says the Status API is falling
+			// behind reality and replay selectors will miss those deliveries.
+			"status_lost", d.emitter.lostCount(),
 		)
 	}
 }
