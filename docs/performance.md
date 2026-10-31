@@ -83,9 +83,16 @@ oracle:
 | `ch` | ClickHouse down 20 s | **0** | 0 | 0 |
 | `kafka` | broker restart mid-run | **0** | 0 | 2,746 |
 | `rebalance` | `kill -9` one dispatcher, handover measured against the session timeout | **0** | 0 | 533–16,554 |
+| `gwfail` | `kill -9` one gateway, **left down for the whole run** | **0** | 0 | 0 |
 
-**`missing=0` and `unexpected=0` in all five** — the two numbers the whole
+**`missing=0` and `unexpected=0` in all six** — the two numbers the whole
 exercise exists for.
+
+`gwfail` is judged *while the gateway is still dead*, so its subscriptions have
+to be routable somewhere else rather than on a node that comes back to serve
+them. Its `duplicates=0` is the interesting one: nobody left a consumer group,
+because gateway connections do not sit in one — the clients simply reconnected
+and resumed from their cursors.
 
 The duplicates track whether a *consumer left the group*, not whether something
 broke. The `pods` run's duplicates fall on **partitions 8–11 only — exactly
@@ -164,9 +171,16 @@ end `missing=0 unexpected=0 duplicates=0` client-side:
   `/readyz` behaving while `/healthz` does not, Status API 404s, soft delete,
   the SSE park path. Full detail in
   [Deviations and open points](deviations-and-open-points.md#stability-hardening-five-failure-modes-what-each-one-cost-and-gave-back).
+- **Multi-node SSE gateway failover** (`gwfail`): a gateway `kill -9`ed and
+  *left down* for the whole run, with the oracle judging while it is dead.
+  6,199 deliveries sat on its subscriptions, all six of its clients reconnected
+  to a survivor, routable subscriptions returned to 20 on the two survivors,
+  and the run ended `missing=0 unexpected=0 duplicates=0 unrecorded=0`. The
+  first run of this scenario found the real defect — see
+  [Deviations and open points](deviations-and-open-points.md#open-points--still-open).
 
 Not exercised yet: the soak test, restart-mid-job recovery of the replay
-worker, the multi-day offline scenario and multi-node SSE gateway failover.
+worker and the multi-day offline scenario.
 
 ## Reproducing it
 
@@ -196,6 +210,6 @@ Chaos scenarios are a `make` target away:
 ```sh
 make infra            # Kafka, PostgreSQL, ClickHouse plus topics and schemas
 make stack            # five services, three replicas of each consumer
-make chaos SCEN=pods  # pods | pg | kafka | ch | rebalance
+make chaos SCEN=pods  # pods | pg | kafka | ch | rebalance | gwfail
 make chaos-test       # the driver's own tests, no stack needed
 ```

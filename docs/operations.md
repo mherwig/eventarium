@@ -79,7 +79,7 @@ docker compose exec -T postgres psql -U pubsub -d pubsub \
 
 ## Chaos scenarios
 
-Five scenarios, each "publish at 200 ev/s for 60 s, inject one fault in the
+Six scenarios, each "publish at 200 ev/s for 60 s, inject one fault in the
 middle, let it drain, then ask the oracle". The driver is committed rather
 than described — `scripts/chaos.sh`, against the topology `scripts/stack.sh`
 starts:
@@ -87,7 +87,7 @@ starts:
 ```sh
 make infra            # Kafka, PostgreSQL, ClickHouse plus topics and schemas
 make stack            # five services, three replicas of each consumer
-make chaos SCEN=pods  # pods | pg | kafka | ch | rebalance
+make chaos SCEN=pods  # pods | pg | kafka | ch | rebalance | gwfail
 make chaos-test       # the driver's own tests, no stack needed
 ```
 
@@ -98,11 +98,12 @@ make chaos-test       # the driver's own tests, no stack needed
 | `ch` | ClickHouse down for 20 s |
 | `kafka` | broker restart |
 | `rebalance` | `kill -9` one dispatcher, **and** measures how long its partitions stay unowned against `KAFKA_SESSION_TIMEOUT` + 15 s of polling slack |
+| `gwfail` | `kill -9` one gateway and **leave it down**: its clients have to land on a survivor, and its subscriptions have to become routable again |
 
 Results, including the full duplicate analysis, are in
 [Performance](performance.md#resilience-under-injected-faults).
 
-Three properties in the driver are load-bearing, and each one exists because
+Four properties in the driver are load-bearing, and each one exists because
 getting it wrong produced a result that looked fine:
 
 - **Faults are asserted, not assumed.** An unquoted `$DOCKER` word-split once
@@ -115,12 +116,56 @@ getting it wrong produced a result that looked fine:
   `expected` — parked-but-undelivered deliveries would otherwise pass.
 - **Each run seeds its own owner**, so an earlier run's events cannot leak into
   the next run's status window as `unexpected`.
+- **`ch` asserts the status store, not only the deliveries.** It settles
+  `status-writer`'s lag on `delivery-status` to 0 *while the outage is still the
+  subject*, then the oracle's `unrecorded=` count checks that every delivery a
+  receiver got has a row in the store. Lag 0 is the *sufficient* half of that
+  claim and it is sound: `status-writer` commits an offset only after the
+  insert into ClickHouse succeeded, so while lag reads 0 nothing can be left in
+  Kafka — including the rows written while it was down. Judging before that
+  would read "still in flight" as "lost". The converse is **not** sound and the
+  driver does not assert it: after a rebalance the commits fail with
+  `UNKNOWN_MEMBER_ID` and the offsets are deliberately dropped
+  (`maxCommitFailures`: the partitions were revoked, the commit can never
+  succeed, the records may be re-consumed, the table is append-only), so from
+  then on lag counts what may be *re-read* rather than what has *not been
+  inserted*. It grew to 1.8 M across a suite run while `unrecorded=0` held
+  throughout. So a non-zero lag only fails the run when `status-writer` has
+  reported no commit trouble at all; otherwise the driver says so and hands the
+  verdict to `unrecorded`, which reads rows rather than offsets. The producer's
+  own counter (`status_lost`, a row that never reached Kafka at all, and so
+  invisible to both lag and `unrecorded`) is diffed across the run as well — it
+  is the one link neither of the other two can see.
+  `unrecorded` judges only receipts inside the oracle's `[from,to]` window,
+  because the Status API cannot see rows outside it and treating "not visible
+  to this query" as "lost" produced 30,028 false alarms on the first `pg` run —
+  a third of its receipts land minutes after publishing stops. On the run that
+  matters the coverage is complete: **`ch` covers 33,703 of 33,703 receipts
+  (100%)**, so the scenario whose status rows were actually at risk is judged
+  in full. `pg` covers 21%, where it is belt-and-braces — its fault is
+  PostgreSQL and the receiver, and ClickHouse is up throughout.
 
 `rebalance` is the one that asserts a number rather than a verdict: it polls
 the group's assignment until every partition is owned by a live member, and
 fails if that takes longer than the configured session timeout allows. It is
 what turns "failover takes 13 s" from an observation into something an upgrade
 cannot silently change.
+
+`gwfail` is the one that has to prove it did not test nothing. Killing a
+gateway whose subscriptions carry no deliveries would move seven idle
+connections and report success — which is exactly what its first run did, and
+why it now sums the oracle's `expected` count for the subscriptions that were
+on the victim and fails if that sum is 0. The subscription cycle in
+`harness seed` and the client-to-gateway assignment used to line up so that
+every `key_ordered` client — whose data filter rejects all 3,000 events —
+landed on the same gateway; the assignment now walks the client list in groups
+of three, which is one of each delivery mode. With that fixed the scenario
+carried 6,199 deliveries on the dead gateway's subscriptions, and it found a
+real loss: the delivery stage chose its target with the first entry of a Go map
+range, so after a `kill -9` it kept stamping `sent` against the dead node's
+connection while the client was already connected to a survivor and would never
+reconnect to recover them. Six deliveries were lost that way, and `pick()` now
+breaks the tie on the node's lease heartbeat instead.
 
 Setup also waits for two things it used to take on trust. The gateways must
 already know the subscriptions just created — a subscription is only reachable

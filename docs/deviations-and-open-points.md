@@ -149,13 +149,35 @@ From §16, minus what Eventarium answered:
 - **Hot/cold handover and failover with ordering** — the spec itself calls
   this the most error-prone part: specify as state machines, test with fault
   injection. The fault injection is done for the dispatcher (breaker
-  recovery, kill/restart rejoin, parked backlog survival) and for a
-  single-node SSE gateway restart with reconnecting clients (see the
-  results below); the state-machine specification and failover **across
-  nodes** — a second gateway node taking over a dead node's connections —
-  are still open, §17 step 4-5 territory (the replay *service* is built —
-  see below — but the formal state-machine specification of §17 step 4 is
-  not written).
+  recovery, kill/restart rejoin, parked backlog survival), for a single-node
+  SSE gateway restart with reconnecting clients, and — since the `gwfail`
+  scenario — for **failover across nodes**: one gateway `kill -9`ed and left
+  down for the whole run, its six clients landing on the two survivors, its
+  subscriptions becoming routable there, judged while it is still dead, and
+  ending `missing=0 unexpected=0 duplicates=0 unrecorded=0`. That scenario
+  found the defect below on its first run. What is *still* open is the formal
+  state-machine specification of §17 step 4-5 (the replay *service* is built —
+  see below — but the specification itself is not written), plus the residual
+  documented on `pick()`: for up to one heartbeat after a kill the dead node's
+  lease is still the freshest, so a client that fails back faster than that
+  can still be served a misrouted delivery.
+  - **The defect `gwfail` found, kept because it is the shape of the whole
+    problem.** The delivery stage picks its target with `pick()`, which broke
+    ties on the first entry of a Go map range — not a decision: what a
+    delivery's target turned on was Go's hash layout for those two keys, and
+    a two-entry map whose slots sit at index 0 and 1 of one bucket returns the
+    first entry 7 times out of 8. A killed node's presence rows stay routable
+    for the whole six-second lease, so both records were visible at once. For
+    the one subscription that was exposed — its delivery partition was owned
+    by a node holding no connection for it — the dead connection was stamped
+    **7 times against the live one's 3**. The one stamp from before the client
+    reconnected was recovered by the `Last-Event-ID` backlog as designed,
+    which is exactly why the design tolerates the lease window; the **6 after
+    it were lost**, because a client that is already connected to a survivor
+    never reconnects again, and a reconnect is the only thing that fetches a
+    misrouted delivery back. `pick()` now breaks the tie on the node's lease
+    heartbeat (`presence.go`), which is the signal that actually separates a
+    live node from one that was killed.
 - **Backlog limit per subscription** — without one storage grows unbounded
   during outages; with one, `dropped` appears and conflicts with guaranteed
   delivery. Unresolved product decision.
@@ -856,9 +878,9 @@ Not exercised yet (§17 test plan): the soak test, the multi-day offline
 scenario, PG/Kafka/CH outages beyond the receiver-level faults above, and the
 replay worker's restart-mid-job recovery (a `running` job is deliberately put
 back to `pending` on startup and re-executes from the start — duplicates
-acceptable, losses not — but that path was not observed live). The SSE
-gateway's multi-node behaviour (a second gateway node taking over a dead
-node's connections) was also not exercised — single-node restarts only.
+acceptable, losses not — but that path was not observed live). Gateway
+multi-node failover *is* exercised now (`gwfail`); what remains from §17
+steps 4-5 is the state-machine specification itself.
 
 ## Replay API: results (§11)
 

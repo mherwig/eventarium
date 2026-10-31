@@ -418,7 +418,15 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   (initial cursor via `-last-event-id`), deduplicates by event reference
   across reconnects and acks every event.
 - `harness verify` – the oracle: compares what receivers got with what the
-  Status API reports and with the expected match set (section 15.1).
+  Status API reports and with the expected match set (section 15.1). Its
+  summary line carries `missing=` (a delivery nobody accounts for),
+  `unexpected=`, `duplicates=` and `unrecorded=` — a delivery a receiver
+  *did* get for which the status store has no row, which is how a status row
+  lost while ClickHouse was down shows up as itself rather than as a shortfall
+  that `missing=` cannot see (it only asks about deliveries that did not
+  arrive). `unrecorded` is judged only inside the Status API's `[from,to]`
+  window and only when the status query succeeded, so a receipt outside the
+  window or a failed query cannot be read as a lost row.
 
 ## Deviations from the spec, on purpose
 
@@ -426,7 +434,16 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   migration 003) instead of a compacted Kafka topic.
 - SSE multi-node routing: presence carries the node ID, so the targeted
   `sse-live` message reaches the node that holds the connection. No message is
-  dropped because the connection lives elsewhere.
+  dropped because the connection lives elsewhere — **with one bounded
+  exception**: a killed node's presence rows stay routable for the length of
+  the presence lease (6 s), so a delivery handed over inside that window goes
+  to a node nobody is answering on. It is recovered when the affected client
+  reconnects and the `Last-Event-ID` backlog refetches it, which is the
+  designed answer; `gwfail` showed the case where it does not apply, because
+  the client had *already* failed over to a survivor and would never reconnect
+  again. `pick()` now prefers the node with the freshest lease heartbeat,
+  which shrinks the exposure from the full lease to at most one heartbeat
+  (see [Deviations and open points](deviations-and-open-points.md#open-points--still-open)).
 - Inbox deletion: batched deletes instead of a watermark table.
 - Replay selector field `event_types`: rejected with 400 instead of
   implemented (section 9: status records carry no event type). `statuses`,

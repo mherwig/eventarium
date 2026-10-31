@@ -49,10 +49,11 @@ stack:
 
 ## chaos SCEN=pods runs one failure scenario against a running stack and judges
 ## it with the harness oracle: SCEN is one of pods | pg | kafka | ch | rebalance
-## (rebalance also measures how long a killed replica's partitions stay
-## unowned, against KAFKA_SESSION_TIMEOUT).
+## | gwfail (rebalance also measures how long a killed replica's partitions stay
+## unowned, against KAFKA_SESSION_TIMEOUT; gwfail kills a gateway and leaves it
+## down, so its clients have to land on a survivor).
 chaos:
-	@test -n "$(SCEN)" || (echo "usage: make chaos SCEN=pods   (pods|pg|kafka|ch|rebalance)"; exit 1)
+	@test -n "$(SCEN)" || (echo "usage: make chaos SCEN=pods   (pods|pg|kafka|ch|rebalance|gwfail)"; exit 1)
 	./scripts/chaos.sh $(SCEN)
 
 ## chaos-test runs the chaos driver's own tests (pure helpers, no Docker)
