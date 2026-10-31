@@ -789,27 +789,31 @@ Stability hardening is verified live as well, scenario by scenario
 
   | fault | missing | unexpected | duplicates |
   | --- | --- | --- | --- |
-  | `kill -9` a dispatcher, a router and a gateway | **0** | 0 | 5,732 |
+  | `kill -9` a dispatcher, a router and a gateway | **0** | 0 | 7,293 |
   | receiver offline **and** PostgreSQL down (20 s overlap) | **0** | 0 | 0 |
   | ClickHouse down 20 s | **0** | 0 | 0 |
-  | Kafka broker restart | **0** | 5,185 | 2,385 |
+  | Kafka broker restart | **0** | 0 | 2,746 |
 
-  The duplicates track whether a **consumer left the group**, not whether
-  something broke: the crash run's 5,732 fall on **partitions 8–11 only —
-  exactly the killed dispatcher's assignment** — and on no other partition, on
-  both runs. A broker restart forces a rejoin and produces the same kind of
-  replay (2,385). The two runs where only a *store* died — PostgreSQL and
-  ClickHouse — show **zero**, because no member left the group and the
-  offsets kept advancing throughout. Duplicates arrive ~45 s after a `kill -9`
-  (franz-go's default session timeout), and reading one duplicated
-  `delivery_id` out of Kafka returns a single record: it is replay of
-  uncommitted work, not re-production, which is the whole point of fix 1.
-  `unexpected` in the broker run is publish-api's fault, not the
-  pipeline's — its 500 after a partial batch (open point below).
+  **`missing=0` and `unexpected=0` on every row.** The duplicates track whether
+  a *consumer left the group*, not whether something broke: the crash run's fall
+  on **partitions 8–11 only — exactly the killed dispatcher's assignment** —
+  and on no other partition (verified twice against the topic's own
+  sub→partition map), while a broker restart forces a rejoin and shows the same
+  kind of replay. The two runs where only a *store* died show **zero**, because
+  no member left the group and the offsets kept advancing throughout.
+  Duplicates arrive ~45 s after a `kill -9` (franz-go's default session
+  timeout), and reading one duplicated `delivery_id` out of Kafka returns a
+  single record: it is replay of uncommitted work, not re-production, which is
+  the whole point of fix 1.
 
-Full numbers, the status-record bug these runs found, and the three times the
-*harness* got in its own way — one of them making a scenario pass with the
-fault never applied:
+  `unexpected` was 5,185 in the first pass of the broker run — publish-api
+  returned 500 for a batch it had already written most of. Batches are
+  transactional now, so the same run reports 1,200 events failed and *none* of
+  them written.
+
+Full numbers, the bugs this round found (all fixed in the code, except the
+franz-go latch which is worked around) and the three times the *harness* got in
+its own way — one of them making a scenario pass with the fault never applied:
 [docs/deviations-and-open-points.md](docs/deviations-and-open-points.md#chaos-during-load-crashed-replicas-and-dead-infrastructure-17).
 
 Not exercised yet: the soak test, restart-mid-job recovery of the replay
@@ -853,23 +857,31 @@ path): 30,000 events at a sustained 1,003 ev/s with zero publish failures,
 fanning out to 145,918 deliveries. The dispatcher bursts to ~2,900 webhook
 deliveries/s and drains to `queue_depth=0` with `offsets_in_flight=0` and
 zero retries, parks, drops or dead-letters. Latency from publish to receipt,
-three consecutive runs of the identical scenario:
+four runs of the identical scenario — three before publish-api went
+transactional, one after:
 
 | Channel | p50 | p90 | p99 | max |
 | --- | --- | --- | --- | --- |
-| Webhook (unlimited subs), run 1 / 2 / 3 | 39 / 38 / 37 ms | 48 / 46 / 45 ms | 94 / 70 / **52 ms** | 183 / 107 / 68 ms |
-| SSE, run 1 / 2 / 3 | 61 / 59 / 58 ms | 84 / 75 / 74 ms | 253 / 99 / **92 ms** | 333 / 145 / 113 ms |
+| Webhook (unlimited), runs 1–3 (plain batch) | 39 / 38 / 37 ms | 48 / 46 / 45 ms | 94 / 70 / **52 ms** | 183 / 107 / 68 ms |
+| Webhook (unlimited), run 4 (**transactional batch**) | 34 ms | 45 ms | **59 ms** | 88 ms |
+| SSE, runs 1–3 (plain batch) | 61 / 59 / 58 ms | 84 / 75 / 74 ms | 253 / 99 / **92 ms** | 333 / 145 / 113 ms |
+| SSE, run 4 (**transactional batch**) | 56 ms | 74 ms | **90 ms** | 144 ms |
 | Webhook, rate-limited subs (by design) | 59 s | 108 s | 119 s | 120 s |
 
-Read that table as run 3 being the steady state and runs 1–2 being warm-up:
-the first run of the session pays for cold page caches, empty ClickHouse
-partitions and unwarmed connection pools, and its p99 is 3× the steady figure.
-Run 3 lands on what the previous session measured (webhook p99 51 ms, SSE
-88 ms), so the no-loss commit path costs nothing measurable at this rate.
-Across all three runs the oracle agrees identically:
-`expected=145918 missing=0 unexpected=0 duplicates=0` over all 40 subscriptions,
-and each run's receipt counts are byte-for-byte the same (99,283 webhook,
-46,635 SSE).
+Read runs 1–2 as warm-up: the first run of a session pays for cold page
+caches, empty ClickHouse partitions and unwarmed connection pools, and its p99
+is 3× the steady figure. Run 3 lands on what the previous session measured
+(webhook p99 51 ms, SSE 88 ms), so the no-loss commit path costs nothing
+measurable at this rate — and run 4 says the same about the transactional
+batch: **1,003.0 ev/s, 30,000/30,000 ok, identical receipt counts
+(99,283 webhook + 46,635 SSE)**, with webhook p99 at 59 ms against a 52–94 ms
+spread across runs 1–3 and SSE p99 marginally better than before. The
+rate-limited row is byte-identical every time because those subscriptions are
+bounded by their own `rate_limit_per_s`, not by delivery speed.
+
+Across all four runs the oracle agrees identically:
+`expected=145918 missing=0 unexpected=0 duplicates=0` over all 40
+subscriptions.
 
 N3 (p99 < 1 s, target a few hundred ms) is met with margin on both channels.
 Rate-limited webhook subscriptions (`rate_limit_per_s=50`) show minutes of

@@ -114,21 +114,17 @@ From §16, minus what the spike answered:
 - **Backlog limit per subscription** — without one storage grows unbounded
   during outages; with one, `dropped` appears and conflicts with guaranteed
   delivery. Unresolved product decision.
-- **A 500 from publish-api does not mean the batch was rejected** — found by
-  the `kafka` chaos run. `ProduceSync` writes the whole request before
-  `publish-api` inspects the results, and the handler returns 500 on the first
-  failing record (after `cmd/publish-api/main.go:243`), so the other ~99 events
-  of that request are already in the log and get delivered while the client —
-  correctly, by HTTP semantics — discards all 100. Measured: 20 produce errors,
-  20 HTTP 500s, **1,000 events reported failed, 533 of those references seen
-  at the receiver**. Not loss, but the reply is untruthful about *which*
-  events, and F19 explicitly invites a retry on 5xx, which would duplicate the
-  99 that already landed. Three ways out, in increasing order of work: say so
-  (document that 5xx means *outcome unknown, inspect before retrying*); return
-  the accepted `event_ref`s alongside the error so a retry can be narrowed to
-  what genuinely failed; or put the batch in a Kafka transaction so 500 really
-  does mean all-or-nothing (the router already does this with
-  `kgo.NewGroupTransactSession`, so the pattern exists in the codebase).
+- **franz-go's `ErrFirstReadEOF` is classified as a fatal producer-ID error**
+  — upstream, and the reason publish-api replaces its transactional client when
+  `BeginTransaction` fails (full write-up in the chaos section). The library's
+  own comment says it means to treat "a transient network error … from a broker
+  restart" as retryable, but the predicate for that is `isAnyDialErr`, which
+  only matches a *dial*-phase `*net.OpError` — and this EOF happens after a
+  successful dial, during ApiVersions. Until that is fixed upstream, the
+  workaround is load-bearing and any upgrade should be checked against it: the
+  latch is timing-dependent, so it looks like an unrelated flake when it fires,
+  and it hits `NewGroupTransactSession` users too (the router escaped by luck
+  in the run we measured).
 - **Commit-watermark scan is O(backlog)** — found while re-measuring the load
   test, not observed as latency. `offsetgate.advance` walks the whole `pending`
   map to find the lowest offset, and `prune` walks `epochs`, so one `Settle`
@@ -200,7 +196,14 @@ From §16, minus what the spike answered:
   every other producer of delivery records.
 - **Publisher idempotency** — publishes are not deduplicated by design;
   whether publishers get an optional `Idempotency-Key` is undecided. (Max
-  event size *is* handled: `MAX_EVENT_BYTES`, default 1 MiB.)
+  event size *is* handled: `MAX_EVENT_BYTES`, default 1 MiB.) It is now also
+  the only answer left to two ambiguities the platform cannot remove: a
+  **client timeout** on a publish (the server may have finished after the
+  client gave up) and a **lost commit acknowledgement**. Batches are
+  transactional since the chaos run, so a 500 means nothing was written and
+  partial batches are gone — but those two remain whole-request uncertainty
+  that no server-side protocol removes for a caller who cannot retry blindly
+  without risking duplicates.
 - **AuthN/Z end state** — JWT claim names, IdP setup, owner-based routing
   restrictions (§6.7). HS256 stands in.
 - **Per-target-host/tenant rate limits** — explicitly out of scope for v1
@@ -389,22 +392,37 @@ parked-but-durable deliveries as missing.
 
 | Scenario | fault | missing | unexpected | duplicates |
 | --- | --- | --- | --- | --- |
-| `pods` | `kill -9` one dispatcher, one router, one gateway | **0** | 0 | 5,732 |
+| `pods` | `kill -9` one dispatcher, one router, one gateway | **0** | 0 | 7,293 |
 | `pg` | receiver offline **and** PostgreSQL down, 20 s overlap | **0** | 0 | 0 |
 | `ch` | ClickHouse down 20 s | **0** | 0 | 0 |
-| `kafka` | broker restart mid-run | **0** | 5,185 | 2,385 |
+| `kafka` | broker restart mid-run | **0** | 0 | 2,746 |
 
-**`missing=0` in all four** — the number this whole exercise exists for.
+**`missing=0` and `unexpected=0` in all four** — the two numbers this whole
+exercise exists for.
+
+All four rows are from one pass against the current code (owners `pods020953`,
+`pg021223`, `ch022133`, `kafka022326`), re-run after publish-api went
+transactional so the table would not mix binaries. The `kafka` row's
+`expected` is lower than the others (52,536 vs 58,366) because 1,200 events
+were *correctly* not written while the broker was restarting — see the
+`unexpected` discussion below, which is where that number used to go wrong.
+
+Earlier `kafka` rows in this document reported `unexpected=5,185`. That was
+publish-api's partial batch, fixed in the same round of work; the run is kept
+below because it is the measurement the fix was made against.
 
 ### What the duplicates are, precisely
 
-In `pods`, the 5,732 duplicates land on **partitions 8, 9, 10 and 11 and
-nowhere else** — which is exactly the four partitions the killed dispatcher
-owned, verified against `kafka-consumer-groups.sh --describe` before the kill.
-Partitions owned by the two survivors show zero duplicates. Run twice, same
-picture. The `pg` and `ch` runs — where only a *store* died and no member
-left the group — show exactly zero; the `kafka` run, where a broker restart
-forces a rejoin, shows the same replay effect (2,385).
+Duplicate volume varies with the run — three runs of `pods` produced 7,698,
+5,732 and 7,293 — because it tracks how far behind the killed partition's
+watermark was, not how big the crash was. Where they *land* does not vary. On
+two runs the sub→partition map was taken from the topic itself and the
+duplicates sat on **partitions 8, 9, 10 and 11 and nowhere else**, which is
+exactly the four partitions the killed dispatcher owned (checked against
+`kafka-consumer-groups.sh --describe` before the kill); partitions owned by
+the two survivors showed zero. The `pg` and `ch` runs — where only a *store*
+died and no member left the group — show exactly zero; the `kafka` run, where
+a broker restart forces a rejoin, shows the same replay effect.
 
 The mechanism, confirmed end to end rather than assumed:
 
@@ -421,37 +439,89 @@ The mechanism, confirmed end to end rather than assumed:
   an interval, so the kill loses up to one flush interval of committed
   progress — plus, on partition 11, everything the two `rate_limit_per_s=50`
   subscriptions had caused to sit below the watermark. That is why one
-  partition carries ~2,200 duplicates while its neighbours carry ~225: the
-  watermark is per partition, and a slow subscription holds *its whole
-  partition* back. Duplicate volume therefore tracks "how far behind was that
-  partition", not "how big was the crash".
+  partition carried ~2,200 duplicates while its neighbours carried ~225.
 
 This is fix 1 from the previous section working as designed: the alternative
-to these 5,732 duplicates was dropping them. The webhook receiver is where
-replay shows up at all — the SSE client deduplicates by event reference
-(§8) before writing, so its file reports 0 by construction and proves nothing
-about what the gateway sent.
+to these duplicates was dropping them. The webhook receiver is where replay
+shows up at all — the SSE client deduplicates by event reference (§8) before
+writing, so its file reports 0 by construction and proves nothing about what
+the gateway sent.
 
-### `kafka`: `missing=0` but `unexpected=5,185`
+### publish-api batches are now transactional (was `unexpected=5,185`)
 
-The only non-clean row, and the fault is publish-api's, not the pipeline's.
-The publisher reported `sent=12000 ok=10900 failed=1100 (5xx=1000
-timeouts=100)` — yet 533 event references that the client recorded as failed
-turn up at the receiver, and they account for the whole `unexpected` count.
+The only non-clean row of the first pass, and the fault was publish-api's, not
+the pipeline's. The publisher reported `sent=12000 ok=10900 failed=1100
+(5xx=1000 timeouts=100)` — yet 533 event references it recorded as failed
+turned up at the receiver, accounting for the whole `unexpected=5,185`.
 
-The mechanism is visible in publish-api's own log for exactly those requests:
-**20 record-level produce errors, 20 HTTP 500s, and 1,000 events reported
-failed** — i.e. ~10 failed requests of 100 events each, with ~1 produce error
-per request. `ProduceSync` produces the whole batch and returns a result per
-record; `publish-api` then returns 500 on the *first* error it sees (after
-line 243), so the other ~99 records of that request are already in the log.
-The client, correctly by HTTP semantics, discards all 100.
+Mechanism: `ProduceSync` writes the whole request before the handler inspects
+the results, and the handler returned 500 on the *first* record that errored
+(after `cmd/publish-api/main.go:243`), so the other ~99 records of that request
+were already in the log while the client — correctly, by HTTP semantics —
+discarded all 100. 20 produce errors, 20 HTTP 500s, 1,000 events reported
+failed.
 
-So the platform delivered events the publisher was told failed. Nothing is
-lost — it is the mirror image of the bug class we spent this whole exercise
-on — but the 500 is a lie about *which* events, and a caller that retries the
-batch on 500 (F19 explicitly allows republishing) will duplicate the 99 that
-already landed. Open point, below.
+Decision: make a batch all-or-nothing. `publishAPI.write` sends a single record
+down the plain path — one record is atomic, there is nothing partial about it,
+so the usual case pays for nothing — and a multi-record request inside one Kafka
+transaction, with the handler's reply finally able to mean what it says.
+
+The same scenario against the fix: **1,200 events reported failed, 12 HTTP 500s
+(11 of them the latch described next), `unexpected=0`** — every failed request
+wrote nothing — with `ok=10,800` against `10,900` before, i.e. the same number
+of successes. The load test re-run says the same about cost: **1,003.0 ev/s,
+30,000/30,000 ok, p99 59 ms webhook / 90 ms SSE** against 52/92 ms before,
+inside the 52–94 ms spread already measured across three baseline runs.
+
+Two things it deliberately does not fix, and one cost worth knowing:
+
+- A **client timeout** and a **lost commit acknowledgement** are whole-batch
+  ambiguity, not partial writes — they exist for a single event too and only
+  publisher idempotency (open point) resolves them. Hence the reply wording:
+  "no event of this request was written" when that is known, "the outcome could
+  not be confirmed" when it is not.
+- **Batches are serialised** through one mutex, because a producer has exactly
+  one transaction in flight and `BeginTransaction` must not run concurrently
+  with the client's other work. That caps batch throughput at 1/txn-duration;
+  at 10 batches/s of 100 events it is nowhere near a constraint, but it is the
+  number to revisit if the batch rate ever rises by orders of magnitude. The
+  serialisation is also why single-record publishes get their own client: they
+  are never queued behind a transaction.
+
+### franz-go latches a restart into a permanent producer-ID failure
+
+Found while verifying the transaction above, and it nearly made the fix worse
+than the bug.
+
+`BeginTransaction` runs `maybeRecoverProducerID`, which classifies a stored
+producer-ID error as either retryable or fatal. An `ErrFirstReadEOF` — a
+connection that dies *after* the dial, during ApiVersions, which is exactly
+what a broker restart produces — unwraps to `io.EOF`, so it is neither a
+`*net.OpError` with `Op=="dial"` (`isAnyDialErr`) nor a broker SQLSTATE
+(`isRetryableBrokerErr`), and lands on `return true, false, err`: **fatal,
+unrecoverable**. Nothing in the library clears it, and `BeginTransaction` then
+fails in 0.5 ms, forever.
+
+Measured: after one broker restart, **99 latched calls and 9,900 of 12,000
+requests failed** for the rest of the run, while the plain single-record client
+— which never enters this path — was unaffected. The library's own comment says
+it intends to catch "a transient network error … from a broker restart", so
+intent and predicate disagree; it is an upstream issue, not ours.
+
+The workaround is load-bearing: on a failed `BeginTransaction`, publish-api
+closes the client and opens a fresh one (only a new client re-runs
+`InitProducerID`), then retries the begin so the request that *detects* the
+latch usually succeeds instead of being sacrificed to it. A replacement that
+cannot be opened leaves the client nil, and "no client" is retried rather than
+becoming a permanent state — otherwise an outage would kill the batch path just
+as effectively as the latch does. Re-run after the fix: **11 latched calls, all
+inside the outage window, 1,200 failures total** instead of 9,900.
+
+Pinning this down matters for anyone else reaching for franz-go transactions:
+the `router` uses the same machinery through `kgo.NewGroupTransactSession` and
+came through this run unscathed, so the latch is timing-dependent rather than
+certain — which is the worst kind, because it looks like an unrelated flake
+when it fires.
 
 ### Readiness, observed rather than asserted
 
@@ -469,7 +539,12 @@ already landed. Open point, below.
   retries drained` once the store returned, then the inbox drained to 0 rows
   and the oracle read `expected=58366 received=58366 missing=0`.
 
-### Two bugs the chaos runs found (both fixed)
+### Bugs this round found (all fixed)
+
+Two came out of the scenarios, one out of starting the topology for them, and
+two more out of verifying the first fix — the last two have their own
+subsections above (the transactional batch, and the franz-go latch that nearly
+made it worse).
 
 1. **Status records stamped the wrong source position** — `emitStatus` wrote
    `it.seq` (the delivery's position on the *deliveries* topic) into
@@ -486,6 +561,21 @@ already landed. Open point, below.
    during the PostgreSQL outage read as `missing` while sitting in the inbox.
    That is exactly the run that had to prove the opposite. Now any status
    except `filtered` counts as accounted.
+3. **A replica could exit on start-up over a schema that was already correct** —
+   `EnsureInboxPartitions` creates each day's partition with
+   `CREATE TABLE IF NOT EXISTS ... PARTITION OF`, and that `IF NOT EXISTS` is
+   **not atomic for partitions**: six concurrent creators of one fresh
+   partition produced five `CREATE TABLE` and one
+   `ERROR: relation "…" already exists (SQLSTATE 42P07)`. The dispatcher
+   treated the loser's error as fatal and exited — so a rolling update could
+   shed a pod over a schema that, by then, was already correct. It bit during
+   this session: `d1` died at start with `inbox_p20261108`, because that date
+   was new (the previous day's run had only needed dates up to 11-07). The
+   race is therefore a *first-deploy or day-rollover* event, which is exactly
+   when every replica is starting at once. `42P07` now counts as success —
+   it is the state `IF NOT EXISTS` asked for — and
+   `TestEnsureInboxPartitionsIsSafeConcurrently` runs 16 creators over one
+   fresh day: it fails on 4 of 16 without the fix, passes with it.
 
 ### What the harness itself got wrong (worth repeating)
 

@@ -142,6 +142,20 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   moment later). The subscription *count* is deliberately not reported — it
   would be a candidate count that ignores CEL filters and would read like a
   delivery forecast.
+- **A batch is written as one Kafka transaction.** Validation already
+  rejected the whole request before anything was produced (422 ⇒ nothing
+  written); a *produce* failure is now the same, so a 500 on a multi-record
+  request means **no event of that request was written** and a retry is safe.
+  A single record stays on the plain path — one record is atomic by itself and
+  would buy nothing from a transaction — which is also why batches have their
+  own client (a transactional client refuses every produce made outside a
+  transaction) and are serialised through one lock (a producer has one
+  transaction in flight). The reply only claims "nothing was written" when that
+  is known, and says so plainly as "the outcome could not be confirmed" when a
+  commit or a rollback could not be confirmed; client timeouts are the same
+  whole-request uncertainty and are left to publisher idempotency. Details,
+  plus the franz-go latch that had to be worked around for this to survive a
+  broker restart: docs/deviations-and-open-points.md.
 - `GET /healthz` (liveness) and `GET /readyz` (readiness: PostgreSQL
   reachable and the registry index younger than `REGISTRY_STALE_AFTER`,
   30 s); no auth.
