@@ -7,10 +7,13 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// TestTimeoutsDefaults pins the numbers this codebase is actually measured
-// with. They are franz-go's defaults, which is the point of the exercise: they
-// were inherited until this, and the chaos runs measured what they cost (43 s
-// to hand a killed replica's partitions over, 3 s for a graceful SIGTERM).
+// TestTimeoutsDefaults pins the shipped numbers rather than the ones franz-go
+// ships. 45s/40s were inherited until the chaos runs measured what they cost
+// (46s for a killed replica's partitions to be handed over, against 3s for a
+// graceful SIGTERM) and the pair was deliberately lowered; see the constants.
+// The point of the test is that a value nobody chose cannot creep back in
+// silently - changing it here is a decision, and the rebalance scenario has to
+// be re-run when it changes.
 func TestTimeoutsDefaults(t *testing.T) {
 	t.Setenv("KAFKA_SESSION_TIMEOUT", "")
 	t.Setenv("KAFKA_TRANSACTION_TIMEOUT", "")
@@ -24,6 +27,13 @@ func TestTimeoutsDefaults(t *testing.T) {
 	}
 	if txn >= session {
 		t.Errorf("txn (%v) must be below session (%v)", txn, session)
+	}
+	// The pair has to stay below franz-go's own defaults for the change to be
+	// real: a "lowered" default that quietly equals the library's would mean
+	// nobody lowered anything.
+	if session >= 45*time.Second || txn >= 40*time.Second {
+		t.Errorf("session=%v txn=%v - both must be below franz-go's 45s/40s, "+
+			"or the measured handover (13s) no longer applies", session, txn)
 	}
 }
 

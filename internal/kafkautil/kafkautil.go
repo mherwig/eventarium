@@ -63,9 +63,28 @@ var Classes = []string{ClassLive, ClassShort, ClassDay, ClassWeek}
 // codebase has actually been measured with - changing either means re-running
 // the rebalance scenario, not just editing a comment.
 const (
-	DefaultSessionTimeout     = 45 * time.Second // franz-go's own default
-	DefaultTransactionTimeout = 40 * time.Second // franz-go's own default, below the session
-	transactionHeadroom       = 5 * time.Second  // the gap the clamp keeps
+	// Both were franz-go's defaults (45s / 40s) until they were measured
+	// against this platform and deliberately lowered. The chaos scenario
+	// `rebalance` reports what each buys:
+	//
+	//	45s / 40s  handover 46s, 45s - the crash floor, unchanged since the start
+	//	15s / 10s  handover 13s        - oracle identical, abort count identical
+	//
+	// 13s instead of 46s for a third of the partitions to resume after an
+	// ungraceful death, with the oracle still reporting missing=0,
+	// unexpected=0 and received==expected. The transaction half had to fall
+	// too: it must stay below the session, and a transaction that outlives its
+	// budget is dropped by the broker and re-consumed - duplicates, never
+	// loss, which is the failure mode this platform already accepts. Measured
+	// at 1,000 ev/s as well (the router writes every batch transactionally) to
+	// confirm 10s holds under the rate the spike actually runs at.
+	//
+	// Both remain environment-tunable, so the conservative pair is one
+	// KAFKA_SESSION_TIMEOUT away if a deployment would rather keep the
+	// longer floor.
+	DefaultSessionTimeout     = 15 * time.Second
+	DefaultTransactionTimeout = 10 * time.Second
+	transactionHeadroom       = 5 * time.Second // the gap the clamp keeps
 )
 
 // Timeouts returns the session and transaction timeouts as a pair, honouring

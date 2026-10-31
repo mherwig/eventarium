@@ -207,6 +207,11 @@ func (kgoLogger) Log(l kgo.LogLevel, msg string, keyvals ...any) {
 // non-zero exit so the pod is restarted with a fresh session.
 func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router) error {
 	slog.Info("router: ready", "group", group)
+	// Read once for the abort diagnosis below: franz-go returns
+	// (committed=false, nil) for every abort and its own reason is logged at a
+	// level kgoLogger filters out at INFO, so the only way to tell a timeout
+	// from a revoke after the fact is how long the transaction lived.
+	_, txnTimeout := kafkautil.Timeouts()
 	backoff := errorBackoff
 	for ctx.Err() == nil {
 		fetches := sess.PollRecords(ctx, pollBatch)
@@ -246,6 +251,9 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 			backoff = nextBackoff(backoff)
 			continue
 		}
+		// The transaction is open from here; an abort reports how long it
+		// lasted so a timeout can be told from a revoke (see below).
+		begun := time.Now()
 		// One transaction covers the delivery records, their pending
 		// status records and the offset commit: End(TryCommit) flushes
 		// everything atomically (section 9).
@@ -273,6 +281,7 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 			return fmt.Errorf("router: committing transaction: %w", err)
 		}
 		if !committed {
+			elapsed := time.Since(begun)
 			// End aborts without an error when the group rebalanced
 			// or the offset commit was rejected. Observed live: the
 			// first transaction of every router pod on a cold
@@ -288,7 +297,15 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 			// spinning. Downstream consumers do not see the aborted
 			// copy at all (kafkautil.NewClient is read_committed).
 			slog.Warn("router: transaction aborted, batch will be re-consumed",
-				"records", len(out), "backoff", backoff)
+				"records", len(out),
+				"elapsed", elapsed.Round(time.Millisecond),
+				// The distinction that matters when tuning
+				// KAFKA_TRANSACTION_TIMEOUT: past it the broker dropped the
+				// transaction, which is what the value buys and costs; short
+				// of it, a revoke or a rejected offset commit did.
+				"past_txn_timeout", elapsed >= txnTimeout,
+				"txn_timeout", txnTimeout,
+				"backoff", backoff)
 			if !sleep(ctx, backoff) {
 				return nil
 			}
