@@ -101,11 +101,16 @@ done
 # the driver would have been incapable of failing. scenarios call judged(),
 # which ORs the oracle's verdict into this.
 FAIL=0
-# judged settles the status store, then asks the oracle. The settle comes first
-# because the oracle reads ClickHouse through the Status API, and a verdict
-# taken while status-writer is still catching up would report in-flight rows as
-# lost - or, worse, pass a run whose rows are still sitting in Kafka.
+# judged settles the status store, then asks the oracle. Membership comes
+# first because it is the cause of the other two: a writer that has left its
+# group cannot settle, and cannot be told apart from one that is merely busy -
+# so asking it first keeps a wedged writer from costing a settle timeout before
+# it is named. The settle comes before the oracle because the oracle reads
+# ClickHouse through the Status API, and a verdict taken while status-writer is
+# still catching up would report in-flight rows as lost - or, worse, pass a run
+# whose rows are still sitting in Kafka.
 judged() {
+  status_writer_in_group 30 || FAIL=1
   status_settled 60 || FAIL=1
   verify || FAIL=1
 }
@@ -281,8 +286,9 @@ handover_complete() {
 # only ever superseded by a newer record for the same key, so a dead node's
 # entries outlived it).
 presence_rows() {
-  "$DOCKER" exec pubsub-postgres-1 psql -U pubsub -d pubsub -tAc \
-    "SELECT count(*) FROM sse_presence WHERE node_id = '$1'" 2>/dev/null
+  docker_value "presence rows of $1" \
+    "$DOCKER" exec pubsub-postgres-1 psql -U pubsub -d pubsub -tAc \
+    "SELECT count(*) FROM sse_presence WHERE node_id = '$1'"
 }
 
 # visible_subs <port> reads one gateway's /healthz "presence": the number of
@@ -293,6 +299,33 @@ presence_rows() {
 visible_subs() {
   curl -s --max-time 3 "http://localhost:$1/healthz" 2>/dev/null \
     | grep -o '"presence":[0-9]*' | cut -d: -f2
+}
+
+# docker_value <label> <command...> runs one docker command and returns its
+# stdout, retrying.
+#
+# A docker exec that fails under load prints nothing and exits non-zero, and an
+# empty answer is not a measurement. Reading it as one is the same class of bug
+# as the unquoted $DOCKER that once made every `docker compose stop` exit 127
+# into /dev/null while the first `pg` run reported success with PostgreSQL
+# never stopped - this time failing the other way, on a run that had actually
+# passed: presence_rows returned nothing and the assertion read "no answer" as
+# "measured zero". Every assertion here is fed by one of these answers, so each
+# is retried and a caller that still gets nothing has to say so rather than
+# report a number it never obtained. DW_TRIES exists so the helper's own tests
+# do not have to wait out the real retry budget.
+docker_value() { # $1 = label, $2.. = command
+  local label=$1 out try
+  shift
+  for try in $(seq 1 "${DW_TRIES:-5}"); do
+    if out=$("$@" 2>/dev/null) && [ -n "$out" ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "  could not read: $label (docker exec failed ${DW_TRIES:-5} times)" >&2
+  return 1
 }
 
 # visible_nodes <port> prints the nodes a gateway currently routes to, from
@@ -366,6 +399,52 @@ status_writer_commit_trouble() {
   echo "${n:-0}"
 }
 
+# status_writer_in_group waits until status-writer is a member of its own
+# consumer group, and fails if it never is.
+#
+# This is the regression guard for the bug these runs found, and lag cannot
+# stand in for it: a writer that has lost its membership keeps inserting from
+# its stale assignment, so the store fills in and every row-level check stays
+# green while the committed offset stops moving forever. That is why
+# status_settled treats lag as uninterpretable after commit trouble - and
+# precisely why something has to assert membership separately, or the
+# exemption would hide the very failure it was written to describe.
+#
+# The failure it guards against: BlockRebalanceOnPoll holds rebalance
+# callbacks until the application calls AllowRebalance, and this loop never
+# stopped polling. After a broker restart the coordinator evicted the member,
+# kgo could not rejoin through the gate it was holding itself, and every
+# commit failed with UNKNOWN_MEMBER_ID for the rest of the process's life -
+# 28 dropped-offset batches and 22 minutes in the run that found it, with
+# lag climbing to 1.8M and unrecorded=0 the whole way.
+status_writer_in_group() {
+  local want=${1:-30} t0 now
+  t0=$(date +%s)
+  while :; do
+    local out
+    if out=$(docker_value "status-writer group state" \
+        "$DOCKER" exec pubsub-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
+        --bootstrap-server localhost:9092 --describe --group status-writer); then
+      # stderr matters here: kafka-consumer-groups.sh writes the "no active
+      # members" notice there, and reading stdout alone reports a wedged
+      # writer as a healthy one.
+      if ! printf '%s\n' "$out" | grep -q "has no active members"; then
+        echo "  status-writer is a member of its consumer group"
+        return 0
+      fi
+    fi
+    now=$(( $(date +%s) - t0 ))
+    if [ "$now" -ge "$want" ]; then
+      echo "  STATUS-WRITER LEFT ITS GROUP: no member after ${now}s" >&2
+      echo "    it keeps inserting, so every row-level check stays green, but it" >&2
+      echo "    can never commit again: lag grows without bound and a restart" >&2
+      echo "    re-consumes everything it has inserted since" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 # status_settled waits until status-writer has caught up on delivery-status,
 # then says so; exits non-zero only if it fails to catch up in <seconds> *and*
 # the lag still means what lag usually means.
@@ -395,7 +474,11 @@ status_settled() {
   local want=${1:-60} t0 now lag
   t0=$(date +%s)
   while :; do
-    lag=$(status_lag)
+    if ! lag=$(status_lag); then
+      echo "  cannot read status-writer's lag, which is not the same as lag 0:" >&2
+      echo "    a run cannot be judged on a number it never obtained" >&2
+      return 1
+    fi
     if [ "$lag" = "0" ]; then
       echo "  status-writer caught up: delivery-status lag=0"
       return 0
@@ -519,9 +602,14 @@ park_base() { grep -h 'parking recovered' "$LOG"/d*.log 2>/dev/null | wc -l; }
 # status_lag sums status-writer's lag on delivery-status: how many status
 # records have been produced but not yet inserted into ClickHouse.
 status_lag() {
-  "$DOCKER" exec pubsub-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
-    --bootstrap-server localhost:9092 --describe --group status-writer 2>/dev/null \
-    | lag_total
+  local out
+  # Not piped straight into lag_total: a describe that failed would reach it
+  # as no input, and lag_total answers 0 for no input - which would report a
+  # wedged broker as a caught-up writer.
+  out=$(docker_value "status-writer lag" \
+    "$DOCKER" exec pubsub-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server localhost:9092 --describe --group status-writer) || return 1
+  printf '%s\n' "$out" | lag_total
 }
 
 # inflight is the worst currently-reported value across the dispatcher
@@ -841,8 +929,12 @@ pods)
   # falling proves the lease - not the deletion - is what stops deliveries
   # being aimed at a connection nobody owns.
   NODEB_ROWS=$(presence_rows node-b)
-  echo "  presence rows still claiming node-b: ${NODEB_ROWS} (kill -9 wrote no disconnect)"
-  if [ -z "$VIS_BEFORE" ]; then
+  echo "  presence rows still claiming node-b: ${NODEB_ROWS:-?} (kill -9 wrote no disconnect)"
+  if [ -z "$NODEB_ROWS" ]; then
+    echo "  could not count node-b's presence rows - the query failed, which is not" >&2
+    echo "    the same as zero: a run must not be judged on an answer it never got" >&2
+    FAIL=1
+  elif [ -z "$VIS_BEFORE" ]; then
     echo "  SETUP FAILED: could not read presence from :8082 before the kill" >&2
     FAIL=1
   elif [ "${NODEB_ROWS:-0}" -le 0 ]; then
@@ -1047,8 +1139,12 @@ gwfail)
   # the number of routable subscriptions never dips - which is exactly why
   # the node list, not the count, is what gets asserted.
   NODEB_ROWS=$(presence_rows node-b)
-  echo "  presence rows still claiming node-b: ${NODEB_ROWS} (kill -9 wrote no disconnect)"
-  if [ "${NODEB_ROWS:-0}" -le 0 ]; then
+  echo "  presence rows still claiming node-b: ${NODEB_ROWS:-?} (kill -9 wrote no disconnect)"
+  if [ -z "$NODEB_ROWS" ]; then
+    echo "  could not count node-b's presence rows - the query failed, which is not" >&2
+    echo "    the same as zero: a run must not be judged on an answer it never got" >&2
+    FAIL=1
+  elif [ "$NODEB_ROWS" -le 0 ]; then
     echo "  presence rows for node-b = ${NODEB_ROWS}, want > 0: nothing left to prove visibility from" >&2
     FAIL=1
   fi

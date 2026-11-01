@@ -28,7 +28,7 @@ extract() { # function name
   sed -n "/^$1()/,/^}/p" "$HERE/chaos.sh"
 }
 # shellcheck disable=SC1090
-source <(extract session_seconds; extract unowned_count; extract partition_count; extract handover_complete; extract is_harness_recv; extract lag_total; extract status_writer_commit_trouble)
+source <(extract session_seconds; extract unowned_count; extract partition_count; extract handover_complete; extract is_harness_recv; extract lag_total; extract status_writer_commit_trouble; extract docker_value)
 
 echo "session_seconds"
 t_session() { # env-value want
@@ -165,5 +165,30 @@ time=2 level=ERROR msg="status-writer: dropping offsets after repeated commit fa
 time=3 level=ERROR msg="status-writer: flush failed" err="committing offsets: UNKNOWN_MEMBER_ID."' 3 \
   "failures and dropped offsets both count"
 
+echo "docker_value"
+# The rule it encodes is worth pinning because breaking it already cost a run:
+# an empty answer is a failure to measure, never a measurement. presence_rows
+# returned nothing once, under docker load, and the assertion read "no answer"
+# as "measured zero" - failing a run that had actually passed. That is the
+# quieter half of the bug this driver's own header warns about, where an error
+# swallowed into /dev/null reports success instead.
+if got=$(docker_value "a command that works" echo hello) && [ "$got" = "hello" ]; then
+  pass "returns the command's stdout"
+else
+  fail_case "a working command returned [$got]"
+fi
+DW_TRIES=1
+if got=$(docker_value "a command that fails" false); then
+  fail_case "a command that fails returned [$got] and exit 0, want exit 1"
+else
+  pass "a command that fails is a failure, not an empty answer"
+fi
+if got=$(docker_value "an empty answer" true); then
+  fail_case "an empty answer returned [$got] and exit 0, want exit 1"
+else
+  pass "an empty answer is retried, then reported as a failure"
+fi
+unset DW_TRIES
 
+[ "$fail" = "0" ] || { echo "chaos helper tests FAILED" >&2; exit 1; }
 echo "all chaos helper tests passed"

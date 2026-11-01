@@ -103,7 +103,7 @@ make chaos-test       # the driver's own tests, no stack needed
 Results, including the full duplicate analysis, are in
 [Performance](performance.md#resilience-under-injected-faults).
 
-Four properties in the driver are load-bearing, and each one exists because
+Five properties in the driver are load-bearing, and each one exists because
 getting it wrong produced a result that looked fine:
 
 - **Faults are asserted, not assumed.** An unquoted `$DOCKER` word-split once
@@ -144,6 +144,15 @@ getting it wrong produced a result that looked fine:
   (100%)**, so the scenario whose status rows were actually at risk is judged
   in full. `pg` covers 21%, where it is belt-and-braces — its fault is
   PostgreSQL and the receiver, and ClickHouse is up throughout.
+- **Membership is asserted separately, because lag cannot see it.** A
+  `status-writer` that has lost its consumer-group membership keeps inserting
+  from its stale assignment, so every row-level check stays green while the
+  committed offset stops moving for the rest of the process's life. That is
+  exactly the bug these runs found — and exactly what `status_settled` now
+  declines to interpret lag as, so without this assertion the exemption
+  written for it would have hidden the failure it describes. `judged()` asks
+  for membership first: it is the cause of the other two, and it fails in 30 s
+  instead of costing a settle timeout before the writer is named.
 
 `rebalance` is the one that asserts a number rather than a verdict: it polls
 the group's assignment until every partition is owned by a live member, and
