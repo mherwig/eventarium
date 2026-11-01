@@ -325,6 +325,28 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 
 - Consumer group `status-writer` over `delivery-status`, batch inserts into
   ClickHouse (`internal/chstore`), every 1 s or 10k rows.
+- An offset is committed **after** the insert succeeded, never before, so lag
+  0 means every produced row has reached the store. The converse is not
+  promised: a commit that keeps failing with `UNKNOWN_MEMBER_ID` is dropped
+  after `maxCommitFailures` and those records are re-consumed (at-least-once,
+  the table is append-only). That is why lag alone is not a completeness
+  signal and the oracle checks rows instead.
+- It does **not** set `BlockRebalanceOnPoll`, and that is a decision rather
+  than an oversight. That option gates rebalance callbacks on the application
+  calling `AllowRebalance`, and this consumer could never satisfy it: polling
+  runs in its own goroutine, so the gate was re-taken microseconds after it
+  was handed back and a rebalance had nowhere to run. After a broker restart
+  the evicted member could not rejoin, so every commit failed with
+  `UNKNOWN_MEMBER_ID` for the life of the process — the inserts kept working
+  off the stale assignment, so the store stayed correct and every row-level
+  check stayed green while lag grew without bound, and a restart would have
+  re-consumed the entire gap. What the option protects here is a commit that
+  races a revoke, which the broker rejects anyway: the offsets are dropped
+  after `maxCommitFailures` and the records are re-consumed into an
+  append-only table. That is the trade this writer already makes, and it is
+  cheaper than a member that can never come back. The `kafka` chaos scenario
+  is the regression test, and `status_settled` alone would not have caught it —
+  which is why the driver asserts membership separately.
 - `GET /healthz` (liveness) and `GET /readyz` (readiness: ClickHouse reachable,
   table created) are the status-writer's only endpoints; no auth.
 

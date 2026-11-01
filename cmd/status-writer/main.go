@@ -85,10 +85,24 @@ func main() {
 
 	// Auto-commit is off: offsets are committed by the flusher, after the
 	// insert, and only then.
+	//
+	// No BlockRebalanceOnPoll, and that is deliberate. It gates rebalance
+	// callbacks on the application calling AllowRebalance, which this loop
+	// could never do reliably: polling runs in its own goroutine that would
+	// re-take the gate microseconds after it was handed back, so a rebalance
+	// had nowhere to run. The cost was not theoretical. After a broker
+	// restart the coordinator evicted the member, kgo could not rejoin, and
+	// every commit failed with UNKNOWN_MEMBER_ID for the rest of the
+	// process's life while the inserts kept working off the stale assignment -
+	// lag grew without bound and a restart would have re-consumed the whole
+	// gap. Every other consumer in this repo runs without the option, and
+	// what it protects here is not worth that: a commit that races a revoke
+	// is rejected by the broker, the offsets are dropped after
+	// maxCommitFailures, and those records are re-consumed - at-least-once,
+	// into an append-only table, which is the trade this writer already makes.
 	cl, err := kafkautil.NewClient(
 		kgo.ConsumerGroup(consumerGroup),
 		kgo.ConsumeTopics(kafkautil.TopicStatus),
-		kgo.BlockRebalanceOnPoll(),
 		kgo.DisableAutoCommit(),
 	)
 	if err != nil {
@@ -111,17 +125,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The poll loop has stopped, and this client is the only one in the repo
-	// that sets BlockRebalanceOnPoll. On a cancelled context kgo's
-	// PollRecords adds itself to the poller count and returns an error fetch
-	// *without releasing it again*, so the count never reaches zero - and
-	// Close() waits for exactly that before leaving the group. Without this
-	// call the deferred cl.Close() below parks forever: SIGTERM logs
-	// "stopped" and the process then has to be SIGKILLed by the orchestrator
-	// (observed: still alive after 20 s, stack parked in
-	// waitAndAddRebalanceSilent). AllowRebalance resets the count, and the
-	// claim it makes - "all pollers are done" - is true right here.
-	cl.AllowRebalance()
 }
 
 // entry is one parsed record plus the Kafka record it came from, so that the
@@ -195,6 +198,7 @@ func (w *writer) run(ctx context.Context) error {
 			}
 			attempt()
 		}
+
 	}
 }
 
