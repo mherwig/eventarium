@@ -1,0 +1,48 @@
+{{/*
+Disruption budgets for the stores.
+
+Why minAvailable and not maxUnavailable: these are quorums, not web servers.
+Kafka needs two of three voters to elect, ClickHouse Keeper needs two of three
+to agree, and a PostgreSQL majority needs two of three to promote - so the
+thing a drain must never do is take a third node down at once. minAvailable
+states the survivable floor directly; maxUnavailable would say the same thing
+for a fixed three but says nothing useful if the count changes.
+
+Skipped for a single replica, where a budget of one would block every drain
+and protect nothing: a one-replica store is already unprotected, and a PDB
+that cannot be satisfied only converts an upgrade into an outage.
+
+CNPG manages its own budget for PostgreSQL (spec.enablePDB), so there is
+deliberately no entry for it here.
+*/}}
+{{- if gt (int .Values.kafka.replicas) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pubsub-infra.kafkaService" . }}
+  labels:
+    {{- include "pubsub-infra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka
+spec:
+  minAvailable: {{ sub (int .Values.kafka.replicas) 1 }}
+  selector:
+    matchLabels:
+      {{- include "pubsub-infra.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kafka
+{{- end }}
+{{- if gt (int .Values.clickhouse.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pubsub-infra.clickhouseService" . }}
+  labels:
+    {{- include "pubsub-infra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clickhouse
+spec:
+  minAvailable: {{ sub (int .Values.clickhouse.replicas) 1 }}
+  selector:
+    matchLabels:
+      {{- include "pubsub-infra.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: clickhouse
+{{- end }}

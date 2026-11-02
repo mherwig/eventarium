@@ -25,7 +25,7 @@ records what is already decided in code and what each service must implement.
 | Variable | Default | Used by |
 | --- | --- | --- |
 | `KAFKA_BROKERS` | `localhost:9092,localhost:9094,localhost:9095` | everything |
-| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, router, dispatcher, sse-gateway, replay-api |
+| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, router, dispatcher, sse-gateway, replay-api. Primary only; replicas on 5433/5434 ([Operations](operations.md#postgresql-topology)). |
 | `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api, replay-api |
 | `JWT_SECRET` | `dev-secret` | every API service, harness |
 | `JWT_ISSUER` | `dev` | same |

@@ -1,6 +1,53 @@
 {{/*
-Kafka: one KRaft node that is broker and controller at once.
+Kafka: three KRaft nodes, each broker and controller at once.
+
+Replicas: three, because replication factor three is what the platform asks
+of every topic and a single broker cannot serve it - `admin all` fails with
+INVALID_REPLICATION_FACTOR (38) rather than quietly making one-replica topics.
+
+Two Services:
+
+  <name>-headless   per-pod DNS for the brokers themselves, with
+                    publishNotReadyAddresses so the names resolve before the
+                    pods are Ready (see the helper for why that matters)
+  <name>            the client seed address, ClusterIP, endpoints only for
+                    Ready pods - which is what a client wants
+
+Per-pod values (node id, advertised listener) are derived from the hostname in
+the command below. Kubernetes can substitute $(POD_NAME) into an env value, but
+KAFKA_NODE_ID has to be an integer and there is no downward-API field for the
+ordinal, so a shell does what template rendering cannot: helm knows the *list*
+of names, only the pod knows *which* one it is.
+
+Advertised is per-pod rather than the Service: the client is handed real
+broker addresses, so metadata tells it who owns which partition instead of
+sending every connection through kube-proxy. Clients still start at the
+ClusterIP, which hands them that metadata.
 */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pubsub-infra.kafkaHeadlessService" . }}
+  labels:
+    {{- include "pubsub-infra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka
+spec:
+  clusterIP: None
+  # Without this, no pod DNS until each pod is Ready - and no pod becomes
+  # Ready until the quorum forms over that DNS. It is a bootstrapping cycle,
+  # and this is the flag that breaks it.
+  publishNotReadyAddresses: true
+  ports:
+    - name: client
+      port: 9092
+      targetPort: client
+    - name: controller
+      port: 9093
+      targetPort: controller
+  selector:
+    {{- include "pubsub-infra.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -25,8 +72,14 @@ metadata:
     {{- include "pubsub-infra.labels" . | nindent 4 }}
     app.kubernetes.io/component: kafka
 spec:
-  serviceName: {{ include "pubsub-infra.kafkaService" . }}
-  replicas: 1
+  # The headless Service, so <pod>.<service> resolves per pod.
+  serviceName: {{ include "pubsub-infra.kafkaHeadlessService" . }}
+  replicas: {{ .Values.kafka.replicas }}
+  # Nodes are voters: taking them all down at once is a quorum loss, so only
+  # one at a time may be unavailable during an upgrade.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       {{- include "pubsub-infra.selectorLabels" . | nindent 6 }}
@@ -37,6 +90,8 @@ spec:
         {{- include "pubsub-infra.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: kafka
     spec:
+      affinity:
+        {{- include "pubsub-infra.spread" (dict "root" . "component" "kafka") | nindent 8 }}
       # The image runs as uid 1000 (appuser) and writes to the claim below;
       # fsGroup makes the fresh volume writable by it without a chown step.
       securityContext:
@@ -45,45 +100,51 @@ spec:
         - name: kafka
           image: "{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
           imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              ordinal="${HOSTNAME##*-}"
+              export KAFKA_NODE_ID="$ordinal"
+              # Same name the headless Service publishes for this pod. Helm
+              # cannot render it per pod - it does not know which ordinal this
+              # container is - and Kafka does not expand env inside its own
+              # value, so it is assembled here from $HOSTNAME.
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.{{ include "pubsub-infra.kafkaHeadlessService" . }}:9092"
+              exec /etc/kafka/docker/run
           ports:
             - name: client
               containerPort: 9092
             - name: controller
               containerPort: 9093
           env:
-            - name: KAFKA_NODE_ID
-              value: "1"
             - name: KAFKA_PROCESS_ROLES
               value: broker,controller
-            # Broker and controller are this same process, so the quorum
-            # address stays on the pod: pointing it at the service name above
-            # deadlocks. A Service only has endpoints once the pod is Ready,
-            # and the pod only becomes Ready once the broker has registered
-            # with the controller - which it cannot reach without an
-            # endpoint. Compose has no readiness gating, which is exactly
-            # why the identical config worked there.
+            # Every node is a voter, addressed over the headless Service. The
+            # IDs are the StatefulSet ordinals the command above assigns.
             - name: KAFKA_CONTROLLER_QUORUM_VOTERS
-              value: 1@localhost:9093
+              value: {{ range $i := until (int .Values.kafka.replicas) }}{{ if $i }},{{ end }}{{ $i }}@{{ include "pubsub-infra.kafkaService" $ }}-{{ $i }}.{{ include "pubsub-infra.kafkaHeadlessService" $ }}:9093{{ end }}
             - name: KAFKA_LISTENERS
               value: PLAINTEXT://:9092,CONTROLLER://:9093
-            # Advertised, not listened: every consumer is handed this name and
-            # dials it from its own pod, so it must be the service DNS name -
-            # "localhost" works in compose and fails in a cluster.
-            - name: KAFKA_ADVERTISED_LISTENERS
-              value: PLAINTEXT://{{ include "pubsub-infra.kafkaService" . }}:9092
             - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
               value: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
             - name: KAFKA_CONTROLLER_LISTENER_NAMES
               value: CONTROLLER
+            # Inter-broker replication rides the same listener the clients
+            # use, advertised as per-pod DNS - every pod resolves every other
+            # pod's headless name, so unlike compose there is no container
+            # versus host distinction to split into two listeners.
             - name: KAFKA_INTER_BROKER_LISTENER_NAME
               value: PLAINTEXT
-            # One broker: replication factors above 1 would never elect an ISR.
+            - name: KAFKA_DEFAULT_REPLICATION_FACTOR
+              value: {{ .Values.kafka.replicationFactor | quote }}
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: {{ .Values.kafka.minInsyncReplicas | quote }}
             - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-              value: "1"
+              value: {{ .Values.kafka.replicationFactor | quote }}
             - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-              value: "1"
+              value: {{ .Values.kafka.replicationFactor | quote }}
             - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-              value: "1"
+              value: {{ .Values.kafka.minInsyncReplicas | quote }}
             - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
               value: "0"
             # The admin job creates every topic with its own retention; the

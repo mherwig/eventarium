@@ -22,8 +22,19 @@ replicaCount: 3
 # at whatever else hosts the stores.
 config:
   KAFKA_BROKERS: "pubsub-infra-kafka:9092"
-  PG_DSN: "postgres://pubsub:pubsub@pubsub-infra-postgres:5432/pubsub?sslmode=disable"
+  # -rw is CloudNativePG's primary Service: the operator keeps its endpoints
+  # on whichever instance is currently primary and rewrites it on failover, so
+  # this address survives losing the node it happens to resolve to today.
+  # The bare cluster name (pubsub-infra-postgres) is not a Service - CNPG
+  # owns the naming - so do not "simplify" this back to it.
+  PG_DSN: "postgres://pubsub:pubsub@pubsub-infra-postgres-rw:5432/pubsub?sslmode=disable"
   CH_DSN: "clickhouse://pubsub:pubsub@pubsub-infra-clickhouse:9000/pubsub"
+  # Names the ClickHouse cluster in <remote_servers>. Set means the schema is
+  # created ON CLUSTER and delivery_status is ReplicatedMergeTree - three nodes
+  # all holding every row. Unset means a single node with plain MergeTree,
+  # which is what the local compose stack uses. internal/chstore decides from
+  # this one value, so both topologies run the same code.
+  CH_CLUSTER: "pubsub"
   JWT_SECRET: "dev-secret"
   JWT_ISSUER: "dev"
   JWT_AUDIENCE: "pubsub"

@@ -6,11 +6,21 @@ sidebar_position: 8
 
 ## Deploying to Kubernetes
 
+**Prerequisite — the CloudNativePG operator.** PostgreSQL is a CNPG `Cluster`
+resource, not a StatefulSet, so the operator has to be installed first or the
+release is rejected by a webhook that does not exist yet:
+
+```sh
+helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+helm install cnpg cloudnative-pg/cloudnative-pg --namespace cnpg-system --create-namespace
+```
+
 Two charts, installed in this order because the second one's hook provisions
 the platform against the first one's endpoints:
 
 ```sh
 docker build -t pubsub:dev .                  # or push it and set image.repository
+kind load docker-image pubsub:dev             # kind cannot see host-built images
 
 helm upgrade --install pubsub-infra charts/pubsub-infra
 kubectl rollout status statefulset/pubsub-infra-postgres   # wait for the stores
@@ -19,9 +29,21 @@ helm upgrade --install pubsub charts/pubsub
 helm test pubsub                              # reaches /healthz and /readyz in-cluster
 ```
 
-`pubsub-infra` is one Kafka, one PostgreSQL, one ClickHouse — deliberately
-(see `charts/pubsub-infra/values.yaml`); growing them is failover tooling, a
-different project from this one. `pubsub` runs **three replicas of every
+`pubsub-infra` runs **three of every store**, chosen so that each one loses a
+node without losing data or write access:
+
+| store | what makes it three | loses a node by |
+| --- | --- | --- |
+| Kafka | 3 KRaft voters, `RF=3`, `min.insync.replicas=2` | leader move + ISR contraction |
+| PostgreSQL | 3 CloudNativePG instances, async streaming | automatic promotion in ~13 s |
+| ClickHouse | 3 nodes, `ReplicatedMergeTree` over embedded Keeper | replica take-over |
+
+`EnsureTopics` refuses to create a platform topic on a cluster with fewer than
+`kafkautil.ReplicationFactor` live brokers rather than quietly making topics
+that survive nothing — which is why the three-broker cluster above is a
+requirement and not a preference.
+
+`pubsub` runs **three replicas of every
 service**, which the inbox lease and the mirrored presence view make safe,
 plus:
 
@@ -43,11 +65,24 @@ keep credentials elsewhere) that every pod loads with `envFrom`; keys are
 the environment variables in [Configuration](configuration.md). `HTTP_ADDR` is
 always set explicitly because the binaries disagree on their defaults.
 
-:::caution Untested on a real cluster
-Nothing in these charts has been installed on a real cluster yet — they are
-`helm lint`-clean and validated against the Kubernetes 1.31 schemas with
-`kubeconform -strict`, including the `existingSecret`, `admin.enabled=false`
-and single-replica variants.
+:::caution Validated on kind, not on a real cluster
+The charts are exercised end to end on a **single-node kind cluster**
+(Kubernetes 1.31), which verified the parts that are easy to get wrong:
+
+- three KRaft voters forming, and all seven platform topics created at
+  `RF=3` — the operation `EnsureTopics` refuses to under-provision;
+- a PostgreSQL failover: deleting the primary pod promoted a standby in
+  **13 s**, moved the `-rw` Service, kept the data, and brought the old
+  primary back as a replica rather than a second writer;
+- ClickHouse replication: a row inserted on one node readable on all three,
+  with a drained Keeper queue;
+- `helm test` reaching `/readyz` through the Services.
+
+What it does **not** cover: a *multi-node* cluster. `podAntiAffinity` is
+`preferred` precisely so these charts still schedule on one node, which means
+the node-level spread it buys has never actually been exercised — nor has
+node loss, DNS across nodes, real storage classes, TLS, or backups. Those need
+a real cluster to answer.
 :::
 
 ## Inspecting state
@@ -140,6 +175,80 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server kafka:29092 --describe \
   | awk '/^Topic:/{t=$2; for(i=1;i<=NF;i++) if($i=="ReplicationFactor:") print t, $(i+1)}'
 ```
+
+## PostgreSQL topology
+
+One primary and two asynchronous streaming replicas:
+
+| service | host port | role |
+| --- | --- | --- |
+| `postgres` | `localhost:5432` | **primary** — every write, and `PG_DSN` |
+| `postgres-2` | `localhost:5433` | replica, read-only |
+| `postgres-3` | `localhost:5434` | replica, read-only |
+
+Asynchronous on purpose: the primary commits without waiting for either
+replica. Synchronous replication would put two network hops in front of every
+commit, and throughput is concurrency over latency — that raises the latency
+floor and so *lowers* max ev/s, to protect data (inbox, presence, registry)
+that is reconstructable. The cost is that a primary dying before WAL ships can
+lose its last few transactions.
+
+```sh
+# is it replicating?
+docker compose exec -T postgres psql -U pubsub -d pubsub -c \
+  "SELECT application_name, state, sync_state, sent_lsn = replay_lsn AS caught_up
+   FROM pg_stat_replication;"
+
+# both replicas answer reads, and neither accepts writes
+psql "postgres://pubsub:pubsub@localhost:5433/pubsub" -c "SELECT pg_is_in_recovery();"
+```
+
+Replicas are started in order rather than together: two concurrent base
+backups killed one of their own temporary replication slots, so `postgres-3`
+waits for `postgres-2` to be healthy first.
+
+### Failover is manual
+
+There is no automatic failover — no Patroni, no leader election. Losing the
+primary stops all writes until a replica is promoted by hand:
+
+```sh
+docker compose stop postgres
+docker compose exec -T postgres-2 psql -U pubsub -d pubsub \
+  -c "SELECT pg_promote();"      # the other replica then re-syncs from it
+```
+
+`PG_DSN` still points at `localhost:5432`, so the port a replica is promoted
+onto matters: a promoted `postgres-2` is on 5433, not 5432. Repoint `PG_DSN`
+and restart the services, or front the two with a virtual IP. Until that is
+automated, the three nodes buy you a *copy* to promote, not an automatic
+recovery — worth being precise about, because "3 nodes for HA" is easy to
+over-read.
+
+### Read routing: analysed, not wired up
+
+The replicas are reachable, and services *could* read from them, but routing is
+not implemented because no current query earns it. The store opens one pool
+that does both, so routing reads means a second pool and per-query decisions —
+and the per-query verdict is:
+
+| read | safe on a replica? | why |
+| --- | --- | --- |
+| `EventTypes`, `Subscriptions`, `Subscription`, `EventType`, `SubscriptionExists` | **yes** | Staleness is bounded by replication lag, and the registry already treats staleness up to `REGISTRY_POLL` (1–2 s) as normal — that poll exists as the safety net under NOTIFY. |
+| `VisiblePresence`, `CountPresence` | **no** | A replica lagging by a few milliseconds returns a view in which a *just-deleted* connection still exists. `pick()` then stamps a delivery onto it, and the delivery is not recovered until the client happens to reconnect — the `gwfail` defect class, reintroduced probabilistically. The other direction parks early deliveries. |
+| `Park`, `FetchParked`, `AckParked`, `CountParked` | **no** | Read-modify-write against the inbox; a stale read loses an acknowledgement. |
+| lease acquire/release | **no** | Coordination. Two nodes thinking they hold it is the failure the lease exists to prevent. |
+
+Even for the registry, the gain is roughly five queries per second — every
+service polls every 1–2 s. PostgreSQL is not the bottleneck at any replica
+count this topology reaches. Routing would also introduce a *new* failure mode:
+a dead read replica makes registry reloads fail and `/readyz` degrade while the
+primary is perfectly healthy.
+
+So the honest position is that the switch is not worth its failure modes yet.
+The place it starts to matter is a much larger service count, where
+`REGISTRY_POLL` traffic scales with instances — and if that arrives, the split
+above is already the correct one.
 
 ## Chaos scenarios
 

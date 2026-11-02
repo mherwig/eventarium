@@ -1,7 +1,111 @@
 {{/*
-ClickHouse: one server. Status queries and the status writer talk to it over
-the native port 9000, the probe over HTTP 8123.
+ClickHouse: three nodes replicating to each other through embedded Keeper.
+
+What makes this three nodes rather than three containers:
+
+  - ReplicatedMergeTree with one table path, so every node holds every row
+    and the Client Service may send an insert to any of them;
+  - an embedded Keeper ensemble (this image runs Keeper inside the server), one
+    member per pod, forming the three-node quorum that coordinates it;
+  - `ON CLUSTER` DDL from the app, which needs the <remote_servers> entry
+    below, so the table is created on all three at once instead of on whichever
+    node the connection happened to land on.
+
+Per-pod values are two: keeper's server_id and the {replica} macro. Both are
+the pod's ordinal, and only the pod knows its own ordinal, so - as with Kafka -
+a command derives it from $HOSTNAME and renders a config fragment with sed.
+Helm can render the *static* parts (the peer list, the shard, remote_servers)
+into the ConfigMap; it cannot render per-pod ones.
+
+Three services' worth of ports: 8123/9000 for clients, 9181 for Keeper client
+requests, 9234 for Keeper's Raft. The last two stay off the Client Service.
+
+Headless, and with publishNotReadyAddresses, for the same reason as Kafka:
+Keeper's members must resolve each other before any of them is Ready.
 */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pubsub-infra.clickhouseService" . }}-cluster
+  labels:
+    {{- include "pubsub-infra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clickhouse
+data:
+  cluster.xml: |
+    <clickhouse>
+      <keeper_server>
+        <tcp_port>9181</tcp_port>
+        <!-- @ORDINAL@ is the pod's own ordinal, substituted at start-up. -->
+        <server_id>@ORDINAL@</server_id>
+        <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+        <coordination_settings>
+          <operation_timeout_ms>10000</operation_timeout_ms>
+          <session_timeout_ms>30000</session_timeout_ms>
+        </coordination_settings>
+        <raft_configuration>
+{{- $headless := printf "%s-headless" (include "pubsub-infra.clickhouseService" .) }}
+{{- range $i := until (int .Values.clickhouse.replicas) }}
+          <server>
+            <id>{{ $i }}</id>
+            <hostname>{{ include "pubsub-infra.clickhouseService" $ }}-{{ $i }}.{{ $headless }}</hostname>
+            <port>9234</port>
+          </server>
+{{- end }}
+        </raft_configuration>
+      </keeper_server>
+
+      <macros>
+        <shard>{{ .Values.clickhouse.shard }}</shard>
+        <!-- Same substitution as server_id: a replica name must be unique
+             per node, and it is what appears in the replicated path. -->
+        <replica>@ORDINAL@</replica>
+      </macros>
+
+      <!-- Required by ON CLUSTER: where the app's CREATE TABLE goes. One
+           shard holding every node, so any node may serve any query. -->
+      <remote_servers>
+        <{{ .Values.clickhouse.cluster }}>
+          <shard>
+{{- range $i := until (int .Values.clickhouse.replicas) }}
+            <replica>
+              <host>{{ include "pubsub-infra.clickhouseService" $ }}-{{ $i }}.{{ $headless }}</host>
+              <port>9000</port>
+            </replica>
+{{- end }}
+          </shard>
+        </{{ .Values.clickhouse.cluster }}>
+      </remote_servers>
+    </clickhouse>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pubsub-infra.clickhouseHeadlessService" . }}
+  labels:
+    {{- include "pubsub-infra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clickhouse
+spec:
+  clusterIP: None
+  # Keeper's members have to resolve each other before any of them is Ready.
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+    - name: native
+      port: 9000
+      targetPort: native
+    - name: keeper
+      port: 9181
+      targetPort: keeper
+    - name: raft
+      port: 9234
+      targetPort: raft
+  selector:
+    {{- include "pubsub-infra.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: clickhouse
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -29,8 +133,9 @@ metadata:
     {{- include "pubsub-infra.labels" . | nindent 4 }}
     app.kubernetes.io/component: clickhouse
 spec:
-  serviceName: {{ include "pubsub-infra.clickhouseService" . }}
-  replicas: 1
+  serviceName: {{ include "pubsub-infra.clickhouseHeadlessService" . }}
+  replicas: {{ .Values.clickhouse.replicas }}
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       {{- include "pubsub-infra.selectorLabels" . | nindent 6 }}
@@ -41,15 +146,46 @@ spec:
         {{- include "pubsub-infra.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: clickhouse
     spec:
+      affinity:
+        {{- include "pubsub-infra.spread" (dict "root" . "component" "clickhouse") | nindent 8 }}
+      securityContext:
+        fsGroup: 101
       containers:
         - name: clickhouse
           image: "{{ .Values.clickhouse.image.repository }}:{{ .Values.clickhouse.image.tag }}"
           imagePullPolicy: {{ .Values.clickhouse.image.pullPolicy }}
+          # Render this pod's fragment, then hand off to the image's own
+          # entrypoint. Only the ordinal differs between pods, and neither
+          # Helm nor the image can compute it from the StatefulSet alone.
+          #
+          # The hand-off matters: /entrypoint.sh is what creates the
+          # CLICKHOUSE_USER and CLICKHOUSE_DB from the environment, and it only
+          # does that when called with no arguments - otherwise it execs
+          # whatever you gave it and skips all initialisation. Calling
+          # clickhouse-server directly - what this did first - left three
+          # healthy pods that refused every connection with "no user with such
+          # name", because /ping needs no auth and the probes therefore passed.
+          #
+          # No arguments at all, deliberately: the entrypoint adds its own
+          # --config-file=$CLICKHOUSE_CONFIG, so passing one here failed with
+          # "Option must not be given more than once: config-file". config.d is
+          # read either way, which is all this fragment needs.
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              ordinal="${HOSTNAME##*-}"
+              sed -e "s/@ORDINAL@/${ordinal}/g" \
+                /config/cluster.xml > /etc/clickhouse-server/config.d/010-cluster.xml
+              exec /entrypoint.sh
           ports:
             - name: http
               containerPort: 8123
             - name: native
               containerPort: 9000
+            - name: keeper
+              containerPort: 9181
+            - name: raft
+              containerPort: 9234
           env:
             - name: CLICKHOUSE_USER
               valueFrom:
@@ -68,16 +204,13 @@ spec:
                   key: CLICKHOUSE_DB
           resources:
             {{- toYaml .Values.clickhouse.resources | nindent 12 }}
-          # /ping answers before the server is fully up, which is exactly
-          # what readiness should mean here; liveness uses the same endpoint
-          # so a wedged process is restarted rather than probed forever.
           readinessProbe:
             httpGet:
               path: /ping
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            failureThreshold: 24
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /ping
@@ -88,11 +221,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/clickhouse
-          # Deviation from compose: it sets nofile to 262144 for the burst of
-          # status inserts, and the Kubernetes API has no ulimit field at all
-          # (checked against core/v1 types), so the container runs on whatever
-          # default the node gives it. Worth revisiting if the status writer
-          # ever hits "too many open files".
+            - name: cluster
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: cluster
+          configMap:
+            name: {{ include "pubsub-infra.clickhouseService" . }}-cluster
   volumeClaimTemplates:
     - metadata:
         name: data

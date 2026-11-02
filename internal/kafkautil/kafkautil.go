@@ -230,12 +230,52 @@ func NewClient(extra ...kgo.Opt) (*kgo.Client, error) {
 }
 
 // EnsureTopics creates the missing platform topics with their configurations.
+// liveBrokers reports how many brokers the cluster currently has, or 0 when
+// that cannot be determined. Metadata with an empty topic list asks for the
+// broker set alone - no topic records, so the reply stays tiny.
+//
+// It exists because ReplicationFactor is a requirement, not a preference.
+// Kafka rejects a replication factor above the live broker count with
+// INVALID_REPLICATION_FACTOR (38): a single-broker cluster cannot serve
+// RF=3, and `admin all` failed with
+//
+//	creating topic events-live: error code 38
+//
+// which says nothing about what to do about it. The broker count is read
+// rather than taken from the seed list, because a production cluster often
+// advertises three seed addresses for fifteen brokers - and deriving the
+// factor from the seeds would quietly halve the durability of a real one.
+func liveBrokers(ctx context.Context, cl *kgo.Client) int {
+	req := kmsg.NewPtrMetadataRequest() // no topics: brokers only
+	resp, err := cl.Request(ctx, req)
+	if err != nil {
+		return 0
+	}
+	mres, ok := resp.(*kmsg.MetadataResponse)
+	if !ok {
+		return 0
+	}
+	return len(mres.Brokers)
+}
+
 func EnsureTopics(ctx context.Context, brokers []string, specs []TopicSpec) error {
 	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
 		return err
 	}
 	defer cl.Close()
+
+	// Refuse rather than degrade. Lowering the factor to fit a small cluster
+	// would hand a degraded cluster *less* redundancy at the moment it has
+	// none - a broker that has just died is exactly when RF=2 matters - and
+	// the topics would keep that reduced factor forever after it recovers.
+	// Three brokers is the deployment target; if the cluster cannot meet it,
+	// provisioning should say so in words instead of writing topics that will
+	// survive losing none of them.
+	if n := liveBrokers(ctx, cl); n > 0 && n < ReplicationFactor {
+		return fmt.Errorf("kafkautil: cluster has %d live broker(s) but every platform topic requires replication factor %d - start the missing brokers rather than lowering the factor",
+			n, ReplicationFactor)
+	}
 
 	req := kmsg.NewPtrCreateTopicsRequest()
 	req.TimeoutMillis = 10000

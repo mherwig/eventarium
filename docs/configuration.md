@@ -11,7 +11,7 @@ the defaults suit the local compose stack. On Kubernetes it is one Secret
 | Variable | Default | Used by |
 | --- | --- | --- |
 | `KAFKA_BROKERS` | `localhost:9092,localhost:9094,localhost:9095` | everything |
-| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, status-api, router, dispatcher, sse-gateway, replay-api |
+| `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, status-api, router, dispatcher, sse-gateway, replay-api. Always the **primary** — every caller writes. The two replicas are on `localhost:5433` and `localhost:5434`, read-only; see [Operations](operations.md#postgresql-topology) for why reads are not routed to them. |
 | `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api, replay-api |
 | `JWT_SECRET` / `JWT_ISSUER` / `JWT_AUDIENCE` | `dev-secret` / `dev` / `pubsub` | every API service, harness, minttoken |
 | `HTTP_ADDR` | `:8080` (publish-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api), set `:8083` for registry-api; `:8085` (router), `:8086` (dispatcher), `:8087` (status-writer) — health endpoints only | every service |

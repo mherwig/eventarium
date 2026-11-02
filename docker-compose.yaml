@@ -114,6 +114,13 @@ services:
       timeout: 10s
       retries: 20
 
+  # Primary. The entrypoint wrapper appends `host replication all all` to
+  # pg_hba.conf on every start: the stock image only allows replication from
+  # 127.0.0.1, and `host all all all` does not cover replication requests -
+  # PostgreSQL matches those against a `replication` database entry, so a base
+  # backup from another container fails outright. The init scripts in
+  # /docker-entrypoint-initdb.d cannot do this, because they only run against
+  # an empty data directory and this primary already has one.
   postgres:
     image: postgres:16-alpine
     ports:
@@ -122,11 +129,87 @@ services:
       POSTGRES_USER: pubsub
       POSTGRES_PASSWORD: pubsub
       POSTGRES_DB: pubsub
+    entrypoint: ["/bin/sh", "/usr/local/bin/pg-primary.sh"]
+    # Explicit: overriding entrypoint without a command left Cmd empty, and
+    # docker-entrypoint.sh then execs nothing and exits 0 - a container that
+    # looks like it started and did not.
+    command: ["postgres"]
+    volumes:
+      - ./scripts/pg-primary.sh:/usr/local/bin/pg-primary.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pubsub -d pubsub"]
       interval: 5s
       timeout: 5s
       retries: 20
+
+  # Two streaming replicas, asynchronous: the primary commits without waiting
+  # for either. Synchronous replication would add two network hops to every
+  # commit, and throughput is concurrency over latency - that raises the
+  # latency floor and so lowers max ev/s, for data (inbox, presence, registry)
+  # that is reconstructable. The cost of async is that a primary dying before
+  # WAL ships can lose the last few transactions.
+  #
+  # `user: postgres` so pg_basebackup writes files postgres can use; running as
+  # root would leave a root-owned data directory. Each takes one base backup
+  # on first start - the existing primary's data included - then serves reads.
+  # Replica ports are published so processes on the host can reach them; the
+  # platform runs as host processes, not containers, so Compose networking
+  # alone would not.
+  postgres-2:
+    image: postgres:16-alpine
+    user: postgres
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: pubsub
+      POSTGRES_PASSWORD: pubsub
+      POSTGRES_DB: pubsub
+    entrypoint: ["/bin/sh", "/usr/local/bin/pg-replica.sh"]
+    command: ["postgres"]
+    volumes:
+      - ./scripts/pg-replica.sh:/usr/local/bin/pg-replica.sh:ro
+      - pg2-data:/var/lib/postgresql/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pubsub -d pubsub"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+
+  postgres-3:
+    image: postgres:16-alpine
+    user: postgres
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: pubsub
+      POSTGRES_PASSWORD: pubsub
+      POSTGRES_DB: pubsub
+    entrypoint: ["/bin/sh", "/usr/local/bin/pg-replica.sh"]
+    command: ["postgres"]
+    volumes:
+      - ./scripts/pg-replica.sh:/usr/local/bin/pg-replica.sh:ro
+      - pg3-data:/var/lib/postgresql/data
+    # After postgres-2 as well as the primary: two base backups running at
+    # once killed one of their own temporary replication slots -
+    #
+    #   terminating process 43 to release replication slot "pg_basebackup_43"
+    #   DETAIL: The slot's restart_lsn 0/5F000000 exceeds the limit by 16777216 bytes
+    #
+    # even with max_slot_wal_keep_size at -1. Serialising makes the second
+    # backup deterministic and costs one healthcheck interval at setup time.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pubsub -d pubsub"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
@@ -146,3 +229,10 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
+
+# Named rather than anonymous: each holds a base backup taken once from the
+# primary, and that copy is not reproducible from anywhere else if the volume
+# is orphaned.
+volumes:
+  pg2-data:
+  pg3-data:

@@ -1,11 +1,22 @@
-# One instance of every store, deliberately.
+# Stores: three of everything - Kafka, PostgreSQL and ClickHouse.
 #
-# The application layer runs three replicas of each component (see the
-# pubsub chart); the stores do not. Kafka, PostgreSQL and ClickHouse are
-# single StatefulSets here, which makes them the remaining single points of
-# failure - documented, not accidental. Growing them is a matter of
-# replication factor (Kafka) and failover tooling (the databases), which is
-# a different project from this spike.
+# The application layer runs three replicas of each component (see the pubsub
+# chart) and the stores now match it:
+#
+#   Kafka        three KRaft nodes, replication factor three
+#   PostgreSQL   three CloudNativePG instances with automatic failover
+#   ClickHouse   three nodes, ReplicatedMergeTree over an embedded Keeper
+#                ensemble - every node holds every row
+#
+# Together those are the difference between a cluster and three containers:
+# each store can lose a node without losing data or write access. See the
+# individual templates for what each one needs to make that true - a quorum,
+# an operator, a coordination service - and for the failure each one is
+# specifically built around.
+#
+# What is still *not* covered anywhere here: node-level failure. Replicas are
+# spread by podAntiAffinity where the cluster has the nodes to spread them
+# over, but a single-node cluster gives container-level HA only.
 
 nameOverride: ""
 
@@ -14,7 +25,16 @@ kafka:
     repository: apache/kafka
     tag: "3.9.0"
     pullPolicy: IfNotPresent
-  # Single-node KRaft: this node is broker and controller at once.
+  # Three nodes, each broker and controller at once (KRaft combined mode).
+  replicas: 3
+  # Three, and not a preference: EnsureTopics refuses to create a platform
+  # topic on a cluster with fewer live brokers than this, rather than quietly
+  # making topics that survive losing nothing.
+  replicationFactor: 3
+  # Two of three. A write still commits while one broker is down, so losing
+  # one is an ISR contraction and a leader move, not an outage. Three would
+  # mean no broker could ever be taken out for maintenance.
+  minInsyncReplicas: 2
   storage: 20Gi
   storageClass: ""
   resources:
@@ -25,10 +45,17 @@ kafka:
       memory: 1Gi
 
 postgres:
+  # CloudNativePG's own image, not stock postgres: it carries the instance
+  # manager that decides who is primary and promotes a survivor when that pod
+  # is lost. Stock postgres:16-alpine has no such process, which is why the
+  # previous one-instance StatefulSet could not fail over at all.
   image:
-    repository: postgres
-    tag: "16-alpine"
+    repository: ghcr.io/cloudnative-pg/postgresql
+    tag: "16.8"
     pullPolicy: IfNotPresent
+  # Three: enough to keep a quorum after losing one. Two is not - a single
+  # surviving instance cannot safely decide it is now the primary.
+  instances: 3
   username: pubsub
   # Development default. Override on install (--set postgres.password=...)
   # or point the app chart at an existing secret.
@@ -36,6 +63,10 @@ postgres:
   database: pubsub
   storage: 10Gi
   storageClass: ""
+  # PostgreSQL's own tuning, kept as values because these pods share a node
+  # with everything else and an unbounded shared_buffers takes it down.
+  sharedBuffers: "128MB"
+  maxConnections: "100"
   resources:
     requests:
       cpu: 100m
@@ -48,6 +79,13 @@ clickhouse:
     repository: clickhouse/clickhouse-server
     tag: "24.8"
     pullPolicy: IfNotPresent
+  # Three nodes, each running its own Keeper member, so delivery_status is
+  # replicated rather than split: one shard, every node a replica of it.
+  replicas: 3
+  # Named in <remote_servers>; the app passes the same value as CH_CLUSTER so
+  # its CREATE TABLE goes to all three at once (internal/chstore).
+  cluster: pubsub
+  shard: "0"
   username: pubsub
   password: pubsub
   database: pubsub

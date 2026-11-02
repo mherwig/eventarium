@@ -1,95 +1,101 @@
 {{/*
-PostgreSQL: one primary, no replica - see the note at the top of values.yaml.
+PostgreSQL: a CloudNativePG Cluster, replacing a hand-rolled StatefulSet.
+
+Why an operator rather than `replicas: 3` on the old StatefulSet: three
+containers running stock postgres are three containers running stock postgres.
+Nothing decides which one is primary, nothing promotes a survivor when that
+one is lost, and clients have no way of knowing where to write. The previous
+chart had exactly one instance for this reason and said so - the gap was
+documented, not hidden.
+
+CloudNativePG supplies the part that was missing. Its instance manager runs
+beside each postgres and is what makes failover automatic:
+
+  - it tracks who is primary, and promotes the most advanced standby when the
+    primary's pod disappears - no human running pg_promote;
+  - it rewrites the -rw Service so clients keep using one DNS name and reach
+    whoever is primary now, which is why PG_DSN never has to change;
+  - with three instances and a surviving quorum there is no split brain, so
+    the old primary cannot come back as a second writer.
+
+It needs its own image (ghcr.io/cloudnative-pg/postgresql), because stock
+postgres:16-alpine has no instance manager to run.
+
+The four Services it owns:
+
+  -rw   the current primary - this is what PG_DSN targets
+  -ro   load-balanced across standbys
+  -r    any one instance
+  -any  any instance, including a further-away one if configured
 */}}
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ include "pubsub-infra.postgresService" . }}
-  labels:
-    {{- include "pubsub-infra.labels" . | nindent 4 }}
-spec:
-  type: ClusterIP
-  ports:
-    - name: postgres
-      port: 5432
-      targetPort: postgres
-  selector:
-    {{- include "pubsub-infra.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: postgres
----
-apiVersion: apps/v1
-kind: StatefulSet
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
 metadata:
   name: {{ include "pubsub-infra.postgresService" . }}
   labels:
     {{- include "pubsub-infra.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgres
 spec:
-  serviceName: {{ include "pubsub-infra.postgresService" . }}
-  replicas: 1
-  selector:
-    matchLabels:
-      {{- include "pubsub-infra.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: postgres
-  template:
-    metadata:
-      labels:
-        {{- include "pubsub-infra.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: postgres
-    spec:
-      containers:
-        - name: postgres
-          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
-          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
-          ports:
-            - name: postgres
-              containerPort: 5432
-          env:
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pubsub-infra.credentialsSecret" . }}
-                  key: POSTGRES_USER
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pubsub-infra.credentialsSecret" . }}
-                  key: POSTGRES_PASSWORD
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pubsub-infra.credentialsSecret" . }}
-                  key: POSTGRES_DB
-            # initdb refuses a data directory that is not empty, and a
-            # freshly provisioned block device often carries lost+found -
-            # nesting the real directory one level down sidesteps that.
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
-          resources:
-            {{- toYaml .Values.postgres.resources | nindent 12 }}
-          readinessProbe:
-            exec:
-              command: ["pg_isready", "-U", {{ .Values.postgres.username | quote }}, "-d", {{ .Values.postgres.database | quote }}]
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            failureThreshold: 12
-          livenessProbe:
-            exec:
-              command: ["pg_isready", "-U", {{ .Values.postgres.username | quote }}, "-d", {{ .Values.postgres.database | quote }}]
-            initialDelaySeconds: 30
-            periodSeconds: 10
-            failureThreshold: 6
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/postgresql/data
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        {{- if .Values.postgres.storageClass }}
-        storageClassName: {{ .Values.postgres.storageClass | quote }}
-        {{- end }}
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: {{ .Values.postgres.storage }}
+  # Three, matching the rest of the platform. Two is not enough: losing one
+  # leaves a single instance and no quorum to elect with, so the survivor
+  # cannot safely be promoted.
+  instances: {{ .Values.postgres.instances }}
+
+  # CNPG writes and honours its own PodDisruptionBudget from this flag, sized
+  # from the instance count - which is why there is no entry for PostgreSQL in
+  # this chart's pdb.yaml. It protects the same floor the other two budgets
+  # do: two of three must survive a drain.
+  enablePDB: true
+
+  # Preferred, never required: on a one-node cluster a required rule means no
+  # instance ever schedules. See the spread helper in _helpers.tpl.
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                cnpg.io/cluster: {{ include "pubsub-infra.postgresService" . }}
+
+  imageName: {{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}
+
+  storage:
+    size: {{ .Values.postgres.storage }}
+    {{- if .Values.postgres.storageClass }}
+    storageClass: {{ .Values.postgres.storageClass | quote }}
+    {{- end }}
+
+  resources:
+    {{- toYaml .Values.postgres.resources | nindent 4 }}
+
+  # Async replication, and the default: the primary does not wait for a
+  # standby to acknowledge before committing. Making it synchronous would put
+  # a round trip to a second pod in front of every write, and throughput is
+  # concurrency over latency - a higher latency floor is a lower ceiling on
+  # events per second. The exchange is a small window of transactions that
+  # can be lost if the primary dies before the standby has them, which is a
+  # defined and accepted RPO rather than an accident. Raise it per-cluster
+  # with minSyncReplicas/maxSyncReplicas if that window is not acceptable.
+  postgresql:
+    parameters:
+      # Quoted on purpose: CNPG's admission webhook rejects the whole Cluster
+      # if any parameter arrives as a YAML number rather than a string -
+      # max_connections: 100 unmarshals as int and fails with
+      # "cannot unmarshal number into ... parameters of type string".
+      # Bounded rather than whatever the image defaults to: these pods share a
+      # node with the rest of the platform, and an unbounded shared_buffers is
+      # how one store takes the node.
+      shared_buffers: {{ .Values.postgres.sharedBuffers | default "128MB" | quote }}
+      max_connections: {{ .Values.postgres.maxConnections | default "100" | quote }}
+
+  bootstrap:
+    initdb:
+      database: {{ .Values.postgres.database }}
+      owner: {{ .Values.postgres.username }}
+      # CNPG reads the key "password". credentialsSecret carries
+      # POSTGRES_PASSWORD for the rest of the chart and the same value under
+      # "password" for this, so there is one password in one place.
+      secret:
+        name: {{ include "pubsub-infra.credentialsSecret" . }}
