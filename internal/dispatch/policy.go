@@ -58,7 +58,9 @@ func policyOf(sub *registry.Subscription) policy {
 		probeInterval:      time.Duration(sub.ProbeIntervalS) * time.Second,
 	}
 	if p.mode == "" {
-		p.mode = delivery.ModeOrdered
+		// Same default as the registry API (section 7): rows written before
+		// delivery_mode existed get the permissive mode, not the serial one.
+		p.mode = delivery.ModeUnordered
 	}
 	if p.mode == delivery.ModeOrdered {
 		p.workers = 1

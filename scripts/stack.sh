@@ -29,6 +29,10 @@ MODE="${1:-replicas}"
 export PG_DSN="${PG_DSN:-postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable}"
 export CH_DSN="${CH_DSN:-clickhouse://pubsub:pubsub@localhost:9000/pubsub}"
 export JWT_SECRET="${JWT_SECRET:-dev-secret}"
+# Three brokers, matching docker-compose.yaml. Every service reads this; the
+# default in kafkautil is a single localhost:9092, which would silently pin
+# the whole platform to broker 1 and make RF=3 pointless.
+export KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:9092,localhost:9094,localhost:9095}"
 
 cd "$ROOT"
 mkdir -p "$LOG"

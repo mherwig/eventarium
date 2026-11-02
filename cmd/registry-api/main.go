@@ -36,6 +36,7 @@ import (
 
 	"pubsub/internal/auth"
 	"pubsub/internal/config"
+	"pubsub/internal/delivery"
 	"pubsub/internal/filter"
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
@@ -420,7 +421,12 @@ func (a *api) buildSubscription(ctx context.Context, w http.ResponseWriter, owne
 
 	mode := strings.TrimSpace(req.DeliveryMode)
 	if mode == "" {
-		mode = "ordered"
+		// unordered is the default, not ordered: a mode chosen for you must
+		// not be the one that silently serialises your deliveries. ordered
+		// pins max_in_flight to 1, so a subscriber that never asked for
+		// strict order would get a per-subscription throughput ceiling as a
+		// surprise. Strictness is opted into, never inherited.
+		mode = delivery.ModeUnordered
 	}
 	if mode != "ordered" && mode != "key_ordered" && mode != "unordered" {
 		httpx.Error(w, http.StatusUnprocessableEntity,

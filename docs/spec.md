@@ -37,7 +37,7 @@ Key decisions so far:
 | F6 | Filters per subscription: on CloudEvents attributes for every event, on the data field only if it is JSON; conditions can be very complex |
 | F7 | Projection: only selected fields of the data are sent, all others are removed (JSON data only) |
 | F8 | Guaranteed delivery (at-least-once); ordering depends on the delivery mode |
-| F9 | The consumer chooses the delivery mode per subscription: ordered (default), key\_ordered or unordered |
+| F9 | The consumer chooses the delivery mode per subscription: unordered (default), key\_ordered or ordered |
 | F10 | Up to 3 concurrent SSE connections per subscription for consumer failover and parallelism |
 | F11 | Retry with backoff and a circuit breaker |
 | F12 | Configurable drain rate per subscription (redelivery after an outage) |
@@ -119,7 +119,7 @@ Replay API ──► Replay service ──► re-reads events from Kafka ──�
 - **Identity:** publishing the same message again (same source and id) is allowed. The platform treats every publish as a new event with its own unique event reference and does not deduplicate on (source, id). The delivery ID is the event reference plus the subscription ID. Delivery is at-least-once, so consumers deduplicate on the event reference or delivery ID from the transport metadata, not on (source, id).
 - **Delivery metadata** (event reference, delivery ID, attempt, replay ID, sequence) travels in transport headers or SSE fields, not inside the CloudEvent.
 - **Delivery formats:** webhooks use the CloudEvents HTTP binding in binary mode (default) or structured mode, set per subscription. SSE messages carry the CloudEvent in JSON format; binary data is base64-encoded.
-- **Ordering key:** taken from an extension attribute (for example the partitioning extension's partitionkey), from subject, or from an expression on JSON data defined in the registry. The default is the Kafka partition key used at publish. Ordering guarantees hold between events of the same retention class (section 12).
+- **Ordering key:** taken from an extension attribute (for example the partitioning extension's partitionkey), from subject, or from an expression on JSON data defined in the registry. The default is the Kafka partition key used at publish. Ordering is preserved between events of the same retention class (section 12); whether that adds up to a total order is decided by the publisher, not the platform (section 7).
 - **Size limit:** to be defined; Kafka's default message limit is about 1 MB.
 
 What works for which kind of data:
@@ -141,7 +141,7 @@ What works for which kind of data:
 - Validates the JWT, the required attributes and the size, then looks the event type up in the registry. Unknown event types are rejected with a client error (for example 422); there is no auto-registration.
 - Stamps an immutable expires\_at (ingestion time plus retention class), an ingestion timestamp and the owner reference taken from the JWT, never from the event body. Later class changes affect only new events.
 - The registry lives in memory and is refreshed from a compacted config topic, so a publish needs no database call.
-- The Kafka partition key chosen at publish (for example the entity ID) preserves per-entity order within one retention class. Each event is written once, to the Kafka topic of its retention class (events-live, events-short, events-day, events-week). The registry supplies the class, and new event types default to short.
+- The Kafka partition key chosen at publish (for example the entity ID) preserves per-entity order within one retention class. It *preserves* the order the writes happened in; it does not *establish* one — see section 7 for what that means when two events for one entity are published concurrently, and for how a caller gets a total order. Each event is written once, to the Kafka topic of its retention class (events-live, events-short, events-day, events-week). The registry supplies the class, and new event types default to short.
 - The response contains the platform's event reference, a unique ID per publish, which is used for status queries. Publishing the same message again creates a new event with a new reference. Publishes are not deduplicated, so a publisher that retries after a timeout may create a duplicate.
 
 ### 6.2 Router
@@ -203,15 +203,84 @@ The consumer chooses the mode per subscription; all connections of a subscriptio
 
 | Mode | Behaviour | Ordering | Parallelism |
 | --- | --- | --- | --- |
-| ordered (default) | One active connection, others on standby with failover | strict per subscription | no |
+| ordered | One active connection, others on standby with failover | strict per subscription | no |
 | key\_ordered | Spread over up to 3 connections; the same key always goes to the same connection | per ordering key | yes |
-| unordered | Spread without ordering | none | yes, maximum |
+| unordered (default) | Spread without ordering | none | yes, maximum |
 
 - The delivery stage, as partition owner, assigns events to connections by hash (for example rendezvous hashing).
 - On rebalancing, a key moves to another connection only after its in-flight events are acknowledged.
 - Failover for ordered: a standby is promoted and redelivery starts from the last cumulative ack. The switch takes seconds.
 - Changing the mode at runtime: stop delivery, wait for open acks, then switch.
 - Webhooks use the same model through max\_in\_flight.
+
+### Ordering: preserved, not guaranteed
+
+Two independent things decide the order a subscriber sees. They are routinely
+conflated, so they are separated here.
+
+**Axis 1 — where an event lands (publish side).** Kafka orders records *per
+partition*, not per topic. The partition key is chosen at publish as a pure
+function of the event: the `partitionkey` extension, else `subject`, else
+`source`/`id`. Given the same event, any publish-api replica computes the same
+key and therefore the same partition — the number of replicas is irrelevant to
+this axis.
+
+**Axis 2 — how a subscription consumes (delivery side).** `delivery_mode`
+decides concurrency: `ordered` pins `max_in_flight` to 1, `key_ordered` hashes
+the ordering key onto N workers, `unordered` round-robins. This axis never
+changes which partition an event is in.
+
+**What the platform preserves.** Every hop keeps the order it is given:
+
+1. publish writes a request's records to their partitions in request order
+   (`ProduceSync`, and one transaction for multi-event requests);
+2. the router reads a partition in offset order and processes a poll batch
+   sequentially, emitting the whole batch in one transaction;
+3. `deliveries` is keyed by subscription ID, so one subscription is one
+   partition, read in order by exactly one dispatcher;
+4. the dispatcher enqueues into the subscription's queue in that order, and a
+   worker retries **in place** — a retry never lets a later event overtake an
+   earlier one.
+
+**What it cannot establish.** A total order is decided *before* step 1, by
+whichever write reaches the broker first. If two events for one entity are
+published concurrently, the broker appends whichever arrives first and the
+partition key cannot help: it runs when the record is built, by which time both
+events are already racing. Replicas make this visible but are not its cause —
+two goroutines in one publish-api pod race identically. (`writeBatch`
+serialises multi-event requests against each other within a process;
+single-record publishes deliberately bypass that lock, and no two processes
+serialise against each other at all.)
+
+**The ordering contract is therefore: the caller publishes synchronously.** Do
+not send event N+1 for an entity until event N has been acknowledged. That is
+the only place a total order can originate, because only the caller knows which
+event it meant to put first. The unit is the *entity*, not the stream: with a
+pool of entities a publisher stays sequential within one entity and parallel
+across them, so the throughput cost is per entity rather than global.
+
+Consequences worth stating plainly:
+
+- A `201` means *accepted*, not *sequenced*. The response carries `event_ref`,
+  not a partition or offset, so a caller cannot detect reordering after the
+  fact.
+- `ingested_at` is a timestamp taken once per request before the write, not a
+  sequence number.
+- Ordering scope is (entity, retention class): events in different class topics
+  have no relative order (section 12).
+- An event type with no ordering key definition still gets a partition key —
+  `partitionkey`, else `subject`, else `source`/`id`. The last of those is
+  unique per event, so it spreads across every partition and orders nothing.
+- Ordering keys should be high cardinality. A key that most events share pins
+  them all to one partition, which concentrates load on a single broker instead
+  of spreading it across the cluster.
+
+**Why `unordered` is the default.** `ordered` is not a safe default: it pins
+`max_in_flight` to 1, so any subscription that does not choose a mode silently
+inherits a per-subscription ceiling of one concurrent delivery. `unordered`
+parallelises by default and strictness is opted into, never inherited. Note
+that this choice has no effect on axis 1 — which broker an event lands on is
+decided at publish, not by the delivery mode.
 
 ### Delivery policy per subscription
 
@@ -375,7 +444,7 @@ All values are orders of magnitude and must be checked against real payload size
 ### 15.4 Pass criteria
 
 - No loss within retention.
-- No order violations: strict per subscription for ordered, per key for key\_ordered.
+- No order violations *relative to what the platform was given*: strict per subscription for ordered, per key for key\_ordered. This asserts only the platform's half of section 7. The caller's half — serialising concurrent publishes for one entity — is outside the platform and is not asserted here.
 - Duplicates only after injected failures, and always identifiable by event reference.
 - p99 from publish to first delivery attempt below 1 s at baseline load, target a few hundred ms.
 - Once the system is idle, status records match the oracle for 100 % of deliveries.

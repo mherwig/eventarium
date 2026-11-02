@@ -53,6 +53,13 @@ simulated receiver of the harness listens on `:9090/hook`:
 ./bin/harness recv -addr :9090 -out recv.jsonl &
 ```
 
+`delivery_mode` defaults to `unordered`. Omit it and deliveries are spread with
+no ordering guarantee; ask for `key_ordered` or `ordered` explicitly when you
+need order. `ordered` pins `max_in_flight` to 1, which is why it is opt-in
+rather than the default. What each mode does and does not promise — and why a
+total order can only come from publishing synchronously — is in
+[Specification §7](spec.md#ordering-preserved-not-guaranteed).
+
 ## Create an SSE subscription
 
 The same request with `channel: "sse"` and no callback URL:

@@ -10,7 +10,7 @@ the defaults suit the local compose stack. On Kubernetes it is one Secret
 
 | Variable | Default | Used by |
 | --- | --- | --- |
-| `KAFKA_BROKERS` | `localhost:9092` | everything |
+| `KAFKA_BROKERS` | `localhost:9092,localhost:9094,localhost:9095` | everything |
 | `PG_DSN` | `postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable` | publish-api, registry-api, status-api, router, dispatcher, sse-gateway, replay-api |
 | `CH_DSN` | `clickhouse://pubsub:pubsub@localhost:9000/pubsub` | status-writer, status-api, replay-api |
 | `JWT_SECRET` / `JWT_ISSUER` / `JWT_AUDIENCE` | `dev-secret` / `dev` / `pubsub` | every API service, harness, minttoken |

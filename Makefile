@@ -26,7 +26,9 @@ logs:
 ## infra starts Kafka, PostgreSQL and ClickHouse and provisions topics and schemas
 infra: up
 	@echo "waiting for infrastructure..."
-	@until docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1; do sleep 2; done
+	@until docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1; do sleep 2; done
+	@until docker compose exec -T kafka-2 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-2:29092 --list >/dev/null 2>&1; do sleep 2; done
+	@until docker compose exec -T kafka-3 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-3:29092 --list >/dev/null 2>&1; do sleep 2; done
 	@until docker compose exec -T postgres pg_isready -U pubsub -d pubsub >/dev/null 2>&1; do sleep 2; done
 	@until docker compose exec -T clickhouse wget -qO- http://localhost:8123/ping >/dev/null 2>&1; do sleep 2; done
 	$(GO) run ./cmd/admin all

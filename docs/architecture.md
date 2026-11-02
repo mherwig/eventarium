@@ -38,13 +38,21 @@ Kafka consumer groups: `router` (events-\*), `dispatcher` and `sse-delivery`
 
 ## Delivery modes
 
-Three modes per subscription, per the spec's delivery policy:
+Three modes per subscription, per the spec's delivery policy. `unordered` is
+the default:
 
 | Mode | Guarantee |
 | --- | --- |
-| `unordered` | Fastest; no ordering across events |
-| `ordered` | Per-shard ordering — events sharing a partition key arrive in publish order |
+| `unordered` (default) | Fastest; no ordering across events |
 | `key_ordered` | Ordering per derived key (`ordering_key_def`): `subject`, `ext:<name>` or `json:<dotted.path>` |
+| `ordered` | Strict per subscription — one delivery at a time, retries in place, so a retry never lets a later event overtake an earlier one |
+
+The mode decides **how many deliveries of one subscription run at once**, not
+where an event lands. Which partition (and therefore which broker) an event is
+written to is decided at publish by the partition key, and is the same for all
+three modes — see [Specification §7](spec.md#ordering-preserved-not-guaranteed)
+for the full model, including why a total order can only come from the
+publisher.
 
 All three are at-least-once. See [Reliability](reliability.md#at-least-once-and-what-that-costs)
 for what that costs and where duplicates come from.

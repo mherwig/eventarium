@@ -130,6 +130,18 @@ func EventsTopic(class string) string { return "events-" + class }
 // The sequence number (section 6.3) depends on it, so it must never change.
 const DeliveryPartitions = 12
 
+// ReplicationFactor is the replication factor of every platform topic. Three
+// is the least that survives losing one broker: with min.insync.replicas=2 a
+// write still commits while one replica is down, so the loss shows up as an
+// ISR contraction and a leader move rather than an outage.
+//
+// Kafka has no "alter replication factor" - an existing topic keeps whatever
+// it was created with, and EnsureTopics deliberately tolerates
+// TOPIC_ALREADY_EXISTS. Changing this constant therefore does nothing to
+// topics that already exist: recreate them (`docker compose down -v` then
+// `make infra`) or reassign partitions by hand.
+const ReplicationFactor = 3
+
 // TopicSpec describes a topic to create.
 type TopicSpec struct {
 	Name        string
@@ -160,7 +172,12 @@ func Specs() []TopicSpec {
 func Bootstrap() []string { return brokerList() }
 
 func brokerList() []string {
-	brokers := envOr("KAFKA_BROKERS", "localhost:9092")
+	// All three brokers of docker-compose.yaml, not just the first: a client
+	// given one seed still discovers the cluster through metadata, but it
+	// takes a broker restart (or a metadata expiry) to learn about the other
+	// two, and a seed list of one is exactly how a three-broker setup ends up
+	// running as a one-broker setup.
+	brokers := envOr("KAFKA_BROKERS", "localhost:9092,localhost:9094,localhost:9095")
 	out := []string{}
 	start := 0
 	for i := 0; i <= len(brokers); i++ {
@@ -226,7 +243,7 @@ func EnsureTopics(ctx context.Context, brokers []string, specs []TopicSpec) erro
 		t := kmsg.NewCreateTopicsRequestTopic()
 		t.Topic = s.Name
 		t.NumPartitions = s.Partitions
-		t.ReplicationFactor = 1
+		t.ReplicationFactor = int16(ReplicationFactor)
 		var configs []kmsg.CreateTopicsRequestTopicConfig
 		set := func(k, v string) { configs = append(configs, kmsg.CreateTopicsRequestTopicConfig{Name: k, Value: &v}) }
 		// Set explicitly rather than left to the broker default: a topic

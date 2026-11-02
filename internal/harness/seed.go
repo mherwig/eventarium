@@ -19,6 +19,32 @@ import (
 // pins this down).
 const seededDataFilter = "int(data.seq) % 2 == 0"
 
+// parseModes splits -modes and rejects anything that is not a delivery mode
+// the platform implements. The default names all three; a throughput run
+// narrows it to "unordered,key_ordered" so that a strict subscription's
+// max_in_flight of 1 does not become the ceiling of the whole measurement.
+func parseModes(s string) ([]string, error) {
+	valid := map[string]bool{
+		delivery.ModeOrdered:    true,
+		delivery.ModeKeyOrdered: true,
+		delivery.ModeUnordered:  true,
+	}
+	out := make([]string, 0, 3)
+	for _, m := range strings.Split(s, ",") {
+		if m = strings.TrimSpace(m); m == "" {
+			continue
+		}
+		if !valid[m] {
+			return nil, fmt.Errorf("-modes: %q is not a delivery mode (want ordered, key_ordered or unordered)", m)
+		}
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("-modes: at least one delivery mode is required")
+	}
+	return out, nil
+}
+
 // runSeed implements `harness seed`: the subscription generator of section
 // 15.2. It creates event types and subscriptions through the HTTP APIs (never
 // SQL) with a deterministic mix of channels, delivery modes, filters,
@@ -32,6 +58,8 @@ func runSeed(ctx context.Context, args []string) int {
 	prefix := fs.String("prefix", envStr("PREFIX", "harness"), "name prefix for the created event types (env HARNESS_PREFIX)")
 	api := fs.String("api", apiDefault(), "base URL of the registry API (env API)")
 	webhookURL := fs.String("webhook-url", envStr("WEBHOOK_URL", "http://localhost:9090/hook"), "callback URL for webhook subscriptions (env HARNESS_WEBHOOK_URL)")
+	modesArg := fs.String("modes", envStr("MODES", "ordered,key_ordered,unordered"),
+		"comma-separated delivery modes to cycle over (env HARNESS_MODES)")
 	if code, done := parseResult(fs.Parse(args)); done {
 		return code
 	}
@@ -41,6 +69,13 @@ func runSeed(ctx context.Context, args []string) int {
 	}
 	if *typesN <= 0 || *subsN <= 0 {
 		fmt.Fprintln(os.Stderr, "harness seed: -types and -subs must be positive")
+		return 2
+	}
+	// Validate before the first API call: a typo in -modes must not leave
+	// twenty event types behind on its way to an error.
+	modes, err := parseModes(*modesArg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "harness seed: "+err.Error())
 		return 2
 	}
 
@@ -81,10 +116,13 @@ func runSeed(ctx context.Context, args []string) int {
 	}
 
 	// Subscriptions: cycle deterministically over channel (webhook/sse),
-	// delivery mode (ordered/key_ordered/unordered) and filter kind
-	// (attribute CEL / data CEL / projection allowlist). The least common
-	// multiple of the cycles is 6, so every combination occurs.
-	modes := []string{delivery.ModeOrdered, delivery.ModeKeyOrdered, delivery.ModeUnordered}
+	// delivery mode and filter kind (attribute CEL / data CEL / projection
+	// allowlist). The least common multiple of the cycles is 6, so every
+	// combination occurs. `modes` comes from -modes, parsed and validated
+	// before any API call; scripts/chaos.sh's start_sse_clients depends on the
+	// default naming all three, because it assigns clients to gateways in
+	// groups of three on the assumption that three consecutive seeded
+	// subscriptions are one of each mode.
 	created := make([]registry.Subscription, 0, *subsN)
 	fmt.Fprintf(os.Stderr, "harness seed: creating %d subscriptions\n", *subsN)
 	for j := range *subsN {

@@ -119,8 +119,23 @@ in-flight deliveries are in the
   equality pre-index.
 - *Ordering key: definition, default, no-key behavior* — implemented:
   `subject`, `ext:<name>`, `json:<path>`; default is the publisher's
-  partition key; unresolvable keys hash to one partition, order not
-  guaranteed across keys. Documented for consumers.
+  partition key; an unresolvable definition warns and falls back to that same
+  partition key. Documented for consumers — and since the ordering rework, with
+  the boundary spelled out in [spec §7](spec.md#ordering-preserved-not-guaranteed):
+  the key *preserves* write order per entity and retention class, it does not
+  *establish* one. Whether two concurrent publishes for one entity end up in
+  the right order is decided before any of this code runs, by whichever write
+  reaches the broker first. A total order is the publisher's to create, by
+  publishing synchronously per entity.
+- *Should the default delivery mode be `ordered` or `unordered`* — **changed to
+  `unordered`**, in the registry API's creation default and in the dispatcher's
+  re-application of defaults for rows that predate the field. `ordered` pins
+  `max_in_flight` to 1, so a subscriber that never chose a mode would silently
+  inherit a one-concurrent-delivery ceiling per subscription; strictness is
+  opted into, never inherited. This is a spec amendment (F9 and the §7 table),
+  not a deviation. Note what it does *not* affect: the delivery mode never
+  decided which partition or broker an event lands on — that is the publish-side
+  partition key, an independent axis.
 - *Fixed partition count for the deliveries topic* — 12, fixed; the sequence
   `(partition, offset)` depends on it.
 - *Webhook security* (§16 calls it its own block of work) — Eventarium has a
@@ -249,6 +264,21 @@ From §16, minus what Eventarium answered:
 - **Ordering across retention classes** — events in different class topics
   have no relative order; the ordering scope (same class? ordering group?) is
   defined in the registry but not enforced or documented to consumers.
+- **The oracle does not assert ordering** — `harness verify` checks
+  `missing=`, `unexpected=` and `duplicates=`, and nothing else; there is no
+  order check anywhere in the harness, although §15.4 lists "no order
+  violations" as a pass criterion. The data to check it already exists: `pub`
+  writes `seq` and `shard` into every payload. Two independent claims have to
+  be separated before it can be asserted, because only one of them is the
+  platform's — see spec §7. The **platform claim** (delivery order matches the
+  order the router read from the partition) needs ground truth the oracle does
+  not have today: the publish response returns `event_ref` but no partition or
+  offset, so nothing records where an event actually landed. The **publisher
+  claim** (router read order matches the caller's intent) cannot pass at all
+  with the current generator: `harness pub` assigns `seq` in order and then
+  hands the requests to 64 concurrent workers, so with `entityPoolSize = 1024`
+  an entity's successive events are in flight simultaneously. Serialising the
+  sender per entity is the prerequisite for asserting either.
 - **Replay** — the service is built and tested (results below). Still open:
   backfill for events that never matched the subscription (the spec itself
   defers this decision, §17/§11), and an exclusive mode that pauses live
@@ -503,6 +533,33 @@ were *correctly* not written while the broker was restarting — see the
 Earlier `kafka` rows in this document reported `unexpected=5,185`. That was
 publish-api's partial batch, fixed in the same round of work; the run is kept
 below because it is the measurement the fix was made against.
+
+### After the move to three brokers (RF=3)
+
+The same scenarios re-run on the three-broker cluster — all six `missing=0
+unexpected=0 unrecorded=0`, all exit 0:
+
+| Scenario | expected | duplicates |
+| --- | --- | --- |
+| `pods` | 58,366 | 192 |
+| `pg` | 58,366 | 0 |
+| `kafka` | **58,366** | **0** |
+| `ch` | 58,366 | 0 |
+| `rebalance` | 58,366 | 967 |
+| `gwfail` | 58,366 | 0 |
+
+The `kafka` row is the one that changed, and it is the whole point of RF=3. At
+RF=1 the restart was a real outage: 1,200 events were *correctly* not written,
+so `expected` came out at 52,536 instead of 58,366, and recovery replayed 2,746
+deliveries. At RF=3 the same `restart kafka` is a leader move and an ISR
+contraction — writes never stop, so `expected` is the full 58,366 and there is
+nothing to replay.
+
+`pods` and `rebalance` still show duplicates because their fault is `kill -9`
+of a dispatcher, which loses in-memory in-flight state by construction. Both
+counts sit inside the range the RF=1 runs produced (5,732–7,698 and
+533–16,554), consistent with what the next section says: duplicates track
+watermark lag, not the size of the crash.
 
 ### What the duplicates are, precisely
 

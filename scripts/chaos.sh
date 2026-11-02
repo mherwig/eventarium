@@ -209,9 +209,26 @@ clickhouse_up() {
 postgres_up() {
   "$DOCKER" exec pubsub-postgres-1 pg_isready -U pubsub -d pubsub >/dev/null 2>&1
 }
+# All three brokers, not one. With RF=3 the kafka scenario restarts broker 1,
+# so checking broker 1 alone would report the cluster up while two of three
+# were still down.
+#
+# Bootstrap on the INTERNAL listener, never CLIENT. These run inside the
+# container, where localhost is that container: CLIENT metadata hands back
+# localhost:9094 for broker 2, which is not listening inside broker 3, so a
+# cluster-wide --list fails on every broker but its own. INTERNAL metadata
+# returns kafka-N:29092, which resolves on the Compose network from anywhere.
 kafka_up() {
-  "$DOCKER" exec pubsub-kafka-1 \
-    /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1
+  local n h
+  for n in 1 2 3; do
+    case $n in
+      1) h=kafka ;;
+      2) h=kafka-2 ;;
+      3) h=kafka-3 ;;
+    esac
+    "$DOCKER" exec "pubsub-kafka-$n" \
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$h:29092" --list >/dev/null 2>&1 || return 1
+  done
 }
 
 # session_seconds turns KAFKA_SESSION_TIMEOUT into whole seconds for the
@@ -245,7 +262,7 @@ session_seconds() {
 # dead one" and "in transit, owned by nobody".
 assignment() {
   "$DOCKER" exec pubsub-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
-    --bootstrap-server localhost:9092 --describe --group dispatcher 2>/dev/null \
+    --bootstrap-server kafka:29092 --describe --group dispatcher 2>/dev/null \
     | awk 'NR>1 && $3 ~ /^[0-9]+$/ { p[$7] = p[$7] " " $3 }
            END { for (k in p) print k p[k] }' | sort
 }
@@ -424,7 +441,7 @@ status_writer_in_group() {
     local out
     if out=$(docker_value "status-writer group state" \
         "$DOCKER" exec pubsub-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
-        --bootstrap-server localhost:9092 --describe --group status-writer); then
+        --bootstrap-server kafka:29092 --describe --group status-writer); then
       # stderr matters here: kafka-consumer-groups.sh writes the "no active
       # members" notice there, and reading stdout alone reports a wedged
       # writer as a healthy one.
@@ -608,7 +625,7 @@ status_lag() {
   # wedged broker as a caught-up writer.
   out=$(docker_value "status-writer lag" \
     "$DOCKER" exec pubsub-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
-    --bootstrap-server localhost:9092 --describe --group status-writer) || return 1
+    --bootstrap-server kafka:29092 --describe --group status-writer) || return 1
   printf '%s\n' "$out" | lag_total
 }
 
@@ -999,7 +1016,8 @@ kafka)
   start_receivers
   publish_bg 200 60s
   sleep 10
-  echo "  t=10s  restart kafka"
+  echo "  t=10s  restart kafka (broker 1 of three; RF=3 means this is a leader"
+  echo "         move and an ISR contraction, not an outage)"
   "$DOCKER" compose restart kafka >/dev/null 2>&1
   assert_up "kafka" kafka_up
   sleep 20

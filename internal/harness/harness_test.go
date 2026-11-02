@@ -155,3 +155,39 @@ func TestWithinWindow(t *testing.T) {
 		})
 	}
 }
+
+// TestParseModes pins down `harness seed -modes`. The default must parse to
+// all three modes *in that order*: scripts/chaos.sh's start_sse_clients assigns
+// SSE clients to gateways in groups of three on the assumption that three
+// consecutive seeded subscriptions are one of each mode, and a different
+// default would reintroduce the aliasing that made the first gwfail run pass
+// vacuously.
+func TestParseModes(t *testing.T) {
+	all, err := parseModes("ordered,key_ordered,unordered")
+	if err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	want := []string{"ordered", "key_ordered", "unordered"}
+	if len(all) != len(want) {
+		t.Fatalf("default parsed %v, want %v", all, want)
+	}
+	for i := range want {
+		if all[i] != want[i] {
+			t.Fatalf("default parsed %v, want %v — order matters to chaos.sh", all, want)
+		}
+	}
+
+	got, err := parseModes(" unordered , key_ordered ")
+	if err != nil {
+		t.Fatalf("two modes with spaces: %v", err)
+	}
+	if len(got) != 2 || got[0] != "unordered" || got[1] != "key_ordered" {
+		t.Errorf("two modes with spaces = %v, want [unordered key_ordered]", got)
+	}
+
+	for _, bad := range []string{"", "   ", "unordered,strict", "ordered;unordered", "ORDERED"} {
+		if _, err := parseModes(bad); err == nil {
+			t.Errorf("parseModes(%q) accepted, want an error", bad)
+		}
+	}
+}

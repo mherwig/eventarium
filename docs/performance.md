@@ -62,8 +62,11 @@ whole-run p99 above ~100 ms as a regression.
 :::
 
 Caveats: this validates the pipeline shape and per-stage latencies, not
-cluster-scale HA (single broker, single node of everything). ClickHouse status
-write/query throughput is the most pressured component at this rate. The
+cluster-scale HA. It was measured on **single-node Kafka** — the stack has
+since moved to three brokers at RF=3, and these numbers have not been
+re-taken. PostgreSQL and ClickHouse are still single-node, so no figure here
+covers HA for the storage tier. ClickHouse status write/query throughput is
+the most pressured component at this rate. The
 status table is cumulative, so re-running a load test for the same owner
 counts earlier runs' deliveries too — the harness scopes Status API queries to
 the run's publish window (`from`/`to`).
@@ -204,6 +207,32 @@ is checked only against what the Status API *claims*, so a delivery written to
 `sse-live` and never read by a client would not be caught. With it, `RECEIVED`
 covers both channels — that is what makes `received` equal `expected` in the
 results above rather than webhook-only.
+
+### Choosing the delivery modes
+
+`harness seed -modes` cycles the subscriptions over a comma-separated list.
+The default is `ordered,key_ordered,unordered`, which is what the run above
+used — and what `scripts/chaos.sh` requires: it assigns SSE clients to gateways
+in groups of three on the assumption that three consecutive seeded
+subscriptions are one of each mode, so a chaos run must keep the default.
+
+For a **throughput** run, narrow it:
+
+```sh
+./bin/harness seed -owner load1 -prefix load1 -types 4 -subs 40 \
+  -modes unordered,key_ordered > seed.json
+```
+
+`ordered` pins `max_in_flight` to 1, so one `ordered` subscription is a
+per-subscription ceiling of one concurrent delivery. Left in the mix it becomes
+the ceiling of the entire measurement, and the number you get back describes
+that strict subscription rather than the platform. Keep the default for
+correctness and chaos runs — those are the ones that need `ordered` exercised —
+and narrow the list when the question is "how many events per second".
+
+This changes *delivery* concurrency only. Which partition and broker an event
+lands on is decided at publish by the partition key and is identical for every
+mode ([Specification §7](spec.md#ordering-preserved-not-guaranteed)).
 
 Chaos scenarios are a `make` target away:
 

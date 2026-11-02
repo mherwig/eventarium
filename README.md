@@ -40,6 +40,11 @@ Measured on one 8-core laptop with single-node Kafka, PostgreSQL and
 ClickHouse. Every figure comes from an independent oracle that recomputes
 expected deliveries itself rather than asking the platform.
 
+The stack now runs **three Kafka brokers at RF=3** (PostgreSQL and ClickHouse
+are still single-node); the figures below predate that change. See
+[Operations](docs/operations.md#kafka-topology) for the topology and for why a
+cluster cannot be grown to three in place.
+
 | | |
 | --- | --- |
 | Throughput | **1,003 ev/s** sustained — 30,000 events fanning out to 145,918 deliveries |

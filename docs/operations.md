@@ -63,9 +63,12 @@ docker compose exec -T postgres psql -U pubsub -d pubsub \
 docker compose exec -T clickhouse clickhouse-client -u pubsub --password pubsub -d pubsub \
   -q "SELECT status, count() FROM delivery_status GROUP BY status FORMAT PrettyCompact"
 
-# what the router produced, and per-stage latency from the headers
+# what the router produced, and per-stage latency from the headers.
+# INTERNAL listener, not localhost: this runs inside the container, where
+# localhost is that container only - a partition led by another broker would
+# be unreachable on localhost:9092.
 docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic deliveries --max-messages 3 \
+  --bootstrap-server kafka:29092 --topic deliveries --max-messages 3 \
   --property print.headers=true
 ```
 
@@ -75,6 +78,67 @@ To watch a breaker cycle or a drain:
 grep "circuit breaker" dispatcher.log         # opened / closed after successful probe / re-opened after failed probe
 docker compose exec -T postgres psql -U pubsub -d pubsub \
   -c "SELECT subscription_id, reason, count(*) FROM inbox GROUP BY 1, 2;"
+```
+
+## Kafka topology
+
+Three brokers in KRaft combined mode, `RF=3`, `min.insync.replicas=2`:
+
+| service | container | CLIENT (host) | INTERNAL (Compose network) |
+| --- | --- | --- | --- |
+| `kafka` | `pubsub-kafka-1` | `localhost:9092` | `kafka:29092` |
+| `kafka-2` | `pubsub-kafka-2` | `localhost:9094` | `kafka-2:29092` |
+| `kafka-3` | `pubsub-kafka-3` | `localhost:9095` | `kafka-3:29092` |
+
+**Which listener to use is decided by where the client runs, and getting it
+wrong fails quietly.**
+
+- Processes on the host — every Go service, `KAFKA_BROKERS` — use **CLIENT**.
+  The CLIENT port is the same inside the container as on the host, so a
+  broker's own healthcheck and its advertised address agree.
+- Anything run with `docker exec` or `docker compose exec` must use
+  **INTERNAL**. Inside a container `localhost` is *that* container, so CLIENT
+  metadata hands back `localhost:9094` for broker 2, which nothing in broker
+  3's container is listening on: `--list` and `--describe` then fail on every
+  broker but their own, while the command still exits 0. Kafka matches the
+  listener you connected on and returns that listener's addresses for the whole
+  cluster, which is why `kafka:29092` resolves correctly from any container.
+
+### Growing the cluster: do it before you have data
+
+**A single-node KRaft cluster cannot be grown to three by editing
+`KAFKA_CONTROLLER_QUORUM_VOTERS` and restarting.** Observed directly: the two
+new brokers start fresh, form a quorum among themselves (2 of 3 is already a
+majority) with an empty metadata log, and elect a leader. Broker 1 then joins
+as a follower of that leader, truncates its own `__cluster_metadata` to match a
+log that does not contain its topics, and dies with
+
+```
+Log doesn't have a last fetch epoch and there is a snapshot
+(OffsetAndEpoch(offset=579547, epoch=28)). Expected the snapshot's end offset
+to match the log's end
+```
+
+The topic segment files survive — only the metadata log is destroyed — but with
+the metadata gone the cluster does not know the topics exist, so the data is
+unreachable. Growing KRaft in place needs the dynamic voter-set procedure
+(`kafka-metadata-quorum.sh`), not a config edit.
+
+For this stack that means: **decide the broker count before you have data you
+care about.** To start over, remove only the Kafka volumes —
+`docker compose down -v` would also destroy PostgreSQL and ClickHouse.
+
+### Replication factor does not upgrade
+
+`kafkautil.EnsureTopics` tolerates `TOPIC_ALREADY_EXISTS`, and Kafka has no
+"alter replication factor": an existing topic keeps whatever it was created
+with. Changing `kafkautil.ReplicationFactor` does nothing to topics that
+already exist. Verify rather than assume:
+
+```sh
+docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --describe \
+  | awk '/^Topic:/{t=$2; for(i=1;i<=NF;i++) if($i=="ReplicationFactor:") print t, $(i+1)}'
 ```
 
 ## Chaos scenarios
