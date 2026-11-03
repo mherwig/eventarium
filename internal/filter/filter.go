@@ -8,12 +8,67 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"cel.dev/cel-go/cel"
 )
 
 // maxCost bounds one filter evaluation. A cost unit is roughly one operation.
 const maxCost = 50000
+
+// A compiled filter depends only on its source string, and the same handful
+// of expressions gets compiled over and over: registry.Reload recompiles
+// every subscription's filters on every poll, in every process. With a few
+// thousand subscriptions at a one-second poll that is tens of thousands of
+// cel.NewEnv + Compile + Program calls per second across the fleet, for
+// expressions that have not changed since the previous tick - measured as
+// replay-api at 150% CPU and loadavg 22 on an otherwise idle platform.
+// Memoising by source turns all of that into a map lookup.
+//
+// Failures are memoised too. Compilation is deterministic, so an expression
+// that does not compile now never will, and re-proving it every tick is the
+// difference between one warning and a permanent load.
+//
+// cacheMax bounds the map. A deployment has a handful of distinct filter
+// strings, so it stays small; the bound exists so a system churning through
+// unique strings cannot grow it without limit. Past it, calls compile
+// uncached rather than evict - correctness never depends on a hit, only
+// speed does.
+const cacheMax = 10000
+
+// cacheErr carries a compile failure in the same sync.Map as a success.
+type cacheErr struct{ err error }
+
+var (
+	attrCache sync.Map // string -> *Compiled | cacheErr
+	dataCache sync.Map
+	attrSize  atomic.Int64
+	dataSize  atomic.Int64
+)
+
+func cacheLookup(c *sync.Map, src string) (*Compiled, error, bool) {
+	v, ok := c.Load(src)
+	if !ok {
+		return nil, nil, false
+	}
+	if e, ok := v.(cacheErr); ok {
+		return nil, e.err, true
+	}
+	return v.(*Compiled), nil, true
+}
+
+func cacheStore(c *sync.Map, n *atomic.Int64, src string, prog *Compiled, err error) {
+	if n.Load() >= cacheMax {
+		return
+	}
+	if err != nil {
+		c.Store(src, cacheErr{err})
+	} else {
+		c.Store(src, prog)
+	}
+	n.Add(1)
+}
 
 // Compiled is a compiled filter expression.
 type Compiled struct {
@@ -31,6 +86,20 @@ var indexRe = regexp.MustCompile(`attributes\["([^"]+)"\]\s*==\s*"([^"]*)"`)
 // Variables: attributes (map[string]string), and the shorthand string
 // variables id, source, type, subject.
 func CompileAttribute(src string) (*Compiled, error) {
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return nil, errors.New("filter: empty expression")
+	}
+	if prog, err, ok := cacheLookup(&attrCache, src); ok {
+		return prog, err
+	}
+	prog, err := compileAttribute(src)
+	cacheStore(&attrCache, &attrSize, src, prog, err)
+	return prog, err
+}
+
+// compileAttribute is the uncached body. Callers go through CompileAttribute.
+func compileAttribute(src string) (*Compiled, error) {
 	src = strings.TrimSpace(src)
 	if src == "" {
 		return nil, errors.New("filter: empty expression")
@@ -66,6 +135,20 @@ func CompileAttribute(src string) (*Compiled, error) {
 // CompileData compiles a filter over the JSON data member.
 // Variable: data (dynamic).
 func CompileData(src string) (*Compiled, error) {
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return nil, errors.New("filter: empty expression")
+	}
+	if prog, err, ok := cacheLookup(&dataCache, src); ok {
+		return prog, err
+	}
+	prog, err := compileData(src)
+	cacheStore(&dataCache, &dataSize, src, prog, err)
+	return prog, err
+}
+
+// compileData is the uncached body. Callers go through CompileData.
+func compileData(src string) (*Compiled, error) {
 	src = strings.TrimSpace(src)
 	if src == "" {
 		return nil, errors.New("filter: empty expression")
