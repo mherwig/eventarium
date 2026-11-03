@@ -1,3 +1,30 @@
+# Three ClickHouse nodes sharing one image, entrypoint wrapper and healthcheck;
+# only identity, ports and storage differ per node. The wrapper exists because
+# Compose container names do not yield a usable ordinal - these end in -1,
+# -2-1 and -3-1, so ${HOSTNAME##*-} would be 1 for every one of them.
+x-clickhouse: &clickhouse
+  image: clickhouse/clickhouse-server:24.8
+  entrypoint: ["/bin/sh", "-ec"]
+  # $$ is Compose's escape for a literal $: without it ${...} here is
+  # interpolated by Compose from the shell environment - blank, as its
+  # "variable is not set" warnings showed - instead of reaching the shell.
+  # command, not args: args is Kubernetes, Compose passes the script as CMD.
+  command:
+    - |
+      sed -e "s/@NODE_ID@/$${CLICKHOUSE_NODE_ID}/g" \
+          -e "s/@REPLICA@/$${CLICKHOUSE_REPLICA}/g" \
+          /config/cluster.xml > /etc/clickhouse-server/config.d/010-cluster.xml
+      exec /entrypoint.sh
+  ulimits:
+    nofile:
+      soft: 262144
+      hard: 262144
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+
 services:
   # Three Kafka brokers in KRaft combined mode: three voters, RF=3, so losing
   # one broker costs an ISR contraction and a leader move, not availability.
@@ -211,24 +238,48 @@ services:
       timeout: 10s
       retries: 60
 
+  # Node 1 also publishes the ports CH_DSN points at. Every node holds every
+  # row, so any of them could serve them - but the DSN names one host, which
+  # is the same limitation PG_DSN has and is documented as such: losing this
+  # container costs the endpoint, not the data.
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    <<: *clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
     environment:
       CLICKHOUSE_USER: pubsub
       CLICKHOUSE_PASSWORD: pubsub
       CLICKHOUSE_DB: pubsub
-    ports:
-      - "8123:8123"
-      - "9000:9000"
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping >/dev/null 2>&1"]
-      interval: 5s
-      timeout: 5s
-      retries: 30
+      CLICKHOUSE_NODE_ID: "1"
+      CLICKHOUSE_REPLICA: "1"
+    volumes:
+      - ./docker/clickhouse-cluster.xml:/config/cluster.xml:ro
+      - clickhouse1-data:/var/lib/clickhouse
+
+  clickhouse-2:
+    <<: *clickhouse
+    environment:
+      CLICKHOUSE_USER: pubsub
+      CLICKHOUSE_PASSWORD: pubsub
+      CLICKHOUSE_DB: pubsub
+      CLICKHOUSE_NODE_ID: "2"
+      CLICKHOUSE_REPLICA: "2"
+    volumes:
+      - ./docker/clickhouse-cluster.xml:/config/cluster.xml:ro
+      - clickhouse2-data:/var/lib/clickhouse
+
+  clickhouse-3:
+    <<: *clickhouse
+    environment:
+      CLICKHOUSE_USER: pubsub
+      CLICKHOUSE_PASSWORD: pubsub
+      CLICKHOUSE_DB: pubsub
+      CLICKHOUSE_NODE_ID: "3"
+      CLICKHOUSE_REPLICA: "3"
+    volumes:
+      - ./docker/clickhouse-cluster.xml:/config/cluster.xml:ro
+      - clickhouse3-data:/var/lib/clickhouse
 
 # Named rather than anonymous: each holds a base backup taken once from the
 # primary, and that copy is not reproducible from anywhere else if the volume
@@ -236,3 +287,8 @@ services:
 volumes:
   pg2-data:
   pg3-data:
+  # Named rather than anonymous: each holds a node's ClickHouse data, and an
+  # orphaned anonymous volume is easy to lose without noticing.
+  clickhouse1-data:
+  clickhouse2-data:
+  clickhouse3-data:

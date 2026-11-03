@@ -1,4 +1,8 @@
 GO    ?= go
+# Names the ClickHouse cluster the admin job provisions against, so
+# delivery_status is created ON CLUSTER with ReplicatedMergeTree rather than
+# as a single-node MergeTree. Unset it to provision a one-node stack.
+CH_CLUSTER ?= pubsub
 export PATH := $(HOME)/.local/go/bin:$(PATH)
 
 .PHONY: build check up down logs infra admin token test tidy fmt clean stack chaos chaos-test
@@ -31,11 +35,11 @@ infra: up
 	@until docker compose exec -T kafka-3 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-3:29092 --list >/dev/null 2>&1; do sleep 2; done
 	@until docker compose exec -T postgres pg_isready -U pubsub -d pubsub >/dev/null 2>&1; do sleep 2; done
 	@until docker compose exec -T clickhouse wget -qO- http://localhost:8123/ping >/dev/null 2>&1; do sleep 2; done
-	$(GO) run ./cmd/admin all
+	CH_CLUSTER=$(CH_CLUSTER) $(GO) run ./cmd/admin all
 
 ## admin runs the provisioning helper directly against the environment
 admin:
-	$(GO) run ./cmd/admin all
+	CH_CLUSTER=$(CH_CLUSTER) $(GO) run ./cmd/admin all
 
 ## token OWNER=team-a [SCOPES=publish,subscribe] [TTL=24h] mints a dev JWT
 token:

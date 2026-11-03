@@ -1,0 +1,75 @@
+<!--
+  ClickHouse cluster configuration for the local compose stack: one shard,
+  three replicas, coordinated by an embedded Keeper ensemble.
+
+  Rendered into config.d by each node's entrypoint, which substitutes the two
+  placeholders. They exist because Compose container names do not yield a
+  usable ordinal - pubsub-clickhouse-1, pubsub-clickhouse-2-1 and
+  pubsub-clickhouse-3-1 all end in "-1", so ${HOSTNAME##*-} would be 1 for
+  every node. Each service states its own identity instead, which is explicit
+  and cannot silently collide.
+
+  Three parts, each load-bearing:
+
+    keeper_server   the Raft ensemble that coordinates replication. Without it
+                    ReplicatedMergeTree has nothing to agree with.
+    macros          {shard} and {replica}, which the table engine interpolates
+                    into its own path - same shard on every node is what makes
+                    them replicas rather than three independent copies.
+    remote_servers  the cluster the app's ON CLUSTER DDL targets (CH_CLUSTER),
+                    so CREATE TABLE reaches all three at once instead of the
+                    one node the connection happened to land on.
+-->
+<clickhouse>
+  <keeper_server>
+    <tcp_port>9181</tcp_port>
+    <server_id>@NODE_ID@</server_id>
+    <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
+    <snapshot_storage_path>/var/lib/clickhouse/coordination/snapshots</snapshot_storage_path>
+    <coordination_settings>
+      <operation_timeout_ms>10000</operation_timeout_ms>
+      <session_timeout_ms>30000</session_timeout_ms>
+    </coordination_settings>
+    <raft_configuration>
+      <server>
+        <id>1</id>
+        <hostname>clickhouse</hostname>
+        <port>9234</port>
+      </server>
+      <server>
+        <id>2</id>
+        <hostname>clickhouse-2</hostname>
+        <port>9234</port>
+      </server>
+      <server>
+        <id>3</id>
+        <hostname>clickhouse-3</hostname>
+        <port>9234</port>
+      </server>
+    </raft_configuration>
+  </keeper_server>
+
+  <macros>
+    <shard>0</shard>
+    <replica>@REPLICA@</replica>
+  </macros>
+
+  <remote_servers>
+    <pubsub>
+      <shard>
+        <replica>
+          <host>clickhouse</host>
+          <port>9000</port>
+        </replica>
+        <replica>
+          <host>clickhouse-2</host>
+          <port>9000</port>
+        </replica>
+        <replica>
+          <host>clickhouse-3</host>
+          <port>9000</port>
+        </replica>
+      </shard>
+    </pubsub>
+  </remote_servers>
+</clickhouse>

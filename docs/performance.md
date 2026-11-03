@@ -13,7 +13,9 @@ missing or unexpected delivery.
 ## Throughput at 1,000 events/s
 
 Measured on the local compose stack on one 8-core laptop: single-node
-Kafka/PostgreSQL/ClickHouse and one instance of every service.
+Kafka/PostgreSQL/ClickHouse and one instance of every service — the topology
+as it then stood. All three stores have since gone to three nodes each, and
+these figures predate that change.
 
 Topology: 4 event types, 40 subscriptions — 20 webhook and 20 SSE — covering
 unordered, per-shard ordered (attribute filter), key-ordered (data filter
@@ -62,10 +64,11 @@ whole-run p99 above ~100 ms as a regression.
 :::
 
 Caveats: this validates the pipeline shape and per-stage latencies, not
-cluster-scale HA. It was measured on **single-node Kafka** — the stack has
-since moved to three brokers at RF=3, and these numbers have not been
-re-taken. PostgreSQL and ClickHouse are still single-node, so no figure here
-covers HA for the storage tier. ClickHouse status write/query throughput is
+cluster-scale HA. It was measured on **single-node Kafka, PostgreSQL and
+ClickHouse** — the stack has since moved to three brokers at RF=3, three
+CloudNativePG instances and three replicated ClickHouse nodes, and **these
+numbers have not been re-taken**. No figure here therefore covers HA for the
+storage tier. ClickHouse status write/query throughput is
 the most pressured component at this rate. The
 status table is cumulative, so re-running a load test for the same owner
 counts earlier runs' deliveries too — the harness scopes Status API queries to

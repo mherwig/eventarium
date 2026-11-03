@@ -171,12 +171,23 @@ cleanup_clients() {
 # ---------------------------------------------------------------------------
 # assertions: a scenario must not pass unless its fault actually landed
 # ---------------------------------------------------------------------------
+# Polls, for the mirror-image reason assert_up does: a service takes seconds
+# to notice a dependency has gone, and a probe checked once at the wrong
+# instant says nothing about whether the fault landed. Observed directly -
+# stopping ClickHouse left status-api answering 200 at t+0 because its
+# readiness check had not re-run yet, and 503 by t+3s - so a single check
+# reported "FAULT NOT APPLIED" against a fault that had plainly applied.
 assert_down() { # name, command...
   local name=$1; shift
-  if "$@" >/dev/null 2>&1; then
-    echo "  FAULT NOT APPLIED: $name still reachable - aborting"; exit 3
-  fi
-  echo "  fault confirmed: $name is down"
+  local i
+  for i in $(seq 1 30); do
+    if ! "$@" >/dev/null 2>&1; then
+      echo "  fault confirmed: $name is down"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "  FAULT NOT APPLIED: $name still reachable after 30s - aborting"; exit 3
 }
 # Polls, because a database takes seconds to accept connections again and a
 # probe checked once at the wrong instant says nothing about whether the

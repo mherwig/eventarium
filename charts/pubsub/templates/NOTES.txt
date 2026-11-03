@@ -45,6 +45,6 @@ Notes
   Kafka drops them after offsets retention (7 days by default).
 - The stores match the app layer: three Kafka brokers at replication factor
   three, three PostgreSQL instances on CloudNativePG that fail over on their
-  own (clients keep using the `-rw` Service through a promotion), and one
-  ClickHouse - which is now the only single instance, and the remaining
-  single point of failure. See charts/pubsub-infra.
+  own (clients keep using the `-rw` Service through a promotion), and three
+  ClickHouse nodes with ReplicatedMergeTree over an embedded Keeper ensemble,
+  so every node holds every row. See charts/pubsub-infra.

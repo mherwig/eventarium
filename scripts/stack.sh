@@ -29,6 +29,11 @@ MODE="${1:-replicas}"
 export PG_DSN="${PG_DSN:-postgres://pubsub:pubsub@localhost:5432/pubsub?sslmode=disable}"
 export CH_DSN="${CH_DSN:-clickhouse://pubsub:pubsub@localhost:9000/pubsub}"
 export JWT_SECRET="${JWT_SECRET:-dev-secret}"
+# Names the ClickHouse cluster in <remote_servers>. Set, chstore creates the
+# database and delivery_status ON CLUSTER with ReplicatedMergeTree, so all
+# three nodes hold every row; unset, plain MergeTree on one node. See
+# docker/clickhouse-cluster.xml for the other half of this.
+export CH_CLUSTER="${CH_CLUSTER:-pubsub}"
 # Three brokers, matching docker-compose.yaml. Every service reads this; the
 # default in kafkautil is a single localhost:9092, which would silently pin
 # the whole platform to broker 1 and make RF=3 pointless.
