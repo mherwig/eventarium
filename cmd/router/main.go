@@ -213,7 +213,16 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 	// from a revoke after the fact is how long the transaction lived.
 	_, txnTimeout := kafkautil.Timeouts()
 	backoff := errorBackoff
+	// Stage timings for the hop no external measurement can split: how long
+	// records waited in Kafka before this poll returned them, how long the
+	// serial Process() loop took, and how long the transactional produce
+	// took. Those three plus the generator and publish-api are the whole
+	// publish-to-pending figure, so each is named rather than inferred.
+	var batches int
+	var sumWait, sumProc, sumSync, sumEnd, sumPoll, sumCycle time.Duration
+	var lastPoll time.Time
 	for ctx.Err() == nil {
+		pollStart := time.Now()
 		fetches := sess.PollRecords(ctx, pollBatch)
 		if ctx.Err() != nil || fetches.IsClientClosed() {
 			return nil
@@ -238,10 +247,33 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 			slog.Warn("router: fetch error, processing partial batch", "err", fetchErr)
 		}
 
+		// How long PollRecords itself took, and how long since the previous
+		// productive poll. A large pollDur means the fetch was waiting for
+		// data to exist rather than for this router to be free - the
+		// difference between "nothing to read yet" and "the router is slow".
+		// A large cycle with a small pollDur points the other way.
+		pollDur := time.Since(pollStart)
+		var cycle time.Duration
+		if !lastPoll.IsZero() {
+			cycle = pollStart.Sub(lastPoll)
+		}
+		lastPoll = pollStart
+
+		// How long these records waited in Kafka before this poll handed
+		// them over - the record's produce timestamp against the moment we
+		// picked it up. Queueing, distinct from the work below.
+		var kafkaWait time.Duration
+		for _, rec := range recs {
+			kafkaWait += time.Since(rec.Timestamp)
+		}
+		kafkaWait /= time.Duration(len(recs))
+
 		out := make([]*kgo.Record, 0, len(recs)*2)
+		procStart := time.Now()
 		for _, rec := range recs {
 			out = append(out, r.Process(rec)...)
 		}
+		procDur := time.Since(procStart)
 
 		if err := sess.Begin(); err != nil {
 			slog.Error("router: beginning transaction", "err", err)
@@ -257,7 +289,14 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 		// One transaction covers the delivery records, their pending
 		// status records and the offset commit: End(TryCommit) flushes
 		// everything atomically (section 9).
-		if res := sess.ProduceSync(ctx, out...); res.FirstErr() != nil {
+		//
+		// ProduceSync and End are timed apart because they are different
+		// costs - waiting for record acks versus committing markers across
+		// every partition the batch touched - and they point at different
+		// fixes: producer tuning versus the transaction itself.
+		res := sess.ProduceSync(ctx, out...)
+		syncDur := time.Since(begun)
+		if res.FirstErr() != nil {
 			slog.Error("router: producing batch", "err", res.FirstErr())
 			if _, err := sess.End(ctx, kgo.TryAbort); err != nil {
 				slog.Error("router: aborting transaction", "err", err)
@@ -269,6 +308,7 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 			continue
 		}
 		committed, err := sess.End(ctx, kgo.TryCommit)
+		endDur := time.Since(begun) - syncDur
 		if ctx.Err() != nil {
 			return nil // shutdown mid-flush, not a failure
 		}
@@ -313,6 +353,28 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 			continue
 		}
 		backoff = errorBackoff
+
+		// Committed: account for this batch. These three are the router's
+		// share of publish-to-pending; the generator and publish-api are
+		// measured separately, so the four together explain the whole figure.
+		batches++
+		sumWait += kafkaWait
+		sumProc += procDur
+		sumSync += syncDur
+		sumEnd += endDur
+		sumPoll += pollDur
+		sumCycle += cycle
+		if batches >= 50 {
+			slog.Info("router: stage timings",
+				"kafka_wait_ms", sumWait.Milliseconds()/int64(batches),
+				"process_ms", sumProc.Milliseconds()/int64(batches),
+				"produce_sync_ms", sumSync.Milliseconds()/int64(batches),
+				"produce_end_ms", sumEnd.Milliseconds()/int64(batches),
+				"poll_ms", sumPoll.Milliseconds()/int64(batches),
+				"cycle_ms", sumCycle.Milliseconds()/int64(batches),
+				"batches", batches, "records", len(recs))
+			batches, sumWait, sumProc, sumSync, sumEnd, sumPoll, sumCycle = 0, 0, 0, 0, 0, 0, 0
+		}
 	}
 	return nil
 }

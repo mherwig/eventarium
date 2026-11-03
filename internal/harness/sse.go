@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -127,6 +128,64 @@ func runSSE(ctx context.Context, args []string) int {
 	var sseID, event string
 	var data []string
 
+	// Acks are cumulative - the gateway's ackUpTo() marks everything up to the
+	// given sequence - and spec.md:7 asks for them "batched every few hundred
+	// ms". They used to be one synchronous POST per event, made from inside
+	// the read loop, which capped a single client at ~219 events/s and, by
+	// blocking the read, backed TCP up until measured SSE delivery latency
+	// was 17 s in every load test while the gateway itself was delivering in
+	// ~100 ms. The read loop now records the highest sequence seen and a
+	// sender coalesces them; acks and ackErrs keep the same meaning.
+	ackMu := &sync.Mutex{}
+	latestAck, sentAck := "", ""
+	ackStop := make(chan struct{})
+	ackDone := make(chan struct{})
+	setAck := func(id string) {
+		ackMu.Lock()
+		latestAck = id
+		ackMu.Unlock()
+	}
+	flushAck := func(ctx context.Context, base int) {
+		ackMu.Lock()
+		id, from := latestAck, sentAck
+		ackMu.Unlock()
+		if id == "" || id == from {
+			return
+		}
+		if aerr := ackEvent(ctx, bases[base], token, *sub, id); aerr != nil {
+			ackErrs.Add(1)
+			fmt.Fprintln(os.Stderr, "harness sse: ack:", aerr)
+			return
+		}
+		acks.Add(1)
+		ackMu.Lock()
+		sentAck = id
+		ackMu.Unlock()
+	}
+	if *ack {
+		go func() {
+			defer close(ackDone)
+			tick := time.NewTicker(ackInterval)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ackStop:
+					// A short run must still end with an accurate ack, but the
+					// run's context is already cancelled by then - use one that
+					// outlives it rather than silently dropping the tail.
+					fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+					flushAck(fctx, base)
+					cancel()
+					return
+				case <-tick.C:
+					flushAck(ctx, base)
+				}
+			}
+		}()
+	} else {
+		close(ackDone)
+	}
+
 	flush := func() {
 		if len(data) == 0 {
 			return
@@ -172,12 +231,9 @@ func runSSE(ctx context.Context, args []string) int {
 			}
 		}
 		if *ack && sseID != "" {
-			if aerr := ackEvent(ctx, bases[base], token, *sub, sseID); aerr != nil {
-				ackErrs.Add(1)
-				fmt.Fprintln(os.Stderr, "harness sse: ack:", aerr)
-			} else {
-				acks.Add(1)
-			}
+			// Record only: the sender coalesces, and the ack is cumulative,
+			// so nothing between the previous send and this one is lost.
+			setAck(sseID)
 		}
 		sseID, event, data = "", "", nil
 	}
@@ -292,6 +348,11 @@ func runSSE(ctx context.Context, args []string) int {
 		}
 	}
 
+	// Stop the acker and let it flush: the tail of a run must still be
+	// acknowledged or deliveries stay "sent" instead of "delivered".
+	close(ackStop)
+	<-ackDone
+
 	if fatal != nil {
 		fmt.Fprintln(os.Stderr, "harness sse:", fatal)
 	} else {
@@ -327,6 +388,11 @@ func fromSSEID(sseID, eventID string) (eventRef, deliveryID string) {
 
 // ackEvent acknowledges one delivery with the Last-Event-ID (docs/contracts.md,
 // sse-gateway: Last-Event-ID or body).
+// ackInterval is how often the coalesced ack is sent. spec.md:7 asks for
+// per-event acks "batched every few hundred ms"; 100 ms keeps the delivered
+// status fresh without putting a round trip in the client's read loop.
+const ackInterval = 100 * time.Millisecond
+
 func ackEvent(ctx context.Context, base, token, subID, lastEventID string) error {
 	actx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

@@ -10,6 +10,13 @@ import (
 // ("sse-live-<NODE_ID>") and starts at the latest offset, because every node
 // must see every message and drop the ones that are not its own (section 6.5).
 func (g *Gateway) runLive(ctx context.Context) {
+	// Time the first half of the boundary nothing outside could see: Kafka's
+	// record timestamp (produce time) to the moment this consumer hands the
+	// record to the connection queue. The second half - queue to socket
+	// write - is timed in the connection's own goroutine, because they run
+	// concurrently and cannot share an accumulator.
+	var kafkaAge time.Duration
+	var n int
 	for {
 		fs := g.liveCl.PollFetches(ctx)
 		if ctx.Err() != nil {
@@ -43,14 +50,25 @@ func (g *Gateway) runLive(ctx context.Context) {
 			if c == nil || lm.Message == nil || c.subID != lm.Message.SubscriptionID {
 				continue
 			}
+			handed := false
 			select {
-			case c.out <- outbound{seq: lm.Sequence, msg: lm.Message}:
+			case c.out <- outbound{seq: lm.Sequence, msg: lm.Message, enqueued: time.Now()}:
+				handed = true
 			default:
 				// Overflow: close the connection instead of buffering without
 				// bound. The client reconnects with Last-Event-ID and the
 				// gateway serves the backlog it missed from the deliveries
 				// topic, which is the recovery path of section 8.
 				c.close("delivery queue overflow, reconnect with Last-Event-ID")
+			}
+			if handed {
+				kafkaAge += time.Since(rec.Timestamp)
+				n++
+				if n >= 500 {
+					g.log.Info("sse-live: kafka record -> connection queue",
+						"avg_ms", kafkaAge.Milliseconds()/int64(n), "n", n)
+					kafkaAge, n = 0, 0
+				}
 			}
 		}
 		// Same commit rule as the delivery stage: a crash repeats a batch

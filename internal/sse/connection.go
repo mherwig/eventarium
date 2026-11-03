@@ -36,6 +36,13 @@ type ssePayload struct {
 type outbound struct {
 	seq delivery.Seq
 	msg *delivery.Message
+	// enqueued is when runLive handed this record to the connection queue.
+	// It exists to split the path at the boundary no external measurement
+	// could see: Kafka handoff (observable as consumer lag) versus the socket
+	// write (observable as the client's received_at). A constant delay on one
+	// side or the other points at a different fix, so the two are timed
+	// separately rather than inferred from a total.
+	enqueued time.Time
 }
 
 // frame renders the SSE wire format. The sequence number of the deliveries

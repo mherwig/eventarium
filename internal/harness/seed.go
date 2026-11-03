@@ -60,6 +60,8 @@ func runSeed(ctx context.Context, args []string) int {
 	webhookURL := fs.String("webhook-url", envStr("WEBHOOK_URL", "http://localhost:9090/hook"), "callback URL for webhook subscriptions (env HARNESS_WEBHOOK_URL)")
 	modesArg := fs.String("modes", envStr("MODES", "ordered,key_ordered,unordered"),
 		"comma-separated delivery modes to cycle over (env HARNESS_MODES)")
+	maxInFlight := fs.Int("max-in-flight", envInt("MAX_IN_FLIGHT", 0),
+		"max_in_flight for the created subscriptions; 0 leaves the registry default (env HARNESS_MAX_IN_FLIGHT)")
 	if code, done := parseResult(fs.Parse(args)); done {
 		return code
 	}
@@ -69,6 +71,10 @@ func runSeed(ctx context.Context, args []string) int {
 	}
 	if *typesN <= 0 || *subsN <= 0 {
 		fmt.Fprintln(os.Stderr, "harness seed: -types and -subs must be positive")
+		return 2
+	}
+	if *maxInFlight < 0 {
+		fmt.Fprintln(os.Stderr, "harness seed: -max-in-flight must be 0 (leave the registry default) or positive")
 		return 2
 	}
 	// Validate before the first API call: a typo in -modes must not leave
@@ -129,6 +135,14 @@ func runSeed(ctx context.Context, args []string) int {
 		sub := map[string]any{
 			"event_type":    typeNames[j%len(typeNames)],
 			"delivery_mode": modes[j%len(modes)],
+		}
+		// max_in_flight is what sets delivery concurrency for key_ordered and
+		// unordered (section 7); ordered pins it to 1 whatever this says. The
+		// registry's own default is 1, so without this flag every seeded
+		// subscription delivers one event at a time and the difference between
+		// the modes never appears in a throughput number.
+		if *maxInFlight > 0 {
+			sub["max_in_flight"] = *maxInFlight
 		}
 		channel := delivery.ChannelWebhook
 		if j%2 == 1 {

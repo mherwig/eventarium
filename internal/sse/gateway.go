@@ -534,6 +534,14 @@ func (g *Gateway) handleSSE(w http.ResponseWriter, r *http.Request) {
 	expiry := time.NewTimer(time.Until(exp))
 	defer expiry.Stop()
 
+	// Second half of the same boundary: how long a delivery sat in conn.out
+	// before it reached the socket. The first half (Kafka record -> queue) is
+	// timed in runLive, which runs concurrently and cannot share an
+	// accumulator. Only the two together account for the gap between the
+	// platform marking a delivery sent and the client receiving it.
+	var queueAge time.Duration
+	var queued int
+
 	for {
 		select {
 		case <-r.Context().Done():
@@ -581,6 +589,14 @@ func (g *Gateway) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if err := write(frame); err != nil {
 				g.log.Info("sse write failed", "connection", conn.id, "err", err)
 				return
+			}
+			queueAge += time.Since(out.enqueued)
+			queued++
+			if queued >= 200 {
+				g.log.Info("sse: connection queue -> socket",
+					"avg_ms", queueAge.Milliseconds()/int64(queued),
+					"n", queued, "connection", conn.id)
+				queueAge, queued = 0, 0
 			}
 			// Only once the bytes are on the wire does the connection remember
 			// the delivery, so an ack can be answered honestly.
