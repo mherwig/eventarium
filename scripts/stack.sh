@@ -4,10 +4,15 @@
 #
 #   ./scripts/stack.sh [replicas]     # default: 3 routers, 3 dispatchers, 3 gateways
 #   ./scripts/stack.sh single         # one of each instead (README §3 by hand)
+#   ./scripts/stack.sh stop           # bring it down (nothing is deleted)
 #
 # Why replicas at all: killing "one of one" is not a failure mode. Three is the
 # minimum in which a kill -9 hands the partitions to somebody, which is the
 # only way to exercise a rebalance and the commit watermark's Keep() path.
+#
+# Every service runs under scripts/supervise.sh: one that exits on its own is
+# restarted, one that is killed is not. See that script's header for why the
+# pid file has to name the service rather than its supervisor.
 #
 # It always rebuilds first. The checked-in bin/ holds binaries that predate the
 # readiness work - testing stale code silently is the one failure a chaos
@@ -49,6 +54,44 @@ if ! command -v "${GO:-go}" >/dev/null 2>&1; then
   export PATH="$HOME/.local/go/bin:$HOME/go/bin:$PATH"
 fi
 
+# stop brings the platform down, and it is the supported way to do so - the
+# ordering is the point: remove the pid file FIRST, then signal the process.
+# In scripts/supervise.sh the pid file is the supervisor's mandate, so one
+# that finds it gone retires instead of respawning what it was watching.
+# Signalling without removing it would race the case this exists for: a
+# supervisor asleep between restarts, which would otherwise bring the service
+# straight back and leave the stack half up with every pid file claiming
+# otherwise.
+stop() {
+  local pass f p found signalled=0
+  # Three passes, because a supervisor can take a moment to notice and
+  # anything that reappears was respawned in the window and gets the same
+  # treatment. Normally pass two finds nothing and stops.
+  for pass in 1 2 3; do
+    found=0
+    for f in "$LOG"/*.pid; do
+      [ -e "$f" ] || continue
+      p=$(cat "$f" 2>/dev/null)
+      rm -f "$f"
+      [ -n "${p:-}" ] || continue
+      if kill "$p" 2>/dev/null; then
+        signalled=$((signalled + 1))
+        found=1
+      fi
+    done
+    [ "$found" = 1 ] || break
+    sleep 1
+  done
+  echo "  signalled $signalled services (logs left in $LOG)"
+}
+
+# stop first, and before the build: stopping must not require a successful
+# compile of code that is not about to run.
+if [ "$MODE" = "stop" ]; then
+  stop
+  exit 0
+fi
+
 echo "building into $BIN ..."
 "${GO:-go}" build -o "$BIN/" ./cmd/... || { echo "build failed" >&2; exit 1; }
 
@@ -71,11 +114,34 @@ refuse_if_serving() { # port, name
 # binary (router, router, router) but must not share a log or a pid file -
 # scripts/chaos.sh reads $LOG/d1.pid to kill it and $LOG/d1.log to watch its
 # heartbeat, and three replicas writing the same file would make both lie.
+#
+# The process is started under scripts/supervise.sh rather than directly: a
+# service that exits on its own (the router does, by design, on a
+# non-retryable commit failure - main.go says "exit so Kubernetes restarts
+# the pod") would otherwise stay dead here, where nothing restarts it. The
+# supervisor restarts those and only those; a kill -9 still leaves the
+# service dead, which is what the chaos scenarios require. See the header of
+# supervise.sh for why the pid file must hold the child.
 start() {
-  local bin=$1 log=$2; shift 2
-  nohup env "$@" "$BIN/$bin" > "$LOG/$log.log" 2>&1 &
-  echo $! > "$LOG/$log.pid"
-  echo "  $log pid $(cat "$LOG/$log.pid")"
+  local bin=$1 log=$2 i; shift 2
+  # The supervisor writes this file, with the child's pid in it, so the
+  # previous one has to go first - otherwise a supervisor that never got
+  # going would leave a stale pid behind and chaos would kill that instead.
+  rm -f "$LOG/$log.pid"
+  nohup "$ROOT/scripts/supervise.sh" "$LOG/$log.pid" env "$@" "$BIN/$bin" \
+    > "$LOG/$log.log" 2>&1 &
+  # Wait for it rather than racing it: the pid file is the handle every later
+  # step - chaos's kill, the alive count, this script's own report - works
+  # from, so it must exist before start() returns.
+  for i in $(seq 1 50); do
+    [ -s "$LOG/$log.pid" ] && break
+    sleep 0.1
+  done
+  if [ -s "$LOG/$log.pid" ]; then
+    echo "  $log pid $(cat "$LOG/$log.pid")"
+  else
+    echo "  $log: supervisor never wrote $LOG/$log.pid - see $LOG/$log.log" >&2
+  fi
 }
 
 start_services() {
@@ -133,7 +199,7 @@ single)
   PORTS="8080 8081 8083 8084 8087 8085 8086 8082"
   ;;
 *)
-  echo "usage: $0 [replicas|single]" >&2
+  echo "usage: $0 [replicas|single|stop]" >&2
   exit 2
   ;;
 esac

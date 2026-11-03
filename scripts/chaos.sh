@@ -922,11 +922,20 @@ verify() {
 }
 
 # start_bin <binary> <log-name> [ENV=...] - restarts a replica a scenario killed.
+# Same supervisor as stack.sh, so a replica brought back by a scenario keeps
+# being supervised: without it the restart would be a bare process and the
+# next self-exit would leave the topology short again, which is exactly how
+# the kafka scenario stranded r2.
 start_bin() {
-  local bin=$1 name=$2; shift 2
-  nohup env "$@" "$BIN/$bin" > "$LOG/$name.log" 2>&1 &
-  echo $! > "$LOG/$name.pid"
-  echo "  restarted $name (pid $(cat "$LOG/$name.pid"))"
+  local bin=$1 name=$2 i; shift 2
+  rm -f "$LOG/$name.pid"
+  nohup "$ROOT/scripts/supervise.sh" "$LOG/$name.pid" env "$@" "$BIN/$bin" \
+    > "$LOG/$name.log" 2>&1 &
+  for i in $(seq 1 50); do
+    [ -s "$LOG/$name.pid" ] && break
+    sleep 0.1
+  done
+  echo "  restarted $name (pid $(cat "$LOG/$name.pid" 2>/dev/null || echo '?'))"
 }
 
 # ---------------------------------------------------------------------------

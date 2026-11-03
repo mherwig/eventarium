@@ -250,6 +250,38 @@ The place it starts to matter is a much larger service count, where
 `REGISTRY_POLL` traffic scales with instances — and if that arrives, the split
 above is already the correct one.
 
+## Local stack lifecycle
+
+`make stack` starts fourteen supervised processes; `make stack-stop` brings
+them down. Each runs under `scripts/supervise.sh`, which exists because
+`cmd/router` exits by design on a non-retryable commit failure — `main.go`
+says *"exit so Kubernetes restarts the pod with a fresh session"* — and
+nothing in compose restarted it. A broker restart during the `kafka` scenario
+therefore left a router dead: that scenario still passed (two of three
+routers absorbed the loss), and the next three then refused to run against a
+topology they could no longer see.
+
+The pid file holds **the service, not the supervisor**, because chaos kills by
+pid file — `kill -9` has to land on the service for the fault to be real. A
+file naming the supervisor would take out the watcher and leave the service
+running, so those scenarios would pass for the wrong reason. What restarts
+and what does not is the child's exit status:
+
+| Exit status | What it means | Supervisor |
+| --- | --- | --- |
+| `0` | clean stop — which is what SIGTERM produces here, since every service catches it and returns from `main` | stays down |
+| `1`–`127` | crashed, or the router's deliberate commit-failure exit (`os.Exit(1)`) | restarts after 1 s |
+| `≥ 128` | killed by a signal — `kill -9` from a scenario, OOM | stays down, fault left applied |
+
+Treating `0` as a crash would make the stack impossible to stop: killing a
+service would bring it straight back. Ten consecutive exits inside five
+seconds gives up instead of spinning, so a broken binary surfaces as one log
+line rather than a hot loop.
+
+`stack-stop` removes each pid file *before* signalling it — the pid file is
+the supervisor's mandate, so one that finds it gone retires rather than
+respawning what it was watching.
+
 ## Chaos scenarios
 
 Six scenarios, each "publish at 200 ev/s for 60 s, inject one fault in the
@@ -368,7 +400,9 @@ go test ./...                                       # unit tests for chquery and
 
 ## Resetting
 
-Reset everything Kafka/PostgreSQL/ClickHouse-specific without touching the
+Stop the local platform first if it is running — `make stack-stop` stops the
+services and leaves their logs and the databases alone. Then reset everything
+Kafka/PostgreSQL/ClickHouse-specific without touching the
 code: `docker compose down -v`, then `go run ./cmd/admin all`. To reset only
 the data, `TRUNCATE inbox;` in PostgreSQL and `TRUNCATE TABLE delivery_status;`
 in ClickHouse.

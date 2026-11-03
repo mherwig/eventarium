@@ -5,7 +5,7 @@ GO    ?= go
 CH_CLUSTER ?= pubsub
 export PATH := $(HOME)/.local/go/bin:$(PATH)
 
-.PHONY: build check up down logs infra admin token test tidy fmt clean stack chaos chaos-test
+.PHONY: build check up down logs infra admin token test tidy fmt clean stack stack-stop chaos chaos-test
 
 ## build compiles every service into bin/
 build:
@@ -52,6 +52,13 @@ token:
 ## of README §3 rather than adding to them.
 stack:
 	./scripts/stack.sh $(MODE)
+
+## stack-stop stops the local platform `make stack` started. Nothing is
+## deleted - the databases, the logs and the pid files' contents stay put.
+## Order matters: it removes each pid file before signalling, because the
+## pid file is what tells scripts/supervise.sh not to respawn the service.
+stack-stop:
+	./scripts/stack.sh stop
 
 ## chaos SCEN=pods runs one failure scenario against a running stack and judges
 ## it with the harness oracle: SCEN is one of pods | pg | kafka | ch | rebalance
