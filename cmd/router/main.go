@@ -220,6 +220,10 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 	// publish-to-pending figure, so each is named rather than inferred.
 	var batches int
 	var sumWait, sumProc, sumSync, sumEnd, sumPoll, sumCycle time.Duration
+	// The spread of record ages across the batches in this window: the
+	// youngest and oldest seen, so the mean above can be read as either
+	// "fetched live" or "fetched as a stale snapshot".
+	var waitMinAll, waitMaxAll time.Duration
 	var lastPoll time.Time
 	for ctx.Err() == nil {
 		pollStart := time.Now()
@@ -262,9 +266,26 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 		// How long these records waited in Kafka before this poll handed
 		// them over - the record's produce timestamp against the moment we
 		// picked it up. Queueing, distinct from the work below.
+		//
+		// min and max matter as much as the mean, and they exist to tell two
+		// very different stories apart: a batch whose records are all about
+		// equally old was fetched as one stale snapshot (the client had not
+		// refetched since the previous poll), while a batch spanning from
+		// near-zero to about one cycle old was fetched live as it arrived.
+		// The first means this loop's poll is what delays records; the second
+		// means it does not, and the wait is elsewhere. Only the mean, which
+		// both produce, cannot say which.
 		var kafkaWait time.Duration
-		for _, rec := range recs {
-			kafkaWait += time.Since(rec.Timestamp)
+		var waitMin, waitMax time.Duration
+		for i, rec := range recs {
+			w := time.Since(rec.Timestamp)
+			if i == 0 || w < waitMin {
+				waitMin = w
+			}
+			if w > waitMax {
+				waitMax = w
+			}
+			kafkaWait += w
 		}
 		kafkaWait /= time.Duration(len(recs))
 
@@ -358,6 +379,16 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 		// share of publish-to-pending; the generator and publish-api are
 		// measured separately, so the four together explain the whole figure.
 		batches++
+		if batches == 1 {
+			waitMinAll, waitMaxAll = waitMin, waitMax
+		} else {
+			if waitMin < waitMinAll {
+				waitMinAll = waitMin
+			}
+			if waitMax > waitMaxAll {
+				waitMaxAll = waitMax
+			}
+		}
 		sumWait += kafkaWait
 		sumProc += procDur
 		sumSync += syncDur
@@ -367,6 +398,8 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 		if batches >= 50 {
 			slog.Info("router: stage timings",
 				"kafka_wait_ms", sumWait.Milliseconds()/int64(batches),
+				"kafka_wait_min_ms", waitMinAll.Milliseconds(),
+				"kafka_wait_max_ms", waitMaxAll.Milliseconds(),
 				"process_ms", sumProc.Milliseconds()/int64(batches),
 				"produce_sync_ms", sumSync.Milliseconds()/int64(batches),
 				"produce_end_ms", sumEnd.Milliseconds()/int64(batches),
@@ -374,6 +407,7 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 				"cycle_ms", sumCycle.Milliseconds()/int64(batches),
 				"batches", batches, "records", len(recs))
 			batches, sumWait, sumProc, sumSync, sumEnd, sumPoll, sumCycle = 0, 0, 0, 0, 0, 0, 0
+			waitMinAll, waitMaxAll = 0, 0
 		}
 	}
 	return nil

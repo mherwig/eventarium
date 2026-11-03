@@ -66,13 +66,157 @@ whole-run p99 above ~100 ms as a regression.
 Caveats: this validates the pipeline shape and per-stage latencies, not
 cluster-scale HA. It was measured on **single-node Kafka, PostgreSQL and
 ClickHouse** — the stack has since moved to three brokers at RF=3, three
-CloudNativePG instances and three replicated ClickHouse nodes, and **these
-numbers have not been re-taken**. No figure here therefore covers HA for the
-storage tier. ClickHouse status write/query throughput is
+CloudNativePG instances and three replicated ClickHouse nodes. Those figures
+have **not** been re-taken in batch mode, so no row above covers HA for the
+storage tier; what the three-node topology does measure, one event per
+request, is in [Single-event publishing](#single-event-publishing-on-the-three-node-stack)
+below — that is a different publish mode, so the two tables are not
+comparable cell for cell. ClickHouse status write/query throughput is
 the most pressured component at this rate. The
 status table is cumulative, so re-running a load test for the same owner
 counts earlier runs' deliveries too — the harness scopes Status API queries to
 the run's publish window (`from`/`to`).
+
+## Single-event publishing on the three-node stack
+
+Batch mode amortises one HTTP round trip and one Kafka produce over 100
+events. Publishing **one event per request** is the case that actually
+matters, and it pays those costs per event — so it is measured separately,
+on the topology above (three brokers at RF=3, three CloudNativePG instances,
+three replicated ClickHouse nodes, nine consumer replicas).
+
+Four event types, 40 subscriptions (17 unlimited webhook, 20 SSE, 3
+rate-limited), 1 KiB payloads, `unordered` unless stated. Every figure below
+is a full-drain run judged by the oracle; every one ended
+`missing=0 unexpected=0 duplicates=0`. The three rate-limited subscriptions
+are excluded from the latency columns — they take minutes by design.
+
+| Mode | Rate | Channel | p50 | p90 | p99 |
+| --- | --- | --- | --- | --- | --- |
+| `unordered` | 100 ev/s | webhook | **79.8 ms** | 139 ms | 385 ms |
+| `unordered` | 100 ev/s | SSE | **92.3 ms** | 160 ms | 512 ms |
+| `unordered` | 300 ev/s | webhook | **154.2 ms** | 270 ms | 442 ms |
+| `unordered` | 300 ev/s | SSE | **178.5 ms** | 321 ms | 528 ms |
+| `unordered` | 1,000 ev/s | webhook | **328–383 ms** | 594–2097 ms | 8329–10026 ms |
+| `unordered` | 1,000 ev/s | SSE | **399–454 ms** | 622–731 ms | 1004–1341 ms |
+| `key_ordered` | 1,000 ev/s | webhook | **516.8 ms** | 5450 ms | 10956 ms |
+| `key_ordered` | 1,000 ev/s | SSE | **542.0 ms** | 918 ms | 1212 ms |
+
+The 1,000 ev/s rows are ranges across runs rather than single numbers: this
+host does not hold still at that rate, and the spread is part of the result.
+Worth noting what the strict mode costs at that rate: on one identical run,
+`key_ordered` webhook sits at p90 **5450 ms** while its SSE half sits at
+918 ms — the webhook side queues far deeper than the SSE side when per-key
+ordering is imposed on a stack already at its ceiling, which is a further
+reason not to run the strict mode at a rate the stack has no headroom for.
+
+### Where those milliseconds go
+
+End-to-end splits into three segments that sum to it. The check is that the
+**per-delivery sum of the three segments** reproduces the harness's own
+reported webhook p50 to within 0.6 ms across all three runs — so the
+decomposition is the same measurement cut three ways, not three medians
+from three populations. It is computed by `scripts/decompose.py`, which
+joins the generator's `pub.jsonl` to the delivery-status rows per event:
+
+| Segment | 100 ev/s | 300 ev/s | 1,000 ev/s |
+| --- | --- | --- | --- |
+| publish → `pending` (events topic) | 30.8 ms | 89.1 ms | 195–222 ms |
+| `pending` → `in_flight` (deliveries topic) | 47.0 ms | 64.0 ms | 119–138 ms |
+| `in_flight` → `delivered` (the HTTP call) | **0 ms** | **1 ms** | **2 ms** |
+| **per-delivery sum** | **79.6 ms** | **153.9 ms** | **329–384 ms** |
+
+**The delivery itself is 2 ms.** Everything else is queueing, and it was
+worth ruling the obvious suspects out properly:
+
+- **publish-api is not the bulk of it.** A record's broker timestamp sits at
+  p50 **−0.2 ms** from the generator's schedule time — measured with only
+  publishing running. Under full load publish-api's whole handler is 41 ms
+  p50 (against 1.7 ms idle) and the timestamp is stamped at the *start* of
+  it, so under load the gap is at most ~41 ms, not the ~200 ms in question.
+  That 41 ms is the ack wait, and a subscriber does not wait on it.
+- **franz-go's fetcher is not blocking.** `poll_ms` is **0** — records are
+  already buffered when the router polls. An earlier working theory that the
+  fetcher held records for 60–110 ms is wrong and does not explain any of
+  this.
+- **Nothing is being dropped by the generator.** With the sender pool sized
+  from `-rate`, every run reported `dropped=0`.
+
+What is left is the router, which is a **serial poll → process → transaction
+→ poll** loop. Measured per stage, each figure an average over 50 batches
+(one representative run per rate; the 1,000 ev/s column is the range across
+two runs):
+
+| Router stage | 100 ev/s | 300 ev/s | 1,000 ev/s |
+| --- | --- | --- | --- |
+| `kafka_wait` (produce → poll pickup) | 32 ms | 86 ms | 172–209 ms |
+| `produce_sync` (deliveries + status) | 33 ms | 43 ms | 61–72 ms |
+| `produce_end` (markers + offset commit) | 9 ms | 14 ms | 28–31 ms |
+| `process` | 0 ms | 1 ms | 9 ms |
+| `cycle` (poll → poll) | 44 ms | 60 ms | 97–119 ms |
+
+Two numbers in that table do the explaining. `produce_sync` + `produce_end`
+is **89–103 ms of a 97–119 ms cycle** — about nine tenths of the loop:
+the router can only commit as fast as Kafka will take a transaction across
+RF=3, and consumption is gated by production. And `kafka_wait` (172–209 ms)
+exceeds the whole cycle, which a steady-state consumer cannot do by fetching
+alone — so records are queued rather than merely waiting for a poll.
+
+They are. Sampled mid-publish with `kafka-consumer-groups`:
+
+| Group | Lag during publish | After drain |
+| --- | --- | --- |
+| `router` | **292–639 records** | 1 |
+| `dispatcher` | 42,741 (27,817 of it in **one** partition) | 22 |
+| `status-writer` | 14,268 | 0 |
+
+The router's lag is the same order as the measured `kafka_wait`, which is
+the point: a few hundred records at 1,000 ev/s is a few hundred milliseconds
+of events sitting in Kafka rather than consumed. It slightly *overstates*
+queueing too — the query reports the **committed** offset, which advances
+only once per ~97 ms transaction, so a cycle's worth of already-processed
+records still reads as lag until the next commit. The dispatcher's backlog is
+the three rate-limited subscriptions accumulating *by design*, which is why
+the unlimited subscriptions still see a 119 ms queue; and status-writer lag
+only delays **observation**, never delivery, because `ts` is stamped when the
+record is emitted rather than when it is written.
+
+### Why 1,000 ev/s costs what it costs
+
+Two things are at their limit at that rate, and neither is the delivery
+path. The first is in the table above: the router commits only as fast as
+Kafka accepts a transaction across RF=3. The second is the host — on this
+8-core laptop, sampled during a `key_ordered` run at 1,000 ev/s:
+
+| | |
+| --- | --- |
+| Load average, stack idle | 3.90 |
+| Load average, mid-publish | **17.1 → 27.6** |
+
+Load average counts runnable *and* uninterruptible-sleeping tasks, so this
+says the host is contended, not that it is purely CPU-bound. It is also not
+all the stack: the harness's own generator, its 20 SSE clients and its
+receiver are running on the same eight cores — a measurement client
+competing with the system it measures is inherent to a load test on one
+machine.
+
+The practical consequence: **at 1,000 ev/s single-event the stack runs at
+its ceiling, and latency at a ceiling is queueing.** Lower the rate and it
+falls away — 154 ms at 300 ev/s, 80 ms at 100 ev/s — with far less work
+competing for the same eight cores. Load average was sampled only during the
+1,000 ev/s runs, so no figure is claimed here for the other two rates. The
+34/56 ms figures above were taken on single-node Kafka with one instance of
+every service, and they do not transfer — not because anything regressed, but
+because replication factor three on shared hardware is a different machine.
+
+:::note Two harness traps, both of which produced wrong numbers first
+A fixed 64-sender pool shed **500–953 events per run** at 1,000 ev/s — a
+generator limit reporting itself as a shortfall in the platform, fixed by
+sizing the pool from `-rate`. And a run must **fully drain** before it is
+measured: judging at the end of the publish window hides the tail entirely,
+which is why every figure above comes from a run that waited for both
+receipt streams to stop growing first.
+:::
 
 ## Resilience under injected faults
 
@@ -210,6 +354,12 @@ is checked only against what the Status API *claims*, so a delivery written to
 `sse-live` and never read by a client would not be caught. With it, `RECEIVED`
 covers both channels — that is what makes `received` equal `expected` in the
 results above rather than webhook-only.
+
+**Wait for both receipt streams to stop growing before verifying.** Judging
+right after the publish window ends measures only what happened to have
+arrived and reports the rest as lost — or, with percentiles, hides a slow
+tail that is still coming. Every latency figure on this page comes from a
+run that waited for the counts to be flat across several consecutive polls.
 
 ### Choosing the delivery modes
 

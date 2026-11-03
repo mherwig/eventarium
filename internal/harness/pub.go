@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -109,7 +110,7 @@ func runPub(ctx context.Context, args []string) int {
 	keys := fs.Int("keys", envInt("KEYS", 32), "number of distinct ordering keys (env HARNESS_KEYS)")
 	out := fs.String("out", envStr("OUT", ""), "append published events with attributes as JSON lines for verify (env HARNESS_OUT)")
 	timeout := fs.Duration("timeout", envDur("TIMEOUT", 10*time.Second), "per-request timeout (env HARNESS_TIMEOUT)")
-	workers := fs.Int("workers", envInt("WORKERS", 64), "concurrent sender goroutines (env HARNESS_WORKERS)")
+	workers := fs.Int("workers", envInt("WORKERS", 0), "concurrent sender goroutines; 0 sizes the pool from -rate (env HARNESS_WORKERS)")
 	source := fs.String("source", envStr("SOURCE", "/harness"), "CloudEvents source attribute (env HARNESS_SOURCE)")
 	if code, done := parseResult(fs.Parse(args)); done {
 		return code
@@ -131,8 +132,12 @@ func runPub(ctx context.Context, args []string) int {
 		fmt.Fprintf(os.Stderr, "harness pub: -mode must be batch or single, got %q\n", *mode)
 		return 2
 	}
-	if *workers <= 0 {
-		*workers = 1
+	if *workers < 0 {
+		fmt.Fprintln(os.Stderr, "harness pub: -workers must not be negative")
+		return 2
+	}
+	if *workers == 0 {
+		*workers = senderPool(*rate)
 	}
 
 	token, err := mintToken(*owner, auth.ScopePublish)
@@ -165,8 +170,8 @@ func runPub(ctx context.Context, args []string) int {
 		lw:      lw,
 	}
 
-	fmt.Fprintf(os.Stderr, "harness pub: %g ev/s for %v, mode=%s, %d types, %d keys -> %s\n",
-		*rate, *duration, *mode, len(typeNames), *keys, p.url)
+	fmt.Fprintf(os.Stderr, "harness pub: %g ev/s for %v, mode=%s, %d types, %d keys, %d workers -> %s\n",
+		*rate, *duration, *mode, len(typeNames), *keys, *workers, p.url)
 	p.run(ctx, *rate, *duration, *workers)
 	p.report(*rate)
 	return 0
@@ -212,6 +217,37 @@ func resolveTypes(ctx context.Context, client *http.Client, base, token, spec st
 		return nil, fmt.Errorf("no event type with prefix %q in the registry", spec)
 	}
 	return names, nil
+}
+
+// senderPool sizes the sender pool so the generator is never the bottleneck.
+//
+// It has to be sized, not chosen: the producer is an open loop that drops an
+// item when the pool is behind, so a pool that is too small turns a
+// throughput run into a measurement of the harness. That is exactly what
+// happened - at 1,000 ev/s in single mode, under full platform load, a fixed
+// 64 senders shed 500-953 events into `dropped` over a run, because the
+// channel (2 items per sender) filled and never drained again. The platform
+// was not the limit; the generator was, and it reported itself as a shortfall
+// in the number being measured. (On an idle stack the same 64 suffice, which
+// is why the failure only showed up in a full run.)
+//
+// The service time to size for is the loaded one, not the idle one: a
+// single-event publish is a plain (deliberately non-transactional - one
+// record has nothing to be partial about) ProduceSync, and measures 1.7 ms
+// on an idle stack but p50 41 ms / mean 51 ms once the same eight cores are
+// also routing, dispatching and recording status. 200 senders per 1,000 ev/s
+// is ~4x that loaded mean, with a floor of 64 for slow rates and a ceiling of
+// 8192 so a large -rate cannot ask for an absurd number of goroutines. An
+// explicit -workers always wins.
+func senderPool(rate float64) int {
+	n := int(math.Ceil(rate * 0.2))
+	if n < 64 {
+		return 64
+	}
+	if n > 8192 {
+		return 8192
+	}
+	return n
 }
 
 // run drives the open loop: a producer schedules batches at the target rate and
