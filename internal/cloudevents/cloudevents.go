@@ -365,8 +365,18 @@ func (e *Event) SetHeaders(h http.Header) {
 	}
 	for k, v := range e.Extensions {
 		var s string
-		if err := json.Unmarshal(v, &s); err == nil {
-			h.Set("Ce-"+strings.ToUpper(k), s)
+		if err := json.Unmarshal(v, &s); err != nil {
+			// Extensions arrive as whatever JSON the publisher used: a bare
+			// number for `shard`, a quoted string for `partitionkey`. HTTP
+			// headers carry strings, so render the raw JSON rather than drop
+			// the attribute. Dropping it silently changed which events matched
+			// a filter between batch and single mode - batch puts extensions
+			// in the body where they survive, single puts them here where the
+			// unmarshal used to fail - and the router then rejected every
+			// event for `attributes["shard"]` while the oracle, reading
+			// pub.jsonl, counted them as matching.
+			s = string(v)
 		}
+		h.Set("Ce-"+strings.ToUpper(k), s)
 	}
 }
