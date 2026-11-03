@@ -209,6 +209,36 @@ competing for the same eight cores. Load average was sampled only during the
 every service, and they do not transfer — not because anything regressed, but
 because replication factor three on shared hardware is a different machine.
 
+### The throughput ceiling
+
+The oracle will not find a ceiling, because a ceiling is not a correctness
+problem — correctness held at **every** rate tested:
+
+| Rate (single, `unordered`) | webhook p50 | webhook p90 | webhook p99 | SSE p50 | drain | Oracle |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1,000 ev/s (achieved 998) | 364 ms | 0.71 s | 1.55 s | 432 ms | 177 s | `missing=0 unexpected=0 duplicates=0` |
+| 1,500 ev/s (achieved 1,476) | 492 ms | **8.87 s** | 15.74 s | 486 ms | 228 s | `missing=0 unexpected=0 duplicates=0` |
+| 2,000 ev/s (achieved 1,995) | 958 ms | 26.35 s | 44.96 s | 886 ms | 315 s | `missing=0 unexpected=0 duplicates=0` |
+| 2,500 ev/s (achieved 2,449) | 2.35 s | 34.73 s | 89.96 s | 2.08 s | 375 s | `missing=0 unexpected=0 duplicates=0` |
+
+40 s of publish each, then a full drain. **The knee is between 1,000 and
+1,500 ev/s, and it appears in the tail first: p90 goes from 0.71 s to
+8.87 s — a 12.5× jump — while p50 moves only 364 → 492 ms.** At 1,500 most
+events are still fast and a growing minority queue for seconds. Past 2,000
+the median itself is a second and the tail is tens of seconds.
+
+So the ceiling for single-event publishing on this topology and this host is
+**~1,000 ev/s**: below it latency is hundreds of milliseconds, above it
+latency is unbounded and only the rate at which you stop publishing matters.
+
+Two corroborating signals. Drain time grows 177 → 375 s — that is the
+backlog that still existed when publishing stopped, and it is the same
+phenomenon as the router lag measured earlier. And `dropped` is non-zero at
+1,500 (884) and 2,500 (1,762) but **not** at 2,000, which rules it out as a
+threshold: the drops arrive in bursts — the whole 884 at 1,500 fell in two
+seconds, 402 and 482 — so it is a transient stall overflowing the sender
+buffer, evidence of operating at the edge rather than the edge itself.
+
 :::note Two harness traps, both of which produced wrong numbers first
 A fixed 64-sender pool shed **500–953 events per run** at 1,000 ev/s — a
 generator limit reporting itself as a shortfall in the platform, fixed by
