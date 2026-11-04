@@ -199,7 +199,19 @@ func (d *Dispatcher) Run(parent context.Context) {
 	go d.heartbeat()
 	go d.drainLoop()
 	go d.parkRetryLoop()
+	// Stage timings, split the same way the router's are: how long the poll
+	// blocked waiting for Kafka against how long the records spent being
+	// handled. Only the second can be this loop's own cost - a large poll with
+	// a small handle says the dispatcher is waiting on the broker, a large
+	// handle says it is the serial path (decode, registry lookups, submit's
+	// mutex) and nothing else will make that faster. handle_us_per_record is
+	// the number the throughput ceiling divides into: at ~150 us the loop tops
+	// out near 6,700 records/s, which is the measured ceiling.
+	var batches, records int
+	var sumPoll, sumHandle, sumCycle time.Duration
+	var lastPoll time.Time
 	for {
+		pollStart := time.Now()
 		recs := d.cl.PollRecords(ctx, 256)
 		if recs.NumRecords() == 0 {
 			if err := recs.Err(); err != nil && ctx.Err() == nil {
@@ -211,9 +223,39 @@ func (d *Dispatcher) Run(parent context.Context) {
 			}
 			continue
 		}
+		pollDur := time.Since(pollStart)
+		var cycle time.Duration
+		if !lastPoll.IsZero() {
+			cycle = pollStart.Sub(lastPoll)
+		}
+		lastPoll = pollStart
+
+		handleStart := time.Now()
 		recs.EachRecord(func(rec *kgo.Record) {
 			d.handleRecord(rec)
 		})
+		handleDur := time.Since(handleStart)
+
+		n := recs.NumRecords()
+		batches++
+		records += n
+		sumPoll += pollDur
+		sumHandle += handleDur
+		sumCycle += cycle
+		if batches >= 50 {
+			perRecord := int64(0)
+			if records > 0 {
+				perRecord = sumHandle.Microseconds() / int64(records)
+			}
+			slog.Info("dispatcher: stage timings",
+				"poll_ms", sumPoll.Milliseconds()/int64(batches),
+				"handle_ms", sumHandle.Milliseconds()/int64(batches),
+				"cycle_ms", sumCycle.Milliseconds()/int64(batches),
+				"handle_us_per_record", perRecord,
+				"batches", batches, "records", records)
+			batches, records = 0, 0
+			sumPoll, sumHandle, sumCycle = 0, 0, 0
+		}
 	}
 }
 
@@ -308,16 +350,31 @@ func (d *Dispatcher) settle(partition int32, offset int64) {
 	}
 }
 
-// parkOrRetry parks the delivery and reports whether it is durable. A failed
-// park does not fail the record: the item goes to the background retry, which
-// parks it as soon as the store answers and releases the offset then. Until
-// that happens the partition's commit point stands still, so a crash replays
-// the record - and if this process never comes back, that replay is the
-// recovery.
+// parkOrRetry hands the delivery to the background parker and reports whether
+// it is already durable - which is now never, and that is the point.
+//
+// It used to attempt the park inline and only queue it when that attempt
+// failed. The inline attempt is a synchronous PostgreSQL INSERT on the poll
+// goroutine, and that goroutine is shared by every subscription the instance
+// owns, so one subscription's overflow stalled all of them. Measured at
+// 1,500 ev/s: the single dispatcher whose partitions carried the three
+// rate-limited subscriptions ran one batch at 402 ms with a per-record high
+// of 1,599 us, while the other two instances never exceeded 4 ms and 72 us in
+// the same window. Removing the rate limits - same 40 subscriptions, same
+// fan-out, 18% more unlimited deliveries - took those unlimited subscriptions'
+// tail from p99 15.1 s / max 25.6 s to p99 415 ms / max 558 ms, and consumer
+// lag from 62,028 to 4,509 and falling.
+//
+// Parking is not worse off in the queue: parkRetryLoop writes the row and
+// settles the offset only after the write succeeds, so nothing is released
+// early; it preserves arrival order (channel, then the slice in order); and
+// it drains as soon as an item arrives rather than waiting out its tick. Its
+// capacity is 4,096 pending against a measured peak arrival of ~116 parks/s.
+//
+// Returning false means "not durable yet", so the caller must NOT settle:
+// the offset stays in flight until parkRetryLoop has the row, which is what
+// makes a crash replay the record instead of losing it.
 func (d *Dispatcher) parkOrRetry(ctx context.Context, s *subState, it *item, reason string) bool {
-	if d.park(ctx, s, it, reason) {
-		return true
-	}
 	select {
 	case d.parkRetry <- &parkRetry{s: s, it: it, reason: reason}:
 	case <-ctx.Done():
@@ -561,10 +618,28 @@ func (d *Dispatcher) heartbeat() {
 		}
 		d.mu.Lock()
 		depth, states := 0, 0
-		for _, s := range d.subs {
+		limitedDepth, unlimitedDepth := 0, 0
+		deepest, deepestSub := 0, "-"
+		for id, s := range d.subs {
 			states++
+			var sd int
 			for _, q := range s.qs {
-				depth += len(q)
+				sd += len(q)
+			}
+			depth += sd
+			// Split by rate limit: the three rate-limited subscriptions are
+			// *supposed* to queue (50/s against an arrival rate many times
+			// that), so a total that says "10,000 queued" without this split
+			// cannot be read as a fault. What matters for the ceiling is
+			// whether the unlimited ones are queueing too - they have no
+			// reason to, and if they are, their deliveries are the tail.
+			if s.policy().rateLimitPerS > 0 {
+				limitedDepth += sd
+			} else {
+				unlimitedDepth += sd
+			}
+			if sd > deepest {
+				deepest, deepestSub = sd, id
 			}
 		}
 		d.mu.Unlock()
@@ -575,6 +650,10 @@ func (d *Dispatcher) heartbeat() {
 			"dropped", d.count.dropped.Load(),
 			"dead_lettered", d.count.deadLettered.Load(),
 			"queue_depth", depth,
+			"queue_rate_limited", limitedDepth,
+			"queue_unlimited", unlimitedDepth,
+			"deepest_queue", deepest,
+			"deepest_sub", deepestSub,
 			"subscriptions", states,
 			// Records whose offset may not be committed yet: queued, retrying
 			// or waiting for a park. A number that only grows means the commit
