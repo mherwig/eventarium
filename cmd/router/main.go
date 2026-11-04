@@ -298,10 +298,42 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 
 		if err := sess.Begin(); err != nil {
 			slog.Error("router: beginning transaction", "err", err)
+			// The failure that matters here is "already in a transaction". A
+			// failed End - the abort on the produce-failure path below, or the
+			// commit - leaves this session inside an open transaction, and from
+			// that moment every Begin fails the same way. Backoff cannot change
+			// that state, so the router stops consuming *without exiting*:
+			// nothing restarts it, its lag stays frozen, and every event it
+			// should have routed is simply never delivered.
+			//
+			// Observed live after a broker restart: r1 and r3 failed Begin
+			// every 30 s for the rest of the suite while their consumer lag sat
+			// unmoving at 37,598, and the four scenarios that followed each
+			// lost 31k-38k deliveries to it.
+			//
+			// publish-api carries txnStale for precisely this case - "without
+			// clearing it first, one bad abort would take the batch path down
+			// for the rest of the process's life" - so clear it here the same
+			// way rather than retrying Begin against a state only an abort can
+			// leave behind.
+			if _, abErr := sess.End(ctx, kgo.TryAbort); abErr != nil {
+				// Still inside it, and if the broker is down that is most
+				// likely why Begin failed too. Keep the escalating backoff and
+				// retry the whole sequence when it may have recovered.
+				slog.Warn("router: aborting the open transaction", "err", abErr)
+				if !sleep(ctx, backoff) {
+					return nil
+				}
+				backoff = nextBackoff(backoff)
+				continue
+			}
+			// Cleared: the state that made Begin fail is gone, so drop back to
+			// the base delay instead of escalating as though the broker were
+			// still down - the next Begin is one second away, not thirty.
+			backoff = errorBackoff
 			if !sleep(ctx, backoff) {
 				return nil
 			}
-			backoff = nextBackoff(backoff)
 			continue
 		}
 		// The transaction is open from here; an abort reports how long it
