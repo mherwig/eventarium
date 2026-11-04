@@ -145,6 +145,36 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 	// because the projection may remove the field it reads.
 	orderingKey := OrderingKey(r.reg, rec, e, owner, decode)
 
+	// Candidates of one event type routinely share a filter: the registry
+	// hands out one *filter.Compiled per distinct source (CompileAttribute
+	// and CompileData are both cached by source), so two subscriptions
+	// carrying the same expression hold the same pointer. The same filter
+	// against the same event can only give one answer, so that answer is
+	// remembered for this event instead of being paid for once per
+	// subscription.
+	//
+	// Keyed on the compiled pointers rather than on the source text: equal
+	// pointers mean equal expressions by construction, nothing has to be
+	// built or compared, and a subscription with no filter at all simply
+	// lands on {nil, nil} alongside the others that have none.
+	type matchKey struct {
+		attr *filter.Compiled
+		data *filter.Compiled
+	}
+	type matchResult struct {
+		ok  bool
+		err error
+	}
+	matchMemo := make(map[matchKey]matchResult, len(entries))
+
+	// The same argument applies to the rest of the per-subscription work: one
+	// projected event and one serialisation of it per distinct projection,
+	// where "no projection at all" is the commonest projection. Serialising
+	// once matters most - it is a full marshal of a ~1 KiB event per delivery
+	// record otherwise, and a batch of events fan-outs to several.
+	projMemo := make(map[string]*cloudevents.Event, 2)
+	rawMemo := make(map[*cloudevents.Event]json.RawMessage, 2)
+
 	// base is the status record every emission of this event starts from:
 	// the platform metadata of section 9, copied per candidate and given its
 	// delivery ID, status and reason.
@@ -162,11 +192,22 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 	for _, entry := range entries {
 		sub := entry.Sub
 
-		var data map[string]any
-		if entry.DataFilter != nil {
-			data = decode()
+		key := matchKey{entry.AttrFilter, entry.DataFilter}
+		res, evaluated := matchMemo[key]
+		if !evaluated {
+			var data map[string]any
+			if entry.DataFilter != nil {
+				data = decode()
+			}
+			mok, merr := filter.Matches(entry.AttrFilter, entry.DataFilter, attrs, data)
+			res = matchResult{ok: mok, err: merr}
+			matchMemo[key] = res
 		}
-		ok, err := filter.Matches(entry.AttrFilter, entry.DataFilter, attrs, data)
+		// Reported per subscription rather than once per event: the warning
+		// names the subscription that silently lost a delivery, and the
+		// evaluation behind it is deterministic for this event, so every
+		// subscriber of a broken filter still sees it complain.
+		ok, err := res.ok, res.err
 		if err != nil {
 			// Section 6.2: a bad filter is a non-match, never a crash
 			// (sandboxed CEL with cost limits; errors still must not stop
@@ -208,22 +249,40 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 			continue
 		}
 
-		ev := e
-		if len(sub.Projection) > 0 {
-			// Section 6.2: project a copy; the shared event must never
-			// be mutated because other subscriptions still see it.
-			// Non-JSON data with a projection is rejected by the
-			// registry API (section 5), this guard is defensive.
-			projected, err := project.Apply(e.Data, sub.Projection)
-			if err != nil {
-				slog.Warn("router: projection failed, skipping subscription",
-					"subscription", sub.ID, "event_ref", eventRef, "err", err)
+		// Section 6.2: project a copy; the shared event must never
+		// be mutated because other subscriptions still see it.
+		// Non-JSON data with a projection is rejected by the
+		// registry API (section 5), this guard is defensive - and it
+		// stays inside the miss so each subscription still reports it.
+		projKey := strings.Join(sub.Projection, "\x00")
+		ev, haveProj := projMemo[projKey]
+		if !haveProj {
+			if len(sub.Projection) > 0 {
+				proj, perr := project.Apply(e.Data, sub.Projection)
+				if perr != nil {
+					slog.Warn("router: projection failed, skipping subscription",
+						"subscription", sub.ID, "event_ref", eventRef, "err", perr)
+					continue
+				}
+				cp := *e
+				cp.Data = proj
+				cp.DataBase64 = ""
+				ev = &cp
+			} else {
+				ev = e
+			}
+			projMemo[projKey] = ev
+		}
+		raw, encoded := rawMemo[ev]
+		if !encoded {
+			var rerr error
+			raw, rerr = json.Marshal(ev)
+			if rerr != nil {
+				slog.Warn("router: encoding the event",
+					"event_ref", eventRef, "subscription", sub.ID, "err", rerr)
 				continue
 			}
-			cp := *e
-			cp.Data = projected
-			cp.DataBase64 = ""
-			ev = &cp
+			rawMemo[ev] = raw
 		}
 
 		msg := &delivery.Message{
@@ -243,11 +302,7 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 			ExpiresAt: expires,
 			Projected: len(sub.Projection) > 0,
 		}
-		if err := msg.SetEvent(ev); err != nil {
-			slog.Warn("router: encoding the event",
-				"event_ref", eventRef, "subscription", sub.ID, "err", err)
-			continue
-		}
+		msg.EventRaw = raw
 		value, err := msg.Encode()
 		if err != nil {
 			slog.Warn("router: encoding delivery failed",
