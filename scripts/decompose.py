@@ -48,6 +48,14 @@ def row(name, vals):
           f"p90={pct(v,.90):8.1f}  p99={pct(v,.99):8.1f}  max={v[-1]:9.1f} ms")
 
 
+def load(path):
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
 def ts(v):
     """ClickHouse returns DateTime64 without a zone (it was stored as UTC);
     the generator's file is RFC3339 with one. Normalise both to UTC or the
@@ -90,11 +98,18 @@ def fetch(owner, subs, selects, having):
     return rows
 
 
-def report(name, rows, boundaries):
-    """boundaries: [(label, column_index), ...] in order after pending."""
+def report(name, rows, boundaries, after=None):
+    """boundaries: [(label, column_index), ...] in order after pending.
+
+    after: optional (label, fn) with fn(row) -> datetime or None. A row whose
+    fn returns None is dropped from every segment, not just the last one - that
+    is deliberate for SSE, where the fn is the client receipt. The harness's
+    own percentile covers deliveries the client actually saw, so the segments
+    have to cover the same set or their sum cannot reconcile with it.
+    """
     # columns: 0 delivery_id, 1 event_ref, 2 pending, then the rest
     idx = [2] + [j for _, j in boundaries]
-    segs = [[] for _ in idx]
+    segs = [[] for _ in range(1 + len(boundaries) + (1 if after else 0))]
     total = []
     for f in rows:
         t0 = sent.get(f[1])
@@ -115,6 +130,11 @@ def report(name, rows, boundaries):
             continue
         deltas = [(pts[n] - pts[n - 1]).total_seconds() * 1000 for n in range(1, len(pts))]
         deltas.insert(0, (pts[0] - t0).total_seconds() * 1000)
+        if after:
+            got = after[1](f)
+            if got is None:
+                continue
+            deltas.append((got - pts[-1]).total_seconds() * 1000)
         for n, d in enumerate(deltas):
             segs[n].append(d)
         total.append(sum(deltas))
@@ -123,11 +143,17 @@ def report(name, rows, boundaries):
     row("1. publish -> pending", segs[0])
     for n, (label, _) in enumerate(boundaries, start=1):
         row(label, segs[n])
+    if after:
+        row(after[0], segs[-1])
     row("sum of the segments", total)
 
 
 sent = {}
 owner, seed, pub = sys.argv[1:4]
+# The client's SSE receipts, same shape latency.py takes them: one file per
+# subscription. Optional - without them the SSE report stops at `sent` and the
+# gateway hop is simply not measured.
+sse_paths = sys.argv[4:]
 for line in open(pub):
     line = line.strip()
     if line:
@@ -148,8 +174,24 @@ report("webhook (unlimited)",
              "t_p > toDateTime(0) AND t_i > toDateTime(0) AND t_d > toDateTime(0)"),
        [("2. pending  -> in_flight", 3), ("3. in_flight -> delivered", 4)])
 
+# The client's own receipt of each SSE delivery. Two jobs: it is the last
+# segment (the store's `sent` is the sse-delivery stage writing to sse-live,
+# not the gateway handing it to a client - that hop is invisible to any status
+# row), and it is the population filter, for the reason on report().
+sse_recv = {}
+for path in sse_paths:
+    for rec in load(path):
+        did = rec.get("delivery_id")
+        when = ts(rec.get("received_at"))
+        if did and when:
+            sse_recv[did] = when
+sse_after = None
+if sse_recv:
+    sse_after = ("3. sent     -> received", lambda f: sse_recv.get(f[0]))
+
 report("sse",
        fetch(owner, sse,
              "minIf(ts,status='pending') t_p, minIf(ts,status='sent') t_s",
              "t_p > toDateTime(0) AND t_s > toDateTime(0)"),
-       [("2. pending  -> sent", 3)])
+       [("2. pending  -> sent", 3)],
+       after=sse_after)
