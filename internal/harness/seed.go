@@ -62,6 +62,8 @@ func runSeed(ctx context.Context, args []string) int {
 		"comma-separated delivery modes to cycle over (env HARNESS_MODES)")
 	maxInFlight := fs.Int("max-in-flight", envInt("MAX_IN_FLIGHT", 0),
 		"max_in_flight for the created subscriptions; 0 leaves the registry default (env HARNESS_MAX_IN_FLIGHT)")
+	rateLimited := fs.Int("rate-limited", envInt("RATE_LIMITED", -1),
+		"how many webhook subscriptions get a 50/s rate limit; -1 keeps the default of every 7th, 0 disables them (env HARNESS_RATE_LIMITED)")
 	if code, done := parseResult(fs.Parse(args)); done {
 		return code
 	}
@@ -130,6 +132,7 @@ func runSeed(ctx context.Context, args []string) int {
 	// groups of three on the assumption that three consecutive seeded
 	// subscriptions are one of each mode.
 	created := make([]registry.Subscription, 0, *subsN)
+	webhooks := 0
 	fmt.Fprintf(os.Stderr, "harness seed: creating %d subscriptions\n", *subsN)
 	for j := range *subsN {
 		sub := map[string]any{
@@ -155,7 +158,21 @@ func runSeed(ctx context.Context, args []string) int {
 			// A few subscriptions get a low token-bucket rate limit so
 			// that rate-limit overflow, parking and draining (section 7)
 			// show up in every run.
-			if j%7 == 0 {
+			//
+			// -rate-limited exists because those subscriptions are slow on
+			// purpose and they dominate a throughput run otherwise: at 1,500
+			// ev/s the three of them pinned 19,958 items in memory - 100% of
+			// the queue, two subscriptions at their 10,000 cap - and held
+			// their partitions' offsets uncommitted for the whole run, which
+			// reads as consumer lag you then go looking for a cause of. 0
+			// keeps the same 40 subscriptions (so the fan-out, and therefore
+			// the offered load, is identical) and only removes the limit.
+			webhooks++
+			giveLimit := j%7 == 0
+			if *rateLimited >= 0 {
+				giveLimit = webhooks <= *rateLimited
+			}
+			if giveLimit {
 				sub["rate_limit_per_s"] = 50
 				sub["burst"] = 100
 			}

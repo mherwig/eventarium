@@ -19,8 +19,10 @@
 # watching BOTH receipt streams stop growing, never by a fixed sleep: a fixed
 # sleep is exactly the guess that got those numbers wrong.
 #
-# Env: MAX_IN_FLIGHT (8), SUBS (40), TYPES (4), DOCKER, CH_CONTAINER,
-# CH_KAFKA (pubsub-kafka-1), LOADTEST_DIR (work dir root).
+# Env: MAX_IN_FLIGHT (8), SUBS (40), TYPES (4), RATE_LIMITED (default: seed's
+# own rule of every 7th webhook subscription; 0 disables rate limits for a
+# throughput run), DOCKER, CH_CONTAINER, CH_KAFKA (pubsub-kafka-1),
+# LOADTEST_DIR (work dir root).
 set -uo pipefail
 
 if [ $# -ne 4 ]; then
@@ -43,6 +45,11 @@ SUBS=${SUBS:-40}; TYPES=${TYPES:-4}
 DOCKER="${DOCKER:-docker}"
 CH_CONTAINER="${CH_CONTAINER:-pubsub-clickhouse-1}"
 CH_KAFKA="${CH_KAFKA:-pubsub-kafka-1}"
+# Passed explicitly rather than conditionally: ${X+"-a $X"} expands to ONE
+# word because quotes inside ${...} suppress splitting, and the flag package
+# then reports `flag provided but not defined: -rate-limited 3`. -1 keeps the
+# seed's own rule (every 7th webhook subscription), 0 disables the limits.
+RATE_LIMITED="${RATE_LIMITED:--1}"
 mkdir -p "$OUT"; cd "$ROOT"
 
 [ -x "$ROOT/bin/harness" ] || { echo "no bin/harness - run 'make build' first" >&2; exit 1; }
@@ -51,6 +58,7 @@ echo "=== mode=$MODE rate=$RATE/s dur=$DUR mif=$MIF owner=$OWNER -> $OUT ==="
 
 ./bin/harness seed -api http://localhost:8083 -owner "$OWNER" -prefix "$OWNER" \
   -types "$TYPES" -subs "$SUBS" -modes "$MODE" -max-in-flight "$MIF" \
+  -rate-limited "$RATE_LIMITED" \
   -webhook-url http://localhost:9090/hook > "$OUT/seed.json" 2>"$OUT/seed.err"
 grep -q '"id"' "$OUT/seed.json" || { echo "seeding failed:" >&2; cat "$OUT/seed.err" >&2; exit 4; }
 echo "  seeded: $(grep -o '"max_in_flight": *[0-9]*' "$OUT/seed.json" | grep -o '[0-9]*' | sort -u | tr '\n' ' ')"
