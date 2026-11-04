@@ -111,10 +111,10 @@ recorded. Full results in [Performance](performance.md).
 
 | What | Result |
 | --- | --- |
-| Throughput | **1,003 ev/s** sustained, 30,000 events fanning out to 145,918 deliveries |
+| Throughput | **1,000 ev/s** single-event sustained — the measured ceiling; above it latency is unbounded while the oracle stays clean |
 | Loss | **`missing=0 unexpected=0`** at every rate and under every injected fault |
-| Webhook latency | p50 **34 ms**, p99 **59 ms** at 1,000 ev/s |
-| SSE latency | p50 **56 ms**, p99 **90 ms** at 1,000 ev/s |
+| Webhook latency | p50 **328–383 ms** at 1,000 ev/s |
+| SSE latency | p50 **399–454 ms** at 1,000 ev/s |
 | Chaos (9 replicas, one fault mid-publish) | `kill -9` of a dispatcher, router **and** gateway: **0 lost** |
 | | PostgreSQL down *and* receiver offline, overlapping: **0 lost** |
 | | ClickHouse down 20 s: **0 lost** · Kafka broker restart: **0 lost** |

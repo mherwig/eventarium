@@ -36,20 +36,23 @@ outcome. Built in Go on Kafka, PostgreSQL and ClickHouse.
 
 ## What to expect
 
-Measured on one 8-core laptop with single-node Kafka, PostgreSQL and
-ClickHouse. Every figure comes from an independent oracle that recomputes
-expected deliveries itself rather than asking the platform.
-
-The stack now runs **three Kafka brokers at RF=3** (PostgreSQL and ClickHouse
-are still single-node); the figures below predate that change. See
+Measured on one 8-core laptop: **three Kafka brokers at RF=3, three
+CloudNativePG instances and three replicated ClickHouse nodes**, with three
+routers, three dispatchers and three gateways. Every figure comes from an
+independent oracle that recomputes expected deliveries itself rather than
+asking the platform. See
 [Operations](docs/operations.md#kafka-topology) for the topology and for why a
 cluster cannot be grown to three in place.
 
+All figures are **single-event publishing** (one event per request) at
+1,000 ev/s — the rate the stack is sized for, and the measured ceiling on
+this hardware:
+
 | | |
 | --- | --- |
-| Throughput | **1,003 ev/s** sustained — 30,000 events fanning out to 145,918 deliveries |
-| Webhook latency | p50 **34 ms**, p99 **59 ms** |
-| SSE latency | p50 **56 ms**, p99 **90 ms** |
+| Throughput | **1,000 ev/s** sustained — 60,000 events fanning out to 291,851 deliveries |
+| Webhook latency | p50 **328–383 ms** at 1,000 ev/s |
+| SSE latency | p50 **399–454 ms** at 1,000 ev/s |
 | Correctness | `missing=0 unexpected=0 duplicates=0` across all 40 subscriptions |
 
 Resilience, with one fault injected mid-publish on nine replicas

@@ -86,29 +86,27 @@ on the topology above (three brokers at RF=3, three CloudNativePG instances,
 three replicated ClickHouse nodes, nine consumer replicas).
 
 Four event types, 40 subscriptions (17 unlimited webhook, 20 SSE, 3
-rate-limited), 1 KiB payloads, `unordered` unless stated. Every figure below
-is a full-drain run judged by the oracle; every one ended
+rate-limited), 1 KiB payloads, `unordered` unless stated, **at 1,000 ev/s** —
+the rate the stack is sized for and the measured ceiling on this hardware.
+Every figure below is a full-drain run judged by the oracle; every one ended
 `missing=0 unexpected=0 duplicates=0`. The three rate-limited subscriptions
 are excluded from the latency columns — they take minutes by design.
 
-| Mode | Rate | Channel | p50 | p90 | p99 |
-| --- | --- | --- | --- | --- | --- |
-| `unordered` | 100 ev/s | webhook | **79.8 ms** | 139 ms | 385 ms |
-| `unordered` | 100 ev/s | SSE | **92.3 ms** | 160 ms | 512 ms |
-| `unordered` | 300 ev/s | webhook | **154.2 ms** | 270 ms | 442 ms |
-| `unordered` | 300 ev/s | SSE | **178.5 ms** | 321 ms | 528 ms |
-| `unordered` | 1,000 ev/s | webhook | **328–383 ms** | 594–2097 ms | 8329–10026 ms |
-| `unordered` | 1,000 ev/s | SSE | **399–454 ms** | 622–731 ms | 1004–1341 ms |
-| `key_ordered` | 1,000 ev/s | webhook | **516.8 ms** | 5450 ms | 10956 ms |
-| `key_ordered` | 1,000 ev/s | SSE | **542.0 ms** | 918 ms | 1212 ms |
+| Mode | Channel | p50 | p90 | p99 |
+| --- | --- | --- | --- | --- |
+| `unordered` | webhook | **328–383 ms** | 0.6–2.1 s | 8.3–10.0 s |
+| `unordered` | SSE | **399–454 ms** | 0.6–0.7 s | 1.0–1.3 s |
+| `key_ordered` | webhook | **516.8 ms** | 5.45 s | 10.96 s |
+| `key_ordered` | SSE | **542.0 ms** | 0.92 s | 1.21 s |
 
-The 1,000 ev/s rows are ranges across runs rather than single numbers: this
-host does not hold still at that rate, and the spread is part of the result.
-Worth noting what the strict mode costs at that rate: on one identical run,
-`key_ordered` webhook sits at p90 **5450 ms** while its SSE half sits at
-918 ms — the webhook side queues far deeper than the SSE side when per-key
-ordering is imposed on a stack already at its ceiling, which is a further
-reason not to run the strict mode at a rate the stack has no headroom for.
+The `unordered` rows are ranges across runs rather than single numbers: this
+host does not hold still at that rate, and the spread is part of the result
+(the p50 holds within 55 ms while p90 varies 3×). Worth noting what the
+strict mode costs at the same rate: on one identical run, `key_ordered`
+webhook sits at p90 **5.45 s** while its SSE half sits at **0.92 s** — the
+webhook side queues far deeper than the SSE side when per-key ordering is
+imposed on a stack already at its ceiling, which is a further reason not to
+run the strict mode at a rate the stack has no headroom for.
 
 ### Where those milliseconds go
 
@@ -119,12 +117,12 @@ decomposition is the same measurement cut three ways, not three medians
 from three populations. It is computed by `scripts/decompose.py`, which
 joins the generator's `pub.jsonl` to the delivery-status rows per event:
 
-| Segment | 100 ev/s | 300 ev/s | 1,000 ev/s |
-| --- | --- | --- | --- |
-| publish → `pending` (events topic) | 30.8 ms | 89.1 ms | 195–222 ms |
-| `pending` → `in_flight` (deliveries topic) | 47.0 ms | 64.0 ms | 119–138 ms |
-| `in_flight` → `delivered` (the HTTP call) | **0 ms** | **1 ms** | **2 ms** |
-| **per-delivery sum** | **79.6 ms** | **153.9 ms** | **329–384 ms** |
+| Segment | 1,000 ev/s |
+| --- | --- |
+| publish → `pending` (events topic) | 195–224 ms |
+| `pending` → `in_flight` (deliveries topic) | 119–138 ms |
+| `in_flight` → `delivered` (the HTTP call) | **2–3 ms** |
+| **per-delivery sum** | **329–384 ms** |
 
 **The delivery itself is 2 ms.** Everything else is queueing, and it was
 worth ruling the obvious suspects out properly:
@@ -143,17 +141,16 @@ worth ruling the obvious suspects out properly:
   from `-rate`, every run reported `dropped=0`.
 
 What is left is the router, which is a **serial poll → process → transaction
-→ poll** loop. Measured per stage, each figure an average over 50 batches
-(one representative run per rate; the 1,000 ev/s column is the range across
-two runs):
+→ poll** loop. Measured per stage, each figure an average over 50 batches,
+as a range across runs at 1,000 ev/s:
 
-| Router stage | 100 ev/s | 300 ev/s | 1,000 ev/s |
-| --- | --- | --- | --- |
-| `kafka_wait` (produce → poll pickup) | 32 ms | 86 ms | 172–209 ms |
-| `produce_sync` (deliveries + status) | 33 ms | 43 ms | 61–72 ms |
-| `produce_end` (markers + offset commit) | 9 ms | 14 ms | 28–31 ms |
-| `process` | 0 ms | 1 ms | 9 ms |
-| `cycle` (poll → poll) | 44 ms | 60 ms | 97–119 ms |
+| Router stage | 1,000 ev/s |
+| --- | --- |
+| `kafka_wait` (produce → poll pickup) | 172–209 ms |
+| `produce_sync` (deliveries + status) | 61–72 ms |
+| `produce_end` (markers + offset commit) | 28–31 ms |
+| `process` | 9 ms |
+| `cycle` (poll → poll) | 97–119 ms |
 
 Two numbers in that table do the explaining. `produce_sync` + `produce_end`
 is **89–103 ms of a 97–119 ms cycle** — about nine tenths of the loop:
@@ -170,23 +167,26 @@ They are. Sampled mid-publish with `kafka-consumer-groups`:
 | `dispatcher` | 42,741 (27,817 of it in **one** partition) | 22 |
 | `status-writer` | 14,268 | 0 |
 
-The router's lag is the same order as the measured `kafka_wait`, which is
-the point: a few hundred records at 1,000 ev/s is a few hundred milliseconds
-of events sitting in Kafka rather than consumed. It slightly *overstates*
-queueing too — the query reports the **committed** offset, which advances
-only once per ~97 ms transaction, so a cycle's worth of already-processed
-records still reads as lag until the next commit. The dispatcher's backlog is
-the three rate-limited subscriptions accumulating *by design*, which is why
-the unlimited subscriptions still see a 119 ms queue; and status-writer lag
-only delays **observation**, never delivery, because `ts` is stamped when the
+Lag is reported as the **committed** offset, which advances only once per
+~97 ms transaction, so a cycle's worth of already-processed records reads as
+lag until the next commit — and the router's figure moves a lot within a
+single run (895 during the initial ramp, 17 once settled; see the sweep
+below). Read as an order of magnitude rather than a point value it agrees
+with `kafka_wait`: 172–209 ms at 1,000 ev/s is ~170 records of standing
+backlog across three routers, against 17–639 sampled.
+
+What is stable in that table is the shape: the dispatcher's backlog is the
+three rate-limited subscriptions accumulating *by design*, which is why the
+unlimited subscriptions still see a 119 ms queue; and status-writer lag only
+delays **observation**, never delivery, because `ts` is stamped when the
 record is emitted rather than when it is written.
 
 ### Why 1,000 ev/s costs what it costs
 
-Two things are at their limit at that rate, and neither is the delivery
-path. The first is in the table above: the router commits only as fast as
-Kafka accepts a transaction across RF=3. The second is the host — on this
-8-core laptop, sampled during a `key_ordered` run at 1,000 ev/s:
+Two things set the **median** at that rate, and neither is the delivery path.
+The first is in the table above: the router commits only as fast as Kafka
+accepts a transaction across RF=3. The second is the host — on this 8-core
+laptop, sampled during a `key_ordered` run at 1,000 ev/s:
 
 | | |
 | --- | --- |
@@ -201,43 +201,87 @@ competing with the system it measures is inherent to a load test on one
 machine.
 
 The practical consequence: **at 1,000 ev/s single-event the stack runs at
-its ceiling, and latency at a ceiling is queueing.** Lower the rate and it
-falls away — 154 ms at 300 ev/s, 80 ms at 100 ev/s — with far less work
-competing for the same eight cores. Load average was sampled only during the
-1,000 ev/s runs, so no figure is claimed here for the other two rates. The
-34/56 ms figures above were taken on single-node Kafka with one instance of
-every service, and they do not transfer — not because anything regressed, but
-because replication factor three on shared hardware is a different machine.
+its ceiling, and latency at a ceiling is queueing** — and as the next
+section shows, what breaks first past it is the dispatcher's queue, not the
+router's. The 34/56 ms figures above were taken on single-node Kafka with
+one instance of every service, and they do not transfer — not because
+anything regressed, but because replication factor three on shared hardware
+is a different machine.
 
 ### The throughput ceiling
 
 The oracle will not find a ceiling, because a ceiling is not a correctness
-problem — correctness held at **every** rate tested:
+problem — correctness held at **every** rate tested. Swept with
+`scripts/ceiling.sh` (40 s of publish each, then a full drain):
 
-| Rate (single, `unordered`) | webhook p50 | webhook p90 | webhook p99 | SSE p50 | drain | Oracle |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1,000 ev/s (achieved 998) | 364 ms | 0.71 s | 1.55 s | 432 ms | 177 s | `missing=0 unexpected=0 duplicates=0` |
-| 1,500 ev/s (achieved 1,476) | 492 ms | **8.87 s** | 15.74 s | 486 ms | 228 s | `missing=0 unexpected=0 duplicates=0` |
-| 2,000 ev/s (achieved 1,995) | 958 ms | 26.35 s | 44.96 s | 886 ms | 315 s | `missing=0 unexpected=0 duplicates=0` |
-| 2,500 ev/s (achieved 2,449) | 2.35 s | 34.73 s | 89.96 s | 2.08 s | 375 s | `missing=0 unexpected=0 duplicates=0` |
+| Rate (single, `unordered`) | Achieved | webhook p50 | webhook p90 | webhook p99 | SSE p50 | drain | `unrecorded` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1,000 ev/s | 1,000.0 | 366 ms | 0.61 s | 0.85 s | 427 ms | 177 s | 0 |
+| 1,500 ev/s | 1,500.0 | 440 ms | **7.88 s** | 25.56 s | 504 ms | 240 s | 0 |
+| 2,000 ev/s | 2,000.0 | 815 ms | 48.54 s | 54.77 s | 715 ms | 312 s | 0 |
+| 2,500 ev/s | 2,500.0 | 922 ms | 78.18 s | 112.80 s | 944 ms | 330 s | **85,157** |
 
-40 s of publish each, then a full drain. **The knee is between 1,000 and
-1,500 ev/s, and it appears in the tail first: p90 goes from 0.71 s to
-8.87 s — a 12.5× jump — while p50 moves only 364 → 492 ms.** At 1,500 most
-events are still fast and a growing minority queue for seconds. Past 2,000
-the median itself is a second and the tail is tens of seconds.
+40 s of publish each, then a full drain, at exactly the requested rate.
+`missing=0 unexpected=0 duplicates=0` at **every** rate — which is the
+point: the oracle cannot find a ceiling.
+
+**The knee is between 1,000 and 1,500 ev/s, and it appears in the tail
+first: p90 goes from 0.61 s to 7.88 s — a 13× jump — while p50 moves only
+366 → 440 ms.** At 1,500 most events are still fast and a growing minority
+queue for seconds. By 2,500 the median is nearly a second and p99 is
+approaching two minutes.
+
+The 2,500 row's `unrecorded=85,157` is a **judging artifact, not a loss**:
+status-writer's lag read 0 again minutes later, so every one of those rows
+had landed — the run was simply judged before the store caught up.
+`scripts/loadtest.sh` now settles status-writer before asking the oracle,
+for exactly this reason.
 
 So the ceiling for single-event publishing on this topology and this host is
 **~1,000 ev/s**: below it latency is hundreds of milliseconds, above it
 latency is unbounded and only the rate at which you stop publishing matters.
 
-Two corroborating signals. Drain time grows 177 → 375 s — that is the
-backlog that still existed when publishing stopped, and it is the same
-phenomenon as the router lag measured earlier. And `dropped` is non-zero at
-1,500 (884) and 2,500 (1,762) but **not** at 2,000, which rules it out as a
-threshold: the drops arrive in bursts — the whole 884 at 1,500 fell in two
-seconds, 402 and 482 — so it is a transient stall overflowing the sender
-buffer, evidence of operating at the edge rather than the edge itself.
+Two corroborating signals. Drain time grows 177 → 330 s — that is the
+backlog that still existed when publishing stopped. And `dropped` cannot be
+the threshold, because **two sweeps disagree about it**: 0 / 884 / 0 / 1,762
+in one and 0 / 0 / 0 / 366 in the other, at identical configurations. The
+drops arrive in bursts — the whole 884 at 1,500 fell in two seconds, 402 and
+482 — so it is a transient stall overflowing the sender buffer, evidence of
+operating at the edge rather than the edge itself.
+
+#### Where the ceiling is
+
+Not where the median lives. At 1,000 ev/s the median is dominated by the
+router's segment (195–224 of 329–384 ms), but the **tail is entirely the
+dispatcher's queue** — same runs, per-delivery p90 from `scripts/decompose.py`:
+
+| Segment (p90) | 1,000 | 1,500 | 2,000 | 2,500 |
+| --- | --- | --- | --- | --- |
+| publish → `pending` (router) | 0.39 s | 0.46 s | 0.69 s | 0.89 s |
+| `pending` → `in_flight` (dispatcher) | 0.23 s | **7.61 s** | **48.04 s** | **77.84 s** |
+| `in_flight` → `delivered` (HTTP) | 12 ms | 13 ms | 15 ms | 19 ms |
+
+The router's segment grows **2.3×** across the whole sweep; the dispatcher's
+grows **336×**; the HTTP call never leaves 12–19 ms. The knee between 1,000
+and 1,500 is therefore the **dispatcher's delivery queue** saturating — not
+the router's transaction and not the delivery itself.
+
+The router's own lag confirms it is not the limiter. Sampled twice inside
+each publish window (the t+15 s sample catches the initial ramp, so t+38 s
+is the steadier reading):
+
+| Rate | lag t+15 s | lag t+38 s | Load average (8 cores) |
+| --- | --- | --- | --- |
+| 1,000 | 895 | 17 | 16.9 → 22.4 |
+| 1,500 | 1,137 | 720 | 16.6 → 26.2 |
+| 2,000 | 1,619 | 1,550 | 15.5 → 35.1 |
+| 2,500 | 2,030 | **2,807** | 24.6 → **40.9** |
+
+It settles rather than grows at every rate until 2,500, where it rises 38% —
+that is the router's own ceiling, and by then end-to-end latency has already
+collapsed twice over. Load average is sampled from `/proc/loadavg`, which
+counts uninterruptible sleepers as well as runnable tasks: it says the host
+is contended, not that it is purely CPU-bound.
 
 :::note Two harness traps, both of which produced wrong numbers first
 A fixed 64-sender pool shed **500–953 events per run** at 1,000 ev/s — a
@@ -363,6 +407,19 @@ Not exercised yet: the soak test, restart-mid-job recovery of the replay
 worker and the multi-day offline scenario.
 
 ## Reproducing it
+
+Every figure above came from one command, which runs the whole sequence in
+the only order that measures it — seed → receivers → publish → **full
+drain** → settle the status store → oracle:
+
+```sh
+HARNESS_MODE=single ./scripts/loadtest.sh unordered 1000 40s load1
+```
+
+`scripts/decompose.py <owner> <seed.json> <pub.jsonl>` then splits the
+result into the three segments, and `scripts/ceiling.sh 40s 1000 1500 2000
+2500` sweeps rates. Doing it by hand is worth knowing too, because two steps
+are easy to get wrong:
 
 ```sh
 ./bin/harness seed -owner load1 -prefix load1 -types 4 -subs 40 > seed.json
