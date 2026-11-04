@@ -32,6 +32,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -213,6 +214,20 @@ func (kgoLogger) Log(l kgo.LogLevel, msg string, keyvals ...any) {
 // produce, an aborted commit) are logged and retried after a backoff; only a
 // non-retryable commit failure returns an error, which main turns into a
 // non-zero exit so the pod is restarted with a fresh session.
+// fatalTxnErr reports whether a Begin failure means the transactional
+// producer is dead rather than merely sitting inside an open transaction.
+//
+// The two cases are indistinguishable by type - franz-go returns a plain
+// errors.New for the second - so this matches the wrapper text franz-go uses
+// for the first. That is deliberate: franz-go decides which producer-ID
+// failures are unrecoverable and that set changes with KIP-890 semantics, so
+// matching its verdict keeps this correct without copying a list of codes
+// that will drift. The cost is a dependency on the wording, which the test
+// next to this pins.
+func fatalTxnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "fatal, unrecoverable error")
+}
+
 func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router) error {
 	slog.Info("router: ready", "group", group)
 	// Read once for the abort diagnosis below: franz-go returns
@@ -306,6 +321,27 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 
 		if err := sess.Begin(); err != nil {
 			slog.Error("router: beginning transaction", "err", err)
+			// Two different failures arrive here and only one of them can be
+			// retried. franz-go wraps a producer ID it could not recover in
+			// "producer ID has a fatal, unrecoverable error" - a fenced
+			// producer, which is what a broker restart produced here: r2 took
+			// PRODUCER_FENCED at 20:52:20 and never routed another event,
+			// silently, until the process was restarted 12 minutes later.
+			// Nothing in-process revives it (maybeRecoverProducerID has
+			// already given up), so the abort below cannot help either: it
+			// fails, the loop escalates its backoff, and the router consumes
+			// events it will never produce for the rest of its life.
+			//
+			// Exit instead, exactly as the End failure further down already
+			// does. The wrapper text is franz-go's own classification rather
+			// than a list of error codes duplicated here - that list moves
+			// with KIP-890 semantics, and missing one code reintroduces this
+			// bug silently. scripts/supervise.sh restarts a service that
+			// exits on its own (a kill -9 still does not), which is the
+			// local equivalent of the pod restart this file already assumes.
+			if fatalTxnErr(err) {
+				return fmt.Errorf("router: transactional producer is unrecoverable: %w", err)
+			}
 			// The failure that matters here is "already in a transaction". A
 			// failed End - the abort on the produce-failure path below, or the
 			// commit - leaves this session inside an open transaction, and from
