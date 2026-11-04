@@ -144,6 +144,14 @@ func newSession(topics []string) (*kgo.GroupTransactSession, error) {
 		kgo.ConsumeTopics(topics...),
 		kgo.DisableAutoCommit(), // offsets are committed by End(TryCommit)
 		kgo.TransactionalID(fmt.Sprintf("%s-%d", host, os.Getpid())),
+		// 2ms rather than 0. Tried at 0 and measured at 1,000 ev/s: produce_sync
+		// went 65 -> 68ms and produce_end 31 -> 28ms, both inside this metric's
+		// own spread across runs (61-72 and 28-31), so it bought nothing - while
+		// risking a flush that fires before a whole ProduceSync call has been
+		// enqueued and splits one transaction's produce into several requests.
+		// ProduceSync hands the batch over in one call anyway, so there is
+		// little for a linger to accumulate here; it is kept for the records
+		// produced outside that call.
 		kgo.ProducerLinger(2*time.Millisecond),
 		kgo.ProducerBatchMaxBytes(4<<20),
 		kgo.SessionTimeout(session),
