@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -82,17 +81,26 @@ func (d *Dispatcher) send(ctx context.Context, pol policy, it *item, attempt uin
 	h := http.Header{}
 	switch pol.format {
 	case "structured":
-		b, err := json.Marshal(msg.Event)
-		if err != nil {
-			return attemptResult{kind: attemptFailure, reason: reasonTransport, err: fmt.Errorf("marshalling event: %w", err)}
+		// The delivery already holds the event as it was published, so sending
+		// it means forwarding those bytes. Marshalling a parsed copy cost a
+		// second serialisation of data that had already been serialised twice -
+		// once by publish-api, once when the router wrote this record.
+		if len(msg.EventRaw) == 0 {
+			return attemptResult{kind: attemptFailure, reason: reasonTransport, err: errors.New("delivery carries no event")}
 		}
-		body = b
+		body = msg.EventRaw
 		h.Set("Content-Type", cloudevents.ContentTypeStructured)
 	default: // binary mode, the CloudEvents binary binding
-		body = eventData(msg.Event)
-		msg.Event.SetHeaders(h)
-		if msg.Event.DataContentType != "" {
-			h.Set("Content-Type", msg.Event.DataContentType)
+		// Only this binding needs the event decoded, and only for the header
+		// attributes; the body is the raw data member either way.
+		ev, err := msg.Event()
+		if err != nil {
+			return attemptResult{kind: attemptFailure, reason: reasonTransport, err: err}
+		}
+		body = eventData(ev)
+		ev.SetHeaders(h)
+		if ev.DataContentType != "" {
+			h.Set("Content-Type", ev.DataContentType)
 		}
 	}
 

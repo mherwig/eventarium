@@ -103,7 +103,9 @@ func buildReplay(reg *registry.Registry, job *Job, sub *registry.Subscription, m
 		CreatedAt:      now,
 		ExpiresAt:      expires,
 		Projected:      len(sub.Projection) > 0,
-		Event:          ev,
+	}
+	if err := msg.SetEvent(ev); err != nil {
+		return nil, fmt.Errorf("encoding the event: %w", err)
 	}
 	value, err := msg.Encode()
 	if err != nil {

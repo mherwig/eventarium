@@ -7,7 +7,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"pubsub/internal/cloudevents"
 	"pubsub/internal/delivery"
 )
 
@@ -25,11 +24,15 @@ const maxSentLog = 4096
 
 // ssePayload is the data member of one SSE event.
 type ssePayload struct {
-	DeliveryID string             `json:"delivery_id"`
-	EventRef   string             `json:"event_ref"`
-	Sequence   string             `json:"sequence"`
-	Replay     bool               `json:"replay,omitempty"`
-	Event      *cloudevents.Event `json:"event"`
+	DeliveryID string `json:"delivery_id"`
+	EventRef   string `json:"event_ref"`
+	Sequence   string `json:"sequence"`
+	Replay     bool   `json:"replay,omitempty"`
+	// Event is forwarded as the bytes the delivery carried. This stage never
+	// inspects it, and decoding it per frame would parse the payload of every
+	// SSE delivery - about half of all records - just to write the same bytes
+	// back out to the client.
+	Event json.RawMessage `json:"event"`
 }
 
 // outbound is one delivery queued for one connection.
@@ -54,7 +57,7 @@ func (o outbound) frame() (string, error) {
 		EventRef:   o.msg.EventRef,
 		Sequence:   o.seq.String(),
 		Replay:     o.msg.Replay,
-		Event:      o.msg.Event,
+		Event:      o.msg.EventRaw,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

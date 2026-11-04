@@ -242,7 +242,11 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 			// the past; that is intended (publish-api stamps it so).
 			ExpiresAt: expires,
 			Projected: len(sub.Projection) > 0,
-			Event:     ev,
+		}
+		if err := msg.SetEvent(ev); err != nil {
+			slog.Warn("router: encoding the event",
+				"event_ref", eventRef, "subscription", sub.ID, "err", err)
+			continue
 		}
 		value, err := msg.Encode()
 		if err != nil {
