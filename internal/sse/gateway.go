@@ -229,11 +229,16 @@ func New(opts Options) (*Gateway, error) {
 		kgo.ConsumeTopics(kafkautil.TopicDeliveries),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
 		kgo.DisableAutoCommit(),
-		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
-			// A rebalance can hand a partition to another node while this one
-			// still holds records of it in memory; the gate stops tracking
-			// them, so their offsets stay the new owner's to commit.
-			g.gate.Keep(assigned)
+		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, revoked map[string][]int32) {
+			// A rebalance hands a partition to another node while this one
+			// may still hold records of it in memory; stop tracking them so
+			// their offsets stay the new owner's to commit.
+			//
+			// Revoked, not assigned: the default cooperative-sticky balancer
+			// only ever reports the partitions a rebalance added, so reading
+			// the assigned callback as "these are mine" dropped every partition
+			// this node kept - see offsetgate.Drop.
+			g.gate.Drop(revoked)
 		}),
 	); err != nil {
 		cleanup()

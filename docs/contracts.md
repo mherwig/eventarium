@@ -102,10 +102,20 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 - `internal/offsetgate` (new) – the no-loss commit watermark both delivery
   stages share: `Track` records hold a polled record's offset with its leader
   epoch, `Settle` releases one, `CommitPoints` is the lowest not-yet-durable
-  offset per partition (what may be committed), and `Keep` drops everything a
-  rebalance handed to another replica. Offsets therefore move past a record
+  offset per partition (what may be committed), and `Drop` forgets the
+  partitions a rebalance took away. Offsets therefore move past a record
   only when it reached a durable outcome; a crash replays what was still in
   flight instead of skipping it.
+  `Drop` takes the *revoked* set rather than the retained one, and the
+  distinction is load-bearing: the default cooperative-sticky balancer hands
+  `OnPartitionsAssigned` only the partitions a rebalance added, so reading it
+  as "these are mine" emptied the gate of every partition the member kept -
+  and a forgotten in-flight record stops holding the commit point back while
+  later records of the same partition keep advancing it, which is the exact
+  loss this package exists to prevent. Measured against the running cluster
+  rather than read from franz-go's source: a survivor of a two-member
+  rebalance on twelve partitions was handed `{}` after giving up only 6-11,
+  and went on receiving from 0-5.
 - `internal/store` – PostgreSQL access: control data and the inbox
   (`Park`, `FetchParked`, `AckParked`, `CountParked`, `DeleteExpiredParked`,
   `UpdateSubscription`, `EnsureInboxPartitions`). Subscriptions are deleted
@@ -272,6 +282,23 @@ publish API. A delivery record additionally carries `pubsub-channel`.
   fail are retried by a bounded background queue (backpressure, not memory),
   and a payload that cannot be encoded for the inbox is the one deliberate
   drop: terminal, with a `dropped`/`park_failed` status.
+- A revoke waits out the work it still holds before handing a partition over.
+  `OnPartitionsRevoked` does not return until every record of the departing
+  partitions has reached a durable outcome (bounded at 2 s; when the bound
+  wins it logs how much was left rather than passing the handover off as
+  clean), then drops those partitions from the watermark and commits the
+  marks. Every revoke logs its drain and commit durations, including the fast
+  ones: franz-go's assign path waits on this callback before resuming fetches,
+  so time spent here is time this member is not consuming, and a bound set
+  against the 15 s session timeout rather than against the delivery p99 is how
+  the first version of this lost 16-20k deliveries per chaos scenario while its
+  own logs stayed silent. Returning immediately would let the group finish the rebalance while
+  this member's workers were still delivering, so two pods would deliver one
+  subscription at once — and `delivery_mode` ordered is the one mode that
+  cannot survive that, because its `max_in_flight=1` is honoured only by data
+  locality: one subscription is one partition and one partition has one owner.
+  The wait is inside the callback rather than built on `BlockRebalanceOnPoll`,
+  which would stall the poll loop for the partitions being *kept* as well.
 - Drains the inbox at `drain_rate_per_s` when the subscription is healthy
   again; while draining, new events go to the inbox so that order holds.
 - Emits in_flight, retrying, delivered, dead_lettered, paused, dropped.

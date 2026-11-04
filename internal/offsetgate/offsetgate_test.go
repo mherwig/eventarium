@@ -169,16 +169,16 @@ func TestSettleUnknownIsNoop(t *testing.T) {
 // A rebalance hands partition 1 to another member: this consumer may still
 // hold records of it, but it must stop tracking - and therefore stop
 // committing - them, or it would race the new owner.
-func TestKeepDropsLostPartitions(t *testing.T) {
+func TestDropForgetsRevokedPartitions(t *testing.T) {
 	g := New()
 	g.Track(rec(40, 1))
 	g.Settle(topic, 1, 40)
 
 	g.Track(&kgo.Record{Topic: topic, Partition: 2, Offset: 8, LeaderEpoch: 1})
-	g.Keep(map[string][]int32{topic: {2}})
+	g.Drop(map[string][]int32{topic: {1}})
 
 	if len(g.parts) != 1 {
-		t.Fatalf("gate keeps %d partitions, want only partition 2", len(g.parts))
+		t.Fatalf("gate holds %d partitions, want only partition 2", len(g.parts))
 	}
 	if _, ok := g.parts[key{topic, 2}]; !ok {
 		t.Fatal("partition 2 was dropped instead of kept")
@@ -189,6 +189,78 @@ func TestKeepDropsLostPartitions(t *testing.T) {
 	// A late settle for the partition that was taken away changes nothing.
 	if got := g.Settle(topic, 1, 40); got != nil {
 		t.Fatalf("settling a partition we no longer own committed: %+v", got)
+	}
+}
+
+// The bug this replaces, pinned so it cannot come back.
+//
+// The gate used to be pruned from OnPartitionsAssigned with a "keep what you
+// were assigned" call. That is only correct if the callback reports the whole
+// assignment, and the default cooperative-sticky balancer does not: franz-go's
+// diffAssigned ignores the partitions in common with the previous session, so
+// after a rebalance the callback reports only the partitions that were added.
+//
+// Measured against the real cluster rather than read from the source: with two
+// members on a twelve-partition topic, the survivor was handed {} after it had
+// given up only partitions 6-11, while it went on receiving from 0-5. Applied
+// as "keep these", that empties the gate of every partition still owned - and
+// a forgotten in-flight record stops holding the commit point back while later
+// records of the same partition keep advancing it, so the commit walks past a
+// delivery that never happened. That is the loss the package exists to prevent,
+// reintroduced by the call meant to prevent it.
+//
+// Drop takes the revoked set instead, so the empty map the assigned callback
+// really produces is a no-op.
+func TestDropLeavesRetainedPartitionsAlone(t *testing.T) {
+	g := New()
+	g.Track(rec(40, 1)) // partition 1: retained across the rebalance
+	g.Track(&kgo.Record{Topic: topic, Partition: 2, Offset: 8, LeaderEpoch: 1})
+
+	// What franz-go reports when a rebalance took nothing away.
+	g.Drop(map[string][]int32{})
+
+	if len(g.parts) != 2 {
+		t.Fatalf("gate holds %d partitions after an empty revoke, want 2", len(g.parts))
+	}
+	if got := head(t, g); got != -1 {
+		t.Fatalf("commit point = %d, want the in-flight record to still hold it back", got)
+	}
+	// The retained partition must still be able to commit: the whole cost of
+	// the old call was that it could not.
+	g.Settle(topic, 1, 40)
+	if got := head(t, g); got != 41 {
+		t.Fatalf("commit point = %d, want 41: a retained partition stopped committing", got)
+	}
+}
+
+// PendingIn is what the dispatcher's revoke waits on, so it has to count
+// exactly the records whose delivery would overlap the new owner's: those of
+// the partitions being taken away, and not those of the ones being kept.
+func TestPendingInCountsOnlyTheRevokedPartitions(t *testing.T) {
+	g := New()
+	g.Track(
+		&kgo.Record{Topic: topic, Partition: 1, Offset: 10, LeaderEpoch: 1},
+		&kgo.Record{Topic: topic, Partition: 1, Offset: 11, LeaderEpoch: 1},
+		&kgo.Record{Topic: topic, Partition: 2, Offset: 20, LeaderEpoch: 1},
+	)
+
+	if got := g.PendingIn(map[string][]int32{topic: {1}}); got != 2 {
+		t.Fatalf("pending on partition 1 = %d, want 2", got)
+	}
+	// The partition being kept contributes nothing: waiting on it would hold
+	// up a handover for work that is not going anywhere.
+	if got := g.PendingIn(map[string][]int32{topic: {2}}); got != 1 {
+		t.Fatalf("pending on partition 2 = %d, want 1", got)
+	}
+	if got := g.PendingIn(map[string][]int32{}); got != 0 {
+		t.Fatalf("pending for no partitions = %d, want 0", got)
+	}
+
+	// Settling is what makes the wait end.
+	g.Settle(topic, 1, 10)
+	g.Settle(topic, 1, 11)
+	if got := g.PendingIn(map[string][]int32{topic: {1}}); got != 0 {
+		t.Fatalf("pending on partition 1 after settling = %d, want 0", got)
 	}
 }
 

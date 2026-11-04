@@ -70,6 +70,39 @@ const (
 	// speed and again every retry tick, so one line per attempt would drown the
 	// log exactly while the store is down.
 	parkLogEvery = 30 * time.Second
+
+	// revokeDrain bounds how long a revoke waits for the deliveries this member
+	// is still holding for the partitions it is giving up. Waiting is what
+	// keeps two pods from delivering the same subscription at once: franz-go
+	// does not hand the partitions to another member until this callback
+	// returns, so a callback that returns immediately says "I am done with
+	// these" while its workers are still delivering them. Two pods then deliver
+	// one subscription at once, which for delivery_mode ordered means two
+	// single-worker pods interleaving - the ordering guarantee broken by
+	// exactly the mechanism meant to preserve it.
+	//
+	// The bound is small because the cost of getting it wrong is asymmetric in
+	// the opposite direction from the benefit. This runs inside the group's
+	// revoke phase and franz-go's assign path waits on it before resuming
+	// fetches, so every millisecond here is a millisecond this member is not
+	// consuming. During a broker recovery, where rebalances arrive with a
+	// backlog behind them, a generous bound becomes partitions nobody reads
+	// from: the first version of this used 10s against a 15s session timeout
+	// (kafkautil.DefaultSessionTimeout, pinned by
+	// TestSessionSecondsFallbackMatchesDefault) and the chaos gate lost 16-20k
+	// deliveries per scenario from exactly that stall. 2s covers the measured
+	// p99 delivery time (1.1-1.5s) and leaves the rest of the session budget to
+	// heartbeats, the commit and the rejoin.
+	//
+	// It also has to be logged on success, not only when it expires: warning
+	// only on timeout made a drain that succeeded after nine seconds
+	// indistinguishable from one that returned immediately, which is exactly
+	// how a stall hides.
+	revokeDrain = 2 * time.Second
+	// revokeDrainTick is how often the drain re-checks: short enough that the
+	// last delivery of a quiet partition is not waited on for longer than it
+	// took.
+	revokeDrainTick = 25 * time.Millisecond
 )
 
 // accept is the decision of the submit path.
@@ -153,26 +186,14 @@ func New(cfg Config) (*Dispatcher, error) {
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = defaultAttempts
 	}
-	// The gate is built first because the consumer's assignment callback needs
-	// it: a rebalance can hand a partition to another replica while this one
-	// still holds records of it, and the gate has to stop tracking them - a
-	// late settle must not move an offset somebody else now owns.
+	// The gate is built first because the group callbacks need it: a rebalance
+	// can hand a partition to another replica while this one still holds
+	// records of it, and the gate has to stop tracking them - a late settle
+	// must not move an offset somebody else now owns.
 	gate := offsetgate.New()
-	cl, err := kafkautil.NewClient(
-		kgo.ConsumerGroup(consumerGroup),
-		kgo.AutoCommitMarks(),
-		kgo.ConsumeTopics(kafkautil.TopicDeliveries),
-		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
-			gate.Keep(assigned)
-		}),
-	)
-	if err != nil {
-		return nil, err
-	}
 	d := &Dispatcher{
 		reg:          cfg.Registry,
 		st:           cfg.Store,
-		cl:           cl,
 		emitter:      newEmitter(cfg.Status),
 		secret:       []byte(cfg.SigningSecret),
 		allowPrivate: cfg.AllowPrivate,
@@ -189,7 +210,144 @@ func New(cfg Config) (*Dispatcher, error) {
 			CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
+	// The client is built after d so the revoke hook can be a method on it
+	// rather than a closure over a variable assigned later: the group goroutine
+	// reads that hook as soon as the first poll starts, and a value racing that
+	// read is the sort of thing every test passes and -race does not. Nothing
+	// can call back into d before Run polls, Run is called after New returns,
+	// and Shutdown closes the client last, so d.cl is set before onRevoked can
+	// run.
+	//
+	// The hook is OnPartitionsRevoked rather than OnPartitionsAssigned. This
+	// is the callback handed the partitions actually being taken away - see
+	// offsetgate.Drop for why the assigned one is not - and it is the last
+	// point at which this member can still hold up the rebalance.
+	cl, err := kafkautil.NewClient(
+		kgo.ConsumerGroup(consumerGroup),
+		kgo.AutoCommitMarks(),
+		kgo.ConsumeTopics(kafkautil.TopicDeliveries),
+		kgo.OnPartitionsRevoked(d.onRevoked),
+	)
+	if err != nil {
+		return nil, err
+	}
+	d.cl = cl
+
 	return d, nil
+}
+
+// onRevoked is the group's revoke hook: it waits out the deliveries this
+// member still holds for the partitions it is losing, stops tracking them, and
+// commits - in that order, and only then returns to let the rebalance proceed.
+//
+// The wait is the point. franz-go does not hand the partitions to another
+// member until every member's revoke callback has returned, so a callback that
+// returns immediately says "I am done with these" while its workers are still
+// delivering them. Two pods then deliver the same subscription at once, which
+// is the one thing delivery_mode ordered cannot survive: policy.go gives that
+// mode a single worker per pod, so the config is honoured only by data
+// locality - one subscription's records sit on one partition, one partition
+// goes to one pod - and an overlapping handover reintroduces exactly the
+// parallelism the config exists to forbid.
+//
+// Nothing here can deadlock. The poll loop keeps running (BlockRebalanceOnPoll
+// is deliberately not set), so workers never wait on this callback, and
+// franz-go invalidates the revoked partitions' buffered fetches before calling
+// us, so the drain is emptying a set that is no longer being added to. The
+// bound exists for the two paths where it genuinely could not finish: a
+// shutdown, where ctx is already cancelled and the first check exits, and a
+// store that is down and holding parks open.
+func (d *Dispatcher) onRevoked(ctx context.Context, cl *kgo.Client, revoked map[string][]int32) {
+	began := time.Now()
+	partitions := 0
+	for _, ps := range revoked {
+		partitions += len(ps)
+	}
+
+	left := drainPartitions(ctx, d.gate, revoked, revokeDrain, revokeDrainTick)
+	drainTook := time.Since(began)
+
+	// Stop tracking before committing: from here a settle for these partitions
+	// is a no-op, which is what stops this member from committing an offset
+	// somebody else now owns.
+	d.gate.Drop(revoked)
+
+	// This replaces franz-go's default revoke, which with AutoCommitMarks is a
+	// blocking commit of every marked offset. Omitting it would leave the last
+	// marks uncommitted and make the new owner replay them - safe, but a
+	// regression in duplicates for no reason. CommitMarkedOffsets commits the
+	// same set defaultRevoke does (both read getUncommitted, and it reaches the
+	// same g.commitOffsetsSync), and it is the variant kgo documents as safe to
+	// call from here: an ordinary commit would be cancelled by the rebalance
+	// that is in progress.
+	//
+	// The drain can observe the last record of a partition already out of the
+	// gate while settle's MarkCommitOffsets is still the next statement to run,
+	// so this commit can miss that one mark. The cost is one replay by the new
+	// owner - a duplicate, which section 8 permits - and never a loss, because
+	// the mark it misses is for a delivery that already happened.
+	commitErr := ""
+	commitTook := time.Duration(0)
+	if ctx.Err() != nil {
+		commitErr = "client context cancelled (shutdown)"
+	} else {
+		start := time.Now()
+		if err := cl.CommitMarkedOffsets(ctx); err != nil {
+			commitErr = err.Error()
+		}
+		commitTook = time.Since(start)
+	}
+
+	// Logged on every revoke, fast ones included. The stall this is here to
+	// catch was invisible in the first version: the only signal was the
+	// timeout warning, so a drain that succeeded after nine seconds looked
+	// exactly like one that returned immediately - and the gate failed with
+	// 16-20k missing deliveries while the logs stayed silent.
+	slog.Info("dispatcher: revoke",
+		"partitions", partitions,
+		"drain_ms", drainTook.Milliseconds(),
+		"left", left,
+		"commit_ms", commitTook.Milliseconds(),
+		"commit_err", commitErr)
+
+	if left > 0 {
+		// The handover goes ahead regardless: the group will not wait forever,
+		// and refusing to return would turn one slow delivery into a member
+		// that gets evicted. Say how much overlap was accepted rather than
+		// letting it look like a clean handoff.
+		slog.Warn("dispatcher: partitions revoked with deliveries still in flight",
+			"left", left, "waited", drainTook.Round(time.Millisecond),
+			"note", "these may be delivered again by the new owner")
+	}
+}
+
+// drainPartitions waits until no record of the named partitions is still in
+// flight, and returns how many were left when it stopped waiting: zero means
+// every delivery for those partitions reached a durable outcome before the
+// partition changed hands.
+//
+// It reads the gate rather than the subscription queues on purpose. What has
+// to be finished is "this Kafka record reached an outcome", and that is
+// precisely what the gate tracks - a record queued, being attempted, or
+// waiting on a park is still pending, while one that was skipped or already
+// parked is not. Counting queue entries instead would wait on deliveries the
+// gate has already released and would not see the ones it has not.
+func drainPartitions(ctx context.Context, g *offsetgate.Gate, want map[string][]int32, timeout, tick time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for {
+		n := g.PendingIn(want)
+		if n == 0 {
+			return 0
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return n
+		}
+		select {
+		case <-time.After(tick):
+		case <-ctx.Done():
+			return g.PendingIn(want)
+		}
+	}
 }
 
 // Run consumes the deliveries topic until ctx is cancelled.

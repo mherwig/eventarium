@@ -241,6 +241,18 @@ changes which partition an event is in.
 4. the dispatcher enqueues into the subscription's queue in that order, and a
    worker retries **in place** — a retry never lets a later event overtake an
    earlier one.
+5. a rebalance is the one moment two dispatchers could hold the same
+   subscription at once, and it is closed too: the outgoing member does not
+   return from its revoke until the partitions it is losing have no delivery
+   in flight, so the handover is serial in the same way the steady state is.
+
+Step 5 is what makes "exactly one dispatcher" in step 3 true across a
+handover rather than only between them. It is bounded — a member that waited
+forever would be evicted instead of handing over — so when the bound wins the
+platform accepts a replay rather than a stalled group. That is the
+"not guaranteed" of the heading: order holds while one member owns the
+partition, and a handover can repeat a delivery, but no two members deliver
+the same subscription concurrently.
 
 **What it cannot establish.** A total order is decided *before* step 1, by
 whichever write reaches the broker first. If two events for one entity are

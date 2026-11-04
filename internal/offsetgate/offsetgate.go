@@ -143,26 +143,38 @@ func (g *Gate) CommitPoints() map[string]map[int32]kgo.EpochOffset {
 	return out
 }
 
-// Keep drops every partition the consumer no longer owns. A rebalance hands a
-// partition to another member while this consumer may still hold records of it
-// in memory; those records can settle later, and settling - and therefore
+// Drop forgets the partitions being taken away. A rebalance hands a partition
+// to another member while this consumer may still hold records of it in
+// memory; those records can settle later, and settling - and therefore
 // committing - a partition somebody else now owns would race the new owner.
 // Dropping is the safe direction: the commit point stays where it was, so the
-// new owner replays from there. Call it from OnPartitionsAssigned, which
-// franz-go invokes with the full assignment after every rebalance.
-func (g *Gate) Keep(assigned map[string][]int32) {
+// new owner replays from there.
+//
+// It takes the revoked set rather than the retained one deliberately. The
+// default cooperative-sticky balancer hands OnPartitionsAssigned only the
+// partitions a rebalance *added*: franz-go's diffAssigned ignores the ones in
+// common with the previous session, so a "keep only what you were assigned"
+// call deletes every partition the member still owns - the exact inverse of
+// its intent, and precisely the hole this package exists to close. A forgotten
+// in-flight record stops holding the commit point back while later records of
+// the same partition keep advancing it, so the commit walks past a delivery
+// that never happened and a crash turns it into loss.
+//
+// That is a measurement, not a reading of the source: with two members on a
+// twelve-partition topic, the survivor's OnPartitionsAssigned reported {}
+// after it had given up only partitions 6-11, while it went on receiving from
+// 0-5. OnPartitionsRevoked, by contrast, is handed exactly the partitions
+// being taken away, and on a fatal group error or a full leave the whole
+// current assignment. Call it from there.
+func (g *Gate) Drop(revoked map[string][]int32) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for k := range g.parts {
-		owned := false
-		for _, partition := range assigned[k.topic] {
+		for _, partition := range revoked[k.topic] {
 			if partition == k.partition {
-				owned = true
+				delete(g.parts, k)
 				break
 			}
-		}
-		if !owned {
-			delete(g.parts, k)
 		}
 	}
 }
@@ -176,6 +188,26 @@ func (g *Gate) Pending() int {
 	n := 0
 	for _, p := range g.parts {
 		n += len(p.pending)
+	}
+	return n
+}
+
+// PendingIn counts the tracked records of the named topic-partitions that have
+// not reached a durable outcome yet. A revoke waits on it so that it does not
+// hand a partition over while this consumer is still delivering for it: the
+// records behind that number are exactly the ones whose delivery would
+// otherwise overlap the new owner's.
+func (g *Gate) PendingIn(want map[string][]int32) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := 0
+	for k, p := range g.parts {
+		for _, partition := range want[k.topic] {
+			if partition == k.partition {
+				n += len(p.pending)
+				break
+			}
+		}
 	}
 	return n
 }
