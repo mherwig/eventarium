@@ -111,7 +111,7 @@ recorded. Full results in [Performance](performance.md).
 
 | What | Result |
 | --- | --- |
-| Throughput | **1,000 ev/s** single-event sustained — the measured ceiling; above it latency is unbounded while the oracle stays clean |
+| Throughput | **1,000 ev/s** single-event sustained — the rate every figure is measured at; the measured ceiling is **~1,500 ev/s**, above which latency grows without bound while the oracle still reports no loss |
 | Loss | **`missing=0 unexpected=0`** at every rate and under every injected fault |
 | Webhook latency | p50 **328–383 ms** at 1,000 ev/s |
 | SSE latency | p50 **399–454 ms** at 1,000 ev/s |

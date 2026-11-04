@@ -45,8 +45,9 @@ asking the platform. See
 cluster cannot be grown to three in place.
 
 All figures are **single-event publishing** (one event per request) at
-1,000 ev/s — the rate the stack is sized for, and the measured ceiling on
-this hardware:
+1,000 ev/s — the rate they are measured at. The measured ceiling on this
+hardware is ~1,500 ev/s; above it latency grows without bound while the
+oracle still reports no loss:
 
 | | |
 | --- | --- |
