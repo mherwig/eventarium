@@ -49,11 +49,20 @@ All figures are **single-event publishing** (one event per request) at
 hardware is ~1,500 ev/s; above it latency grows without bound while the
 oracle still reports no loss:
 
+**Latency is end-to-end**: publish request → receipt at the destination, so it
+includes Kafka at RF=3, routing, dispatch, and the delivery call itself. The
+ranges are across seven runs at 1,000 ev/s (40 s and 60 s publishes — p50 and
+p90 do not depend on the publish window: a 60 s A/B moved p50 by 4 ms). Two
+runs of the *same build* landed 48 ms apart on p50, so treat the spread as
+measurement noise rather than variance in the platform. Per-segment and
+per-stage breakdowns are in
+[the performance docs](https://mherwig.github.io/eventarium/docs/performance).
+
 | | |
 | --- | --- |
 | Throughput | **1,000 ev/s** sustained — 60,000 events fanning out to 291,851 deliveries |
-| Webhook latency | p50 **328–383 ms** at 1,000 ev/s |
-| SSE latency | p50 **399–454 ms** at 1,000 ev/s |
+| Webhook latency (end-to-end) | p50 **304–352 ms**, p90 **0.44–0.57 s** |
+| SSE latency (end-to-end) | p50 **359–423 ms**, p90 **0.53–0.70 s** |
 | Correctness | `missing=0 unexpected=0 duplicates=0` across all 40 subscriptions |
 
 Resilience, with one fault injected mid-publish on nine replicas
