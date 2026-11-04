@@ -96,37 +96,53 @@ are excluded from the latency columns — they take minutes by design.
 
 | Mode | Channel | p50 | p90 | p99 |
 | --- | --- | --- | --- | --- |
-| `unordered` | webhook | **328–383 ms** | 0.6–2.1 s | 8.3–10.0 s |
-| `unordered` | SSE | **399–454 ms** | 0.6–0.7 s | 1.0–1.3 s |
+| `unordered` | webhook | **202–246 ms** | 0.29–0.41 s | 0.38–0.75 s |
+| `unordered` | SSE | **229–291 ms** | 0.34–0.49 s | 0.43–0.88 s |
 | `key_ordered` | webhook | **516.8 ms** | 5.45 s | 10.96 s |
 | `key_ordered` | SSE | **542.0 ms** | 0.92 s | 1.21 s |
 
-The `unordered` rows are ranges across runs rather than single numbers: this
-host does not hold still at that rate, and the spread is part of the result
-(the p50 holds within 55 ms while p90 varies 3×). Worth noting what the
-strict mode costs at the same rate: on one identical run, `key_ordered`
+The `unordered` rows are ranges across **seven identical runs of the current
+build**, 40 s of publish each, rather than single numbers: the host does not
+hold still at that rate, and the spread is part of the result. Six of the
+seven sit within **17 ms** of each other on p50 and **14 ms** on p90; the
+seventh was taken immediately after a restart and paid for cold caches, which
+is what widens the range. That 17 ms is the bar a change has to clear before
+it counts as a change.
+
+**p99 is only comparable within one publish duration.** A 60 s publish at the
+same rate roughly doubles it — measured at **1.38 s** webhook and **1.46 s**
+SSE against the 0.38–0.75 s above — because the three rate-limited
+subscriptions accumulate for half again as long and their backlog reaches the
+unlimited column through the shared dispatcher. The rows this table used to
+carry (328–383 ms and 8.3–10.0 s) came from two 60 s publishes taken before
+the dispatcher stopped parking on its poll loop; at the same 60 s duration
+today that tail reads 1.38 s, so most of what those numbers recorded is gone.
+
+The `key_ordered` rows are a single earlier run and have **not** been re-taken
+on this build: read them as the order of magnitude strict mode costs, not as
+cells comparable with the rows above. That cost is worth seeing — `key_ordered`
 webhook sits at p90 **5.45 s** while its SSE half sits at **0.92 s** — the
-webhook side queues far deeper than the SSE side under per-key ordering at
-the same offered load, which is a further reason not to mix the strict mode
-into a throughput measurement.
+webhook side queues far deeper than the SSE side under per-key ordering at the
+same offered load, which is a further reason not to mix the strict mode into a
+throughput measurement.
 
 ### Where those milliseconds go
 
 End-to-end splits into three segments that sum to it. The check is that the
 **per-delivery sum of the three segments** reproduces the harness's own
-reported webhook p50 to within 0.6 ms across all three runs — so the
+reported webhook p50 to within 1 ms across all seven runs — so the
 decomposition is the same measurement cut three ways, not three medians
 from three populations. It is computed by `scripts/decompose.py`, which
 joins the generator's `pub.jsonl` to the delivery-status rows per event:
 
 | Segment | 1,000 ev/s |
 | --- | --- |
-| publish → `pending` (events topic) | 195–224 ms |
-| `pending` → `in_flight` (deliveries topic) | 118–138 ms |
-| `in_flight` → `delivered` (the HTTP call) | **2–3 ms** |
-| **per-delivery sum** | **321–384 ms** |
+| publish → `pending` (events topic) | 121–150 ms |
+| `pending` → `in_flight` (deliveries topic) | 76–92 ms |
+| `in_flight` → `delivered` (the HTTP call) | **1–2 ms** |
+| **per-delivery sum** | **202–246 ms** |
 
-**The delivery itself is 2 ms.** Everything else is queueing, and it was
+**The delivery itself is 1–2 ms.** Everything else is queueing, and it was
 worth ruling the obvious suspects out properly:
 
 - **publish-api is not the bulk of it.** A record's broker timestamp sits at
@@ -144,20 +160,21 @@ worth ruling the obvious suspects out properly:
 
 What is left is the router, which is a **serial poll → process → transaction
 → poll** loop. Measured per stage, each figure an average over 50 batches,
-as a range across runs at 1,000 ev/s:
+as a range across the same seven runs at 1,000 ev/s:
 
 | Router stage | 1,000 ev/s |
 | --- | --- |
-| `kafka_wait` (produce → poll pickup) | 172–209 ms |
-| `produce_sync` (deliveries + status) | 61–72 ms |
-| `produce_end` (markers + offset commit) | 28–31 ms |
-| `process` | 9 ms |
-| `cycle` (poll → poll) | 97–119 ms |
+| `kafka_wait` (produce → poll pickup) | 120–138 ms |
+| `produce_sync` (deliveries + status) | 49–54 ms |
+| `produce_end` (markers + offset commit) | 19–23 ms |
+| `process` | 3–4 ms |
+| `cycle` (poll → poll) | 74–81 ms |
 
 Two numbers in that table do the explaining. `produce_sync` + `produce_end`
-is **89–103 ms of a 97–119 ms cycle** — about nine tenths of the loop:
+is **68–77 ms of a 74–81 ms cycle** — about nine tenths of the loop, a
+ratio that has not moved:
 the router can only commit as fast as Kafka will take a transaction across
-RF=3, and consumption is gated by production. And `kafka_wait` (172–209 ms)
+RF=3, and consumption is gated by production. And `kafka_wait` (120–138 ms)
 exceeds the whole cycle, which a steady-state consumer cannot do by fetching
 alone — so records are queued rather than merely waiting for a poll.
 
@@ -174,7 +191,7 @@ Lag is reported as the **committed** offset, which advances only once per
 lag until the next commit — and the router's figure moves a lot within a
 single run (895 during the initial ramp, 17 once settled; see the sweep
 below). Read as an order of magnitude rather than a point value it agrees
-with `kafka_wait`: 172–209 ms at 1,000 ev/s is ~170 records of standing
+with `kafka_wait`: 120–138 ms at 1,000 ev/s is ~120–140 records of standing
 backlog across three routers, against 17–639 sampled.
 
 What is stable in that table is the shape: the dispatcher's backlog is the
@@ -278,7 +295,7 @@ the identical measurement went p90 **7.88 s → 0.85 s** and p99
 #### Where the ceiling is
 
 Not where the median lives. At 1,000 ev/s the median is dominated by the
-router's segment (198 of 321 ms), but the **tail is entirely the dispatcher's
+router's segment (121–150 of the 202–246 ms), but the **tail is entirely the dispatcher's
 queue** — same sweep, per-delivery p90 from `scripts/decompose.py`:
 
 | Segment (p90) | 1,000 | 1,500 | 2,000 | 2,500 |

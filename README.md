@@ -51,18 +51,20 @@ oracle still reports no loss:
 
 **Latency is end-to-end**: publish request → receipt at the destination, so it
 includes Kafka at RF=3, routing, dispatch, and the delivery call itself. The
-ranges are across seven runs at 1,000 ev/s (40 s and 60 s publishes — p50 and
-p90 do not depend on the publish window: a 60 s A/B moved p50 by 4 ms). Two
-runs of the *same build* landed 48 ms apart on p50, so treat the spread as
-measurement noise rather than variance in the platform. Per-segment and
-per-stage breakdowns are in
+ranges are across **seven identical runs** — same build, same rate, 40 s of
+publish each — and all seven ended `missing=0 unexpected=0 duplicates=0`.
+Six of the seven sit within **17 ms** of each other on p50; the seventh was
+taken immediately after a restart and paid for cold caches, which is what makes
+the range wider than the floor. Read the spread as measurement noise rather
+than variance in the platform: it is the bar a change has to clear before it
+counts as a change. Per-segment and per-stage breakdowns are in
 [the performance docs](https://mherwig.github.io/eventarium/docs/performance).
 
 | | |
 | --- | --- |
 | Throughput | **1,000 ev/s** sustained — 60,000 events fanning out to 291,851 deliveries |
-| Webhook latency (end-to-end) | p50 **304–352 ms**, p90 **0.44–0.57 s** |
-| SSE latency (end-to-end) | p50 **359–423 ms**, p90 **0.53–0.70 s** |
+| Webhook latency (end-to-end) | p50 **202–246 ms**, p90 **0.29–0.41 s** |
+| SSE latency (end-to-end) | p50 **229–291 ms**, p90 **0.34–0.49 s** |
 | Correctness | `missing=0 unexpected=0 duplicates=0` across all 40 subscriptions |
 
 Resilience, with one fault injected mid-publish on nine replicas
