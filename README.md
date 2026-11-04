@@ -110,6 +110,18 @@ In the repository: [specification](docs/spec.md) ·
 [service contracts](docs/contracts.md) ·
 [deviations and open points](docs/deviations-and-open-points.md).
 
+## A note on commit timestamps
+
+The date on a commit records **when the change was written, not when a human
+was involved in it**. Development in this repository uses automated tooling,
+so the human in the loop may have directed, reviewed or approved a change at a
+time that has nothing to do with the timestamp stamped on it — before it, after
+it, or not at that moment at all.
+
+`git log` is therefore a reliable record of *what changed and in what order*,
+and not a timeline of human activity. Neither a burst of commits nor a long
+gap between two tells you when somebody was actually working on this.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
