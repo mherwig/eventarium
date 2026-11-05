@@ -252,9 +252,12 @@ STAGELOG="$LOG/router.log"
 if [ -f "$STAGELOG" ]; then
   # Only the lines written after the phase-2 start: the file survives a restart
   # and would otherwise average in a previous run.
-  awk -v cut="$(date -d "@$T3" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null)" '
-    /stage timings/ && (cut == "" || index($1, substr(cut,1,19)) > 0) {print}
-  ' "$STAGELOG" | tail -20 > "$OUT/stages.log"
+  # No timestamp filter: start() truncates the log when it launches the router
+  # and phase 0 stopped any previous one, so the file holds this run alone. The
+  # first cut filtered with index($1, substr(cut,1,19)) - a test for equality
+  # with one second rather than "after it" - which matched nothing and reported
+  # "no stage lines" for runs that had logged them.
+  grep "stage timings" "$STAGELOG" > "$OUT/stages.log" || true
   N=$(wc -l < "$OUT/stages.log")
   if [ "$N" -gt 0 ]; then
     echo "  ($N samples, last 5)"
@@ -266,7 +269,8 @@ if [ -f "$STAGELOG" ]; then
       echo "    $(printf '%-14s' $k) $v ms"
     done
   else
-    echo "  no stage lines after phase-2 start - see $STAGELOG"
+    echo "  no stage lines in $STAGELOG - the router may not have committed"
+    echo "  50 batches; they are only logged every 50 (see cmd/router/main.go)"
   fi
 else
   echo "  no router log at $STAGELOG"
