@@ -42,6 +42,7 @@ import (
 	"pubsub/internal/kafkautil"
 	"pubsub/internal/project"
 	"pubsub/internal/registry"
+	"pubsub/internal/schema"
 	"pubsub/internal/store"
 	"pubsub/migrations"
 )
@@ -158,6 +159,11 @@ type eventTypeRequest struct {
 	ContentType    string `json:"content_type"`
 	OrderingKeyDef string `json:"ordering_key_def"`
 	OrderingGroup  string `json:"ordering_group"`
+	// DataSchema is an optional JSON Schema for the data member. Re-posting
+	// the same event type with a different one replaces it: the store's
+	// insert is an upsert, so changing a schema does not mean deleting the
+	// type and its created_at with it.
+	DataSchema json.RawMessage `json:"data_schema"`
 }
 
 func (a *api) handleEventTypeCreate(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +199,28 @@ func (a *api) handleEventTypeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Compile here rather than trusting the publisher to send something
+	// sensible: a schema nobody can compile is rejected at registration, not
+	// discovered at the first publish - and certainly not at every publish,
+	// where it would either block the type or silently validate nothing.
+	// schema.Compile also enforces the size cap, so one enormous document is
+	// refused here rather than carried by every registry reload.
+	dataSchema := req.DataSchema
+	if len(dataSchema) > 0 {
+		if _, err := schema.Compile(dataSchema); err != nil {
+			httpx.Error(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		// Only enforced for JSON event types (publish-api checks IsJSON
+		// before it validates), so a schema on anything else would sit there
+		// looking like a guarantee it never provides.
+		if !registry.IsJSONContentType(contentType) {
+			httpx.Error(w, http.StatusUnprocessableEntity,
+				"data_schema is only meaningful for a JSON content_type")
+			return
+		}
+	}
+
 	et := registry.EventType{
 		Owner:          claims.Owner, // owner from the token only (section 6.7)
 		Name:           name,
@@ -200,6 +228,7 @@ func (a *api) handleEventTypeCreate(w http.ResponseWriter, r *http.Request) {
 		ContentType:    contentType,
 		OrderingKeyDef: orderingKeyDef,
 		OrderingGroup:  strings.TrimSpace(req.OrderingGroup),
+		DataSchema:     dataSchema,
 	}
 	if err := a.store.CreateEventType(r.Context(), et); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "storing event type failed")

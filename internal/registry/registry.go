@@ -12,6 +12,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -49,11 +50,24 @@ type EventType struct {
 	ContentType    string `json:"content_type"`
 	OrderingKeyDef string `json:"ordering_key_def,omitempty"`
 	OrderingGroup  string `json:"ordering_group,omitempty"`
+	// DataSchema is the optional JSON Schema for this type's data member,
+	// registered alongside the type and enforced at publish when
+	// SCHEMA_VALIDATION says so. Nil means "no schema": validation is opt-in
+	// per type, and a type without one is never validated rather than
+	// validated against nothing.
+	DataSchema json.RawMessage `json:"data_schema,omitempty"`
 }
 
 // IsJSON reports whether the declared content type is JSON.
-func (e EventType) IsJSON() bool {
-	ct := e.ContentType
+func (e EventType) IsJSON() bool { return IsJSONContentType(e.ContentType) }
+
+// IsJSONContentType reports whether a content type carries JSON, so that the
+// same rule can be applied to a bare string - the registry-api validating a
+// content type it has not built an EventType from yet. One rule in one place:
+// publish-api decides whether to validate a schema from IsJSON, so a second
+// implementation here could disagree with it and leave a schema silently
+// unenforced.
+func IsJSONContentType(ct string) bool {
 	return ct == "application/json" || len(ct) > 6 && ct[len(ct)-6:] == "+json"
 }
 

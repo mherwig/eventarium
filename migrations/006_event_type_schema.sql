@@ -1,0 +1,22 @@
+-- An optional JSON Schema for an event type's data member, enforced at publish
+-- when SCHEMA_VALIDATION says so (docs/api.md, "Validating against a schema").
+--
+-- jsonb rather than text for two reasons. PostgreSQL rejects a document that
+-- is not JSON at write time, so a malformed schema fails at registration
+-- rather than at the first publish; and TOAST compresses it on disk, which
+-- matters because schemas are the one thing here that can be arbitrarily long.
+-- The normalisation jsonb does - key order, whitespace, duplicate keys
+-- collapsing to the last - is harmless because a schema is compiled
+-- semantically, and it is a benefit for caching: re-registering a
+-- cosmetically edited schema produces the same bytes and skips recompilation.
+--
+-- Nullable with no default. NULL means "this event type has no schema", which
+-- is what makes validation opt-in per type instead of something every type has
+-- to carry. It also keeps the registry load free for the types that do not
+-- have one: a NULL column is never read from TOAST, so the cost of the column
+-- is proportional to how many types carry a schema, not to how many exist.
+--
+-- No compatibility constraint with a previous version - changing a schema
+-- deliberately does not re-validate events already published, and whether a
+-- new schema may break subscribers is a decision this gate does not make.
+ALTER TABLE event_types ADD COLUMN IF NOT EXISTS data_schema jsonb;

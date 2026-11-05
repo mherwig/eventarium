@@ -41,7 +41,8 @@ func (s *Store) Close() { s.Pool.Close() }
 // EventTypes loads every registered event type.
 func (s *Store) EventTypes(ctx context.Context) ([]registry.EventType, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT owner, name, retention_class, content_type, COALESCE(ordering_key_def, ''), COALESCE(ordering_group, '')
+		SELECT owner, name, retention_class, content_type, COALESCE(ordering_key_def, ''),
+		       COALESCE(ordering_group, ''), data_schema
 		FROM event_types`)
 	if err != nil {
 		return nil, err
@@ -50,9 +51,15 @@ func (s *Store) EventTypes(ctx context.Context) ([]registry.EventType, error) {
 	var out []registry.EventType
 	for rows.Next() {
 		var t registry.EventType
-		if err := rows.Scan(&t.Owner, &t.Name, &t.RetentionClass, &t.ContentType, &t.OrderingKeyDef, &t.OrderingGroup); err != nil {
+		// data_schema is NULL for a type that has none, which is the common
+		// case; scanning it costs nothing extra for those, because a NULL
+		// column is never read out of its TOAST detoast.
+		var dataSchema []byte
+		if err := rows.Scan(&t.Owner, &t.Name, &t.RetentionClass, &t.ContentType,
+			&t.OrderingKeyDef, &t.OrderingGroup, &dataSchema); err != nil {
 			return nil, err
 		}
+		t.DataSchema = dataSchema
 		out = append(out, t)
 	}
 	return out, rows.Err()
@@ -111,6 +118,14 @@ func (s *Store) Subscription(ctx context.Context, id string) (*registry.Subscrip
 }
 
 // EventType loads one event type.
+//
+// It deliberately does NOT load data_schema. Every caller here wants to know
+// whether the type exists (and whether it is JSON), not what its schema says,
+// and a schema may be up to a megabyte - reading one to answer an existence
+// question is a cost with no benefit. The consequence is that DataSchema is
+// nil on the value this returns even for a type that has one; the registry
+// snapshot, which is what the router and publish-api actually read, does load
+// it (EventTypes below).
 func (s *Store) EventType(ctx context.Context, owner, name string) (*registry.EventType, error) {
 	var t registry.EventType
 	err := s.Pool.QueryRow(ctx, `
@@ -126,15 +141,28 @@ func (s *Store) EventType(ctx context.Context, owner, name string) (*registry.Ev
 // CreateEventType inserts or replaces an event type.
 func (s *Store) CreateEventType(ctx context.Context, t registry.EventType) error {
 	_, err := s.Pool.Exec(ctx, `
-		INSERT INTO event_types (owner, name, retention_class, content_type, ordering_key_def, ordering_group)
-		VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''))
+		INSERT INTO event_types (owner, name, retention_class, content_type, ordering_key_def, ordering_group, data_schema)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7::jsonb)
 		ON CONFLICT (owner, name) DO UPDATE SET
 			retention_class = EXCLUDED.retention_class,
 			content_type    = EXCLUDED.content_type,
 			ordering_key_def= EXCLUDED.ordering_key_def,
-			ordering_group  = EXCLUDED.ordering_group`,
-		t.Owner, t.Name, t.RetentionClass, t.ContentType, t.OrderingKeyDef, t.OrderingGroup)
+			ordering_group  = EXCLUDED.ordering_group,
+			data_schema     = EXCLUDED.data_schema`,
+		t.Owner, t.Name, t.RetentionClass, t.ContentType, t.OrderingKeyDef, t.OrderingGroup,
+		// NULL rather than an empty string: '' is not valid JSON and the cast
+		// would reject it, while NULL is exactly "no schema".
+		nullableJSON(t.DataSchema))
 	return err
+}
+
+// nullableJSON renders an absent schema as SQL NULL. An empty string would
+// fail the ::jsonb cast, and "no schema" is the meaning we want anyway.
+func nullableJSON(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return []byte(raw)
 }
 
 // DeleteEventType removes an event type.
