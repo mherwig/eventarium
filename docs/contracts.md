@@ -33,6 +33,7 @@ records what is already decided in code and what each service must implement.
 | `HTTP_ADDR` | `:8080` (publish-api, registry-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api); `:8085` (router), `:8086` (dispatcher), `:8087` (status-writer), health only | every service |
 | `WEBHOOK_SIGNING_SECRET` | unset (no signature) | dispatcher |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
+| `PROPAGATE_HEADERS` | unset — nothing is propagated | publish-api. Allow-list of inbound request headers forwarded as CloudEvent extensions |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api (upper bound for `max_events`) |
 | `REGISTRY_POLL` | `1s` (`2s` in publish-api) — the safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `LOG_LEVEL` | `info` | everything |
@@ -143,6 +144,12 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 ### publish-api (port 8080)
 
 - `POST /v1/events` – binary, structured or batch mode (scope `publish`).
+  With `PROPAGATE_HEADERS` set, the named inbound request headers are copied
+  onto every event as CloudEvent extensions before validation, in any of the
+  three modes; an extension the event already carries wins, and an over-long
+  value fails the request rather than publishing without it. Everything
+  downstream already handles extensions, so this is the only stage that
+  changes.
 - Validates the CloudEvent, looks the type up in the registry by
   `(token owner, type)`. Unknown type or invalid JSON for a JSON type: 422.
 - Stamps `event_ref` (uuid), `ingested_at`, `expires_at` from the retention

@@ -103,7 +103,8 @@ func main() {
 			}
 			return cl, cl.Close, nil
 		},
-		maxBytes: maxBytes,
+		maxBytes:         maxBytes,
+		propagateHeaders: parseHeaderAllowList(config.Str("PROPAGATE_HEADERS", "")),
 	}
 	// Deliberately api.closeTxn and not txnClient.Close: a latched client may
 	// have been replaced since, and this closes whichever one is current.
@@ -145,7 +146,8 @@ func main() {
 	// The initial registry load happened above and the Kafka client is
 	// connected; from here on, readiness is only about the dependencies.
 	health.SetReady(true)
-	slog.Info("publish-api listening", "addr", addr, "brokers", brokers, "max_event_bytes", maxBytes)
+	slog.Info("publish-api listening", "addr", addr, "brokers", brokers, "max_event_bytes", maxBytes,
+		"propagate_headers", strings.Join(api.propagateHeaders, ","))
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fatal("serving http", err)
 	}
@@ -221,6 +223,11 @@ type publishAPI struct {
 	// what keeps "stale" and "no client" from ever being true together.
 	txnStale bool
 	maxBytes int64
+	// propagateHeaders is the PROPAGATE_HEADERS allow-list: inbound HTTP
+	// headers copied onto every event as a CloudEvent extension, so they reach
+	// the consumer as Ce-... headers on a webhook and as a field in the SSE
+	// data member. Empty means the feature is off.
+	propagateHeaders []string
 }
 
 // publishResult is one entry of the 201 response (section 6.1).
@@ -261,6 +268,13 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	events, err := cloudevents.Read(r, a.maxBytes)
 	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Before validation, and failing the request as a whole: a header that
+	// cannot be propagated should be visible to the publisher rather than
+	// published without the correlation id it was meant to carry.
+	if err := applyPropagatedHeaders(r.Header, events, a.propagateHeaders); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}

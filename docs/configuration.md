@@ -16,6 +16,7 @@ the defaults suit the local compose stack. On Kubernetes it is one Secret
 | `JWT_SECRET` / `JWT_ISSUER` / `JWT_AUDIENCE` | `dev-secret` / `dev` / `pubsub` | every API service, harness, minttoken |
 | `HTTP_ADDR` | `:8080` (publish-api), `:8081` (status-api), `:8082` (sse-gateway), `:8084` (replay-api), set `:8083` for registry-api; `:8085` (router), `:8086` (dispatcher), `:8087` (status-writer) — health endpoints only | every service |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
+| `PROPAGATE_HEADERS` | unset — nothing is propagated | publish-api. Comma-separated allow-list of inbound request headers copied onto every event as a CloudEvent extension, so they reach the consumer as `ce-*` headers (webhook) and as a field in the SSE `data` member. Off by default; see [api.md](api.md#carrying-a-correlation-header) |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api |
 | `REGISTRY_POLL` | `1s` (`2s` in publish-api) — safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `REGISTRY_STALE_AFTER` | `30s` — how old the registry index may be before `/readyz` fails | publish-api, replay-api, sse-gateway |

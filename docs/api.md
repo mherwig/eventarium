@@ -157,6 +157,51 @@ registry-api call has returned, the type or subscription is usable; no
 settling time. `REGISTRY_POLL` (2 s for publish-api) is only the safety net
 for notifications missed while a listener was down.
 
+### Carrying a correlation header
+
+Context a publisher's own code never puts in the body — a gateway's request
+id, a tracing id an agent injects on the wire — can still travel with the
+event. `PROPAGATE_HEADERS` on publish-api is a comma-separated allow-list of
+plain request headers to copy onto every event as a CloudEvent extension:
+
+```sh
+PROPAGATE_HEADERS=x-business-process-id,traceparent
+```
+
+```sh
+curl -s -X POST localhost:8080/v1/events -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -H 'ce-specversion: 1.0' -H 'ce-id: 43' -H 'ce-source: /orders' \
+  -H 'ce-type: orders.created' \
+  -H 'x-business-process-id: order-4711' \
+  -d '{"order_id":"o-1","total":99.9}'
+```
+
+This works in **every content mode** — the allow-list reads the request's HTTP
+headers, which are there whether the attributes arrive as `ce-*` headers
+(binary) or as fields in the body (structured and batch). One header reaches
+the consumer in three places:
+
+| where | form |
+| --- | --- |
+| event attribute | extension `x-business-process-id` |
+| filter | `attributes["x-business-process-id"] == "order-4711"` |
+| webhook callback | header `ce-x-business-process-id: order-4711` |
+| SSE | `"x-business-process-id":"order-4711"` inside the `data:` member |
+
+Four rules, in the order they tend to surprise people:
+
+- **Off by default.** An unset `PROPAGATE_HEADERS` propagates nothing, so no
+  deployment changes behaviour until it opts in. Nothing is captured
+  ambiently either, which is why there is no deny-list: naming the header *is*
+  the opt-in, so `authorization` cannot leak unless someone puts it there.
+- **An extension already on the event wins.** The header fills in context the
+  publisher never sees; it does not rewrite an attribute set deliberately.
+- **A batch shares one request**, so one header applies to every event in it.
+- **An over-long value rejects the request** with `400` instead of being
+  dropped or truncated. A truncated correlation id looks valid and is not, and
+  a dropped one disappears without the publisher ever finding out.
+
 ## Receive on the webhook
 
 The dispatcher POSTs the event — binary binding by default, with delivery
@@ -170,6 +215,7 @@ ce-id: 42
 ce-source: /orders
 ce-type: orders.created
 ce-region: eu
+ce-x-business-process-id: order-4711   # only when PROPAGATE_HEADERS names it
 pubsub-delivery-id: <event-ref>/<subscription-id>
 pubsub-event-ref: 4f4e...            # the event's identity
 pubsub-attempt: 1
