@@ -1,7 +1,7 @@
 ---
 id: configuration
 title: Configuration
-sidebar_position: 7
+sidebar_position: 8
 ---
 
 Every service reads its configuration from the environment (`internal/config`);
@@ -18,7 +18,7 @@ the defaults suit the local compose stack. On Kubernetes it is one Secret
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
 | `PROPAGATE_HEADERS` | unset — nothing is propagated | publish-api. Comma-separated allow-list of inbound request headers copied onto every event as a CloudEvent extension, so they reach the consumer as `ce-*` headers (webhook) and as a field in the SSE `data` member. Off by default; see [api.md](api.md#carrying-a-correlation-header) |
 | `SCHEMA_VALIDATION` | `off` | publish-api. `off`, `warn` or `enforce`: whether a data member that does not match its event type's registered `data_schema` is ignored, logged and accepted, or rejected with `422`. An unknown value is a startup error rather than a silent fallback to `off`. See [api.md](api.md#validating-against-a-schema) |
-| `METRICS_ENABLED` | `true` | every service. Serves OpenTelemetry metrics in Prometheus format on `GET /metrics`; set `false` for a 404 and no instruments recorded. See [performance.md](performance.md#metrics). |
+| `METRICS_ENABLED` | `true` | every service. Serves OpenTelemetry metrics in Prometheus format on `GET /metrics`; set `false` for a 404 and no instruments recorded. See [monitoring.md](monitoring.md). |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api |
 | `REGISTRY_POLL` | `1s` (`2s` in publish-api) — safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `REGISTRY_STALE_AFTER` | `30s` — how old the registry index may be before `/readyz` fails | publish-api, replay-api, sse-gateway |

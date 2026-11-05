@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: Eventarium
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    # Reloaded rather than imported, so editing the JSON and waiting is enough -
+    # no UI click, no export step, and the dashboard lives with the code that
+    # produces the numbers.
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

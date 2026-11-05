@@ -317,6 +317,9 @@ services:
       # Provisioned rather than clicked in, so a fresh `docker compose up` has a
       # data source instead of a setup step.
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Read-only alongside the provisioning config: the dashboard lives with
+      # the code that produces its numbers rather than in a UI export.
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus

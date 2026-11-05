@@ -1,0 +1,244 @@
+{
+  "uid": "eventarium-overview",
+  "title": "Eventarium",
+  "description": "Platform overview: ingest, delivery, backlog and the runtime numbers behind them. Built from the instruments documented in docs/monitoring.md.",
+  "tags": ["eventarium"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Goroutines",
+      "description": "A leak shows as monotonic growth with no matching traffic.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (job) (go_goroutine_count)", "legendFormat": "{{job}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Resident memory",
+      "description": "RSS per service. A step change without a deploy points at a leak or at the host running out of room.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (job) (process_memory_rss_bytes)", "legendFormat": "{{job}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Events ingested",
+      "description": "rate() gives per second; change the query to increase(...[1d]) for a daily total.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(pubsub_publish_events_total[5m]))", "legendFormat": "events/s" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Published per event type",
+      "description": "One type flat while the others climb is a publisher problem, not a platform one.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (event_type) (rate(pubsub_publish_events_total[5m]))", "legendFormat": "{{event_type}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Publish latency p99",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.99, sum by (le) (rate(pubsub_publish_duration_seconds_bucket[5m])))", "legendFormat": "p99" },
+        { "refId": "B", "expr": "histogram_quantile(0.50, sum by (le) (rate(pubsub_publish_duration_seconds_bucket[5m])))", "legendFormat": "p50" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Publish outcomes",
+      "description": "anything other than ok is a rejected request; the event_type label says whose.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (outcome) (rate(pubsub_publish_requests_total[5m]))", "legendFormat": "{{outcome}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Delivery outcomes",
+      "description": "The last mile. retrying and parked climbing while delivered flat means receivers or the inbox are the problem.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (outcome) (rate(pubsub_delivery_outcome_total[5m]))", "legendFormat": "{{outcome}}" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "End-to-end latency",
+      "description": "publish-api's ingest stamp to the consumer receiving it. Server-side: it excludes the publisher's own network hop.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.99, sum by (le, channel) (rate(pubsub_e2e_duration_seconds_bucket[5m])))", "legendFormat": "p99 {{channel}}" },
+        { "refId": "B", "expr": "histogram_quantile(0.90, sum by (le, channel) (rate(pubsub_e2e_duration_seconds_bucket[5m])))", "legendFormat": "p90 {{channel}}" },
+        { "refId": "C", "expr": "histogram_quantile(0.50, sum by (le, channel) (rate(pubsub_e2e_duration_seconds_bucket[5m])))", "legendFormat": "p50 {{channel}}" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Delivered per second",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (channel) (rate(pubsub_delivery_outcome_total{outcome=\"delivered\"}[5m]))", "legendFormat": "{{channel}}" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Offsets in flight",
+      "description": "Records polled but not yet durable. A value that only grows means commit points are standing still while Kafka keeps the records.",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "pubsub_dispatch_offsets_in_flight", "legendFormat": "in flight" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Queue depth",
+      "description": "Split by rate limit: the rate-limited subscriptions are meant to queue, the unlimited ones are not.",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (class) (pubsub_dispatch_queue_depth)", "legendFormat": "{{class}}" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Inbox backlog",
+      "description": "Rows parked for a subscription and waiting to drain.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(pubsub_dispatch_parked)", "legendFormat": "parked" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Revokes that hit the drain bound",
+      "description": "How often a handover gave up with deliveries outstanding. Rare is a bound working; routine means it is a queue.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(pubsub_rebalance_drain_abandoned_total[5m])", "legendFormat": "abandoned/s" }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Router stage latency p99",
+      "description": "Which part of the serial cycle is slow: kafka_wait means queued records, produce_sync means Kafka, process means the router.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(pubsub_router_stage_duration_seconds_bucket[5m])))", "legendFormat": "{{stage}}" }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "SSE connections",
+      "description": "connections is this node's streams, presence is every node's from the routing view. Sum connections across instances for the cluster total.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(pubsub_sse_connections)", "legendFormat": "connections (this node)" },
+        { "refId": "B", "expr": "sum(pubsub_sse_presence)", "legendFormat": "presence (all nodes)" }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Registry reloads",
+      "description": "A reload that stops succeeding is what /readyz eventually reports as not ready.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (result) (rate(pubsub_registry_reloads_total[5m]))", "legendFormat": "{{result}}" }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Status rows written",
+      "description": "The status store is what the oracle and the status API read, so this falling while deliveries continue means outcomes are being lost.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(pubsub_status_rows_written_total[5m]))", "legendFormat": "rows/s" },
+        { "refId": "B", "expr": "sum(rate(pubsub_status_insert_failures_total[5m]))", "legendFormat": "failures/s" }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Replay jobs",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (status) (rate(pubsub_replay_jobs_total[5m]))", "legendFormat": "job {{status}}" },
+        { "refId": "B", "expr": "sum by (result) (rate(pubsub_replay_events_total[5m]))", "legendFormat": "events {{result}}" }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "status-api latency p99 by route",
+      "description": "The four routes cost very different amounts; one climbing while the others stay flat is a single endpoint regressing.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.99, sum by (le, route) (rate(pubsub_http_server_duration_seconds_bucket[5m])))", "legendFormat": "{{route}}" }
+      ]
+    }
+  ]
+}

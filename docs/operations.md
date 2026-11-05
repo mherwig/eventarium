@@ -1,7 +1,7 @@
 ---
 id: operations
 title: Operating Eventarium
-sidebar_position: 8
+sidebar_position: 9
 ---
 
 ## Deploying to Kubernetes

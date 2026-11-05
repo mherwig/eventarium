@@ -1,7 +1,7 @@
 ---
 id: architecture
 title: Architecture
-sidebar_position: 6
+sidebar_position: 7
 ---
 
 Eight services on three data stores. The split that matters: **Kafka is the
