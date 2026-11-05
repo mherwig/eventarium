@@ -1,0 +1,13 @@
+# Provisioned rather than added by hand so that a fresh `docker compose up`
+# has a working data source: the point of the stack is that everything in it
+# can be brought up from nothing.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    uid: prometheus
+    editable: false

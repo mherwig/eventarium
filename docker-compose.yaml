@@ -281,12 +281,55 @@ services:
       - ./docker/clickhouse-cluster.xml:/config/cluster.xml:ro
       - clickhouse3-data:/var/lib/clickhouse
 
+  # Prometheus and Grafana exist so that the metrics the eight services expose
+  # on /metrics have somewhere to land - an endpoint nobody scrapes is not
+  # observability. They are the only two containers here that are not part of
+  # the platform: the services run on the host under scripts/supervise.sh, which
+  # is why the scrape targets point at the host rather than at each other.
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    ports:
+      # 9090 is the harness's webhook receiver, so Prometheus takes 9091.
+      - "9091:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      # Resolves host.docker.internal to the host the services listen on. Docker
+      # Desktop provides that name; Docker Engine on Linux does not, without this.
+      - "host.docker.internal:host-gateway"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # 30d so that increase()[1d] and [7d] have samples to work with - the
+      # two-hour default answers "today" and nothing longer.
+      - --storage.tsdb.retention.time=30d
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.5
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      # Provisioned rather than clicked in, so a fresh `docker compose up` has a
+      # data source instead of a setup step.
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 # Named rather than anonymous: each holds a base backup taken once from the
 # primary, and that copy is not reproducible from anywhere else if the volume
 # is orphaned.
 volumes:
   pg2-data:
   pg3-data:
+  prometheus-data:
+  grafana-data:
   # Named rather than anonymous: each holds a node's ClickHouse data, and an
   # orphaned anonymous volume is easy to lose without noticing.
   clickhouse1-data:

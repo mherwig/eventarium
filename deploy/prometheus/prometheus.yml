@@ -1,0 +1,30 @@
+# Scrapes the eight services, which run on the host rather than in Compose -
+# scripts/stack.sh starts them directly - so the targets are the host as seen
+# from the container. host-gateway is what makes that name resolve on Linux;
+# without it Docker only provides host.docker.internal on Docker Desktop.
+#
+# One job per service rather than one job with a shared label: the job name is
+# what a Grafana query groups by, and "which service is slow" is the first
+# question anyone asks. service.name also arrives on target_info, so either
+# works - job is the one that reads well in an expression.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: publish-api
+    static_configs: [{targets: ["host.docker.internal:8080"]}]
+  - job_name: registry-api
+    static_configs: [{targets: ["host.docker.internal:8083"]}]
+  - job_name: status-api
+    static_configs: [{targets: ["host.docker.internal:8081"]}]
+  - job_name: replay-api
+    static_configs: [{targets: ["host.docker.internal:8084"]}]
+  - job_name: status-writer
+    static_configs: [{targets: ["host.docker.internal:8087"]}]
+  - job_name: router
+    static_configs: [{targets: ["host.docker.internal:8085"]}]
+  - job_name: dispatcher
+    static_configs: [{targets: ["host.docker.internal:8086"]}]
+  - job_name: sse-gateway
+    static_configs: [{targets: ["host.docker.internal:8082"]}]
