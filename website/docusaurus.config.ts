@@ -128,6 +128,7 @@ const config: Config = {
             {label: 'HTTP API walkthrough', to: '/docs/api'},
             {label: 'Reliability', to: '/docs/reliability'},
             {label: 'Performance', to: '/docs/performance'},
+            {label: 'Monitoring', to: '/docs/monitoring'},
             {label: 'Operating', to: '/docs/operations'},
           ],
         },

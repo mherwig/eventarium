@@ -13,7 +13,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Guides',
       collapsed: false,
-      items: ['api', 'reliability', 'performance', 'operations'],
+      items: ['api', 'reliability', 'performance', 'monitoring', 'operations'],
     },
     {
       type: 'category',
