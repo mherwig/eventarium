@@ -345,6 +345,49 @@ func (e Event) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// UnmarshalJSON decodes a structured-mode document, keeping every attribute
+// the platform does not know about as an extension.
+//
+// Extensions are tagged json:"-" because they are not fields of this struct -
+// they are whatever the publisher sent, and the struct has no fixed place to
+// put them. That tag also means the default decoder drops them, which is how
+// a delivery lost them on the way to the callback: SetHeaders has always
+// written e.Extensions onto the request, but Message.Event decoded with
+// encoding/json, so by the time it ran the map was empty and the Ce- header
+// never appeared. The comment in internal/delivery referring to this method
+// was, until it existed, describing a method that did not exist.
+//
+// It deliberately does not Validate: this is the decode path, and rejecting an
+// event here would turn a record that previously decoded into a failed
+// delivery. Parsing on the way in already validates.
+func (e *Event) UnmarshalJSON(data []byte) error {
+	// A locally declared type inherits no methods, so this cannot recurse
+	// back into UnmarshalJSON or MarshalJSON.
+	type decode Event
+	var d decode
+	if err := json.Unmarshal(data, &d); err != nil {
+		return err
+	}
+	*e = Event(d)
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	for k, v := range m {
+		if isKnown(k) {
+			continue
+		}
+		// Only allocated when there is something to keep, so an event without
+		// extensions decodes exactly as it did before this method existed.
+		if e.Extensions == nil {
+			e.Extensions = make(map[string]json.RawMessage, len(m))
+		}
+		e.Extensions[k] = append(json.RawMessage(nil), v...)
+	}
+	return nil
+}
+
 // SetHeaders writes the event into HTTP headers in binary mode.
 func (e *Event) SetHeaders(h http.Header) {
 	h.Set("Ce-Specversion", e.SpecVersion)
