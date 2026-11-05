@@ -375,6 +375,7 @@ func (r *Registry) observeReload(err error, took time.Duration) {
 
 	d, derr := r.metrics.Meter().Float64Histogram("pubsub.registry.reload.duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("Time to reload the registry index."))
 	if derr != nil {
 		return

@@ -90,6 +90,45 @@ func New(serviceName string) (*Metrics, error) {
 	}, nil
 }
 
+// DurationBuckets are the histogram boundaries for every duration instrument,
+// in seconds.
+//
+// Explicit because the default is wrong for this unit. OpenTelemetry's
+// fallback boundaries are [0, 5, 10, 25, 50, ...] - numbers chosen for an
+// instrument whose values are milliseconds. Recording seconds into them puts
+// every realistic observation in the first bucket (le=5), and PromQL's
+// histogram_quantile then linearly interpolates inside [0, 5] and answers
+// q x 5s for any input at all. Measured on this platform: an e2e histogram
+// whose true mean (sum/count) was 332 ms reported p50 = 2,569 ms and
+// p99 = 30,910 ms. The mean is computed from _sum and _count and was never
+// affected, which is exactly why the bug survived - the numbers that agreed
+// with the docs were the ones that were right.
+//
+// The range covers what this platform actually measures: an HTTP delivery is
+// 1-2 ms, a publish handler 1.7-41 ms, a router stage 3-95 ms, end-to-end
+// 200-500 ms, a rate-limited delivery up to 45 s, a full drain 177-465 s.
+// Resolution is densest below one second because that is where a regression
+// would show up, and coarse above it because those tails are by design.
+//
+// Cardinality note: buckets multiply a histogram's series count, and the
+// delivery instruments carry owner + subscription_id. At 16 boundaries that
+// is 16 series per subscription where the OTel default was 15 - deliberately
+// within one of the old count. Do not add boundaries without checking
+// docs/monitoring.md's series estimate.
+var DurationBuckets = []float64{
+	0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
+	0.1, 0.2, 0.5, 1, 2, 5,
+	10, 30, 60, 600,
+}
+
+// WithDurationBuckets is metric.WithExplicitBucketBoundaries(DurationBuckets),
+// provided so call sites can name the intent and so there is exactly one place
+// to change the list. Every duration histogram in the platform passes through
+// it.
+func WithDurationBuckets() metric.HistogramOption {
+	return metric.WithExplicitBucketBoundaries(DurationBuckets...)
+}
+
 // Meter is the meter instruments are created from. When metrics are disabled
 // it is a no-op meter, so recording is free and nothing has to be guarded at
 // the call site.

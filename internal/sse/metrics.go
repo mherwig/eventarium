@@ -40,6 +40,7 @@ func newMetrics(meter metric.Meter) (*metrics, error) {
 	}
 	e2e, err := meter.Float64Histogram("pubsub.e2e.duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("Publish-api's ingest stamp to the consumer receiving the delivery."))
 	if err != nil {
 		return nil, err

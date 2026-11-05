@@ -59,12 +59,14 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	}
 	attempt, err := meter.Float64Histogram("pubsub.delivery.attempt.duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("Duration of one delivery attempt, per subscription."))
 	if err != nil {
 		return nil, err
 	}
 	e2e, err := meter.Float64Histogram("pubsub.e2e.duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("Publish-api's ingest stamp to the consumer receiving the delivery."))
 	if err != nil {
 		return nil, err
@@ -91,6 +93,7 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	}
 	revokeDrain, err := meter.Float64Histogram("pubsub.rebalance.drain.duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("How long a revoke waited for the departing partitions' deliveries before handing them over."))
 	if err != nil {
 		return nil, err

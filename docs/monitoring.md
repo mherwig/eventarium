@@ -94,6 +94,12 @@ Two details worth knowing before building a panel:
   not the path, so one subscription id cannot become one series. Health and
   metrics endpoints are excluded for the same reason: a probe and a scrape are
   not traffic.
+- **`histogram_quantile` answers NaN if the window crosses a restart that
+  changed the bucket boundaries.** The buckets live in code
+  (`otelmetric.DurationBuckets`), so changing them gives Prometheus two
+  incompatible layouts under the same `le` labels, and `sum by (le)` merges
+  them into a non-monotonic series. Narrow the range until the window starts
+  after the restart. It looks exactly like broken metrics and is not.
 
 ## Dashboard
 

@@ -7,6 +7,8 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+
+	"pubsub/internal/otelmetric"
 )
 
 // Metrics returns middleware that records request duration by route and
@@ -33,6 +35,7 @@ func Metrics(mux *http.ServeMux, m metric.Meter) (func(http.Handler) http.Handle
 	}
 	dur, err := m.Float64Histogram("pubsub.http.server.duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("HTTP request duration by route and status code."))
 	if err != nil {
 		return nil, err

@@ -48,6 +48,7 @@ func newStatusMetrics(meter metric.Meter) (*statusMetrics, error) {
 	}
 	writeDuration, err := meter.Float64Histogram("pubsub.status.write_duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("Duration of one batch insert into ClickHouse."))
 	if err != nil {
 		return nil, err

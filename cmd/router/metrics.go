@@ -29,6 +29,7 @@ type routerMetrics struct {
 func newRouterMetrics(meter metric.Meter) (*routerMetrics, error) {
 	stage, err := meter.Float64Histogram("pubsub.router.stage.duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("One stage of the router's cycle, by stage name."))
 	if err != nil {
 		return nil, err

@@ -42,6 +42,7 @@ func newPublishMetrics(meter metric.Meter) (*publishMetrics, error) {
 	}
 	duration, err := meter.Float64Histogram("pubsub.publish.duration",
 		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
 		metric.WithDescription("Time to accept and write a publish request."))
 	if err != nil {
 		return nil, err
