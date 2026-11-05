@@ -193,10 +193,18 @@ func (d *Dispatcher) setupInstruments(m *otelmetric.Metrics) error {
 		return err
 	}
 	d.instruments = instr
+	// Every instrument observeGauges writes to must appear here, or OTel
+	// silently never produces it: the callback's instruments are the set it is
+	// allowed to fill. Missing one costs nothing visible - no error, no log -
+	// just a series that never exists. parked was missing, so the inbox
+	// backlog gauge had never reported since it was written, and the
+	// dashboard's panel for it read as "no backlog" rather than "never
+	// reported" - which is exactly the misreading the gauge's own comment
+	// says reporting nothing is meant to avoid.
 	_, err = m.Meter().RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		d.observeGauges(o)
 		return nil
-	}, instr.queueDepth, instr.offsetsInFlight)
+	}, instr.queueDepth, instr.offsetsInFlight, instr.parked)
 	return err
 }
 

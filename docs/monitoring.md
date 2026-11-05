@@ -94,6 +94,11 @@ Two details worth knowing before building a panel:
   not the path, so one subscription id cannot become one series. Health and
   metrics endpoints are excluded for the same reason: a probe and a scrape are
   not traffic.
+- **A gauge whose callback forgot to register it reports nothing at all.**
+  `RegisterCallback(fn, instruments...)` allows `fn` to fill *only* the
+  instruments listed — an unlisted one produces no series and no error, and
+  reads as "nothing there". The inbox-backlog gauge was in this state; it now
+  sits on the same list as the other two.
 - **`histogram_quantile` answers NaN if the window crosses a restart that
   changed the bucket boundaries.** The buckets live in code
   (`otelmetric.DurationBuckets`), so changing them gives Prometheus two
