@@ -547,11 +547,20 @@ func (d *Dispatcher) settle(partition int32, offset int64) {
 // the offset stays in flight until parkRetryLoop has the row, which is what
 // makes a crash replay the record instead of losing it.
 func (d *Dispatcher) parkOrRetry(ctx context.Context, s *subState, it *item, reason string) bool {
+	// Timed from before the send: a channel with room returns immediately, so
+	// anything material here means the queue was full and the poll goroutine
+	// waited for the parker to drain it. That is the backpressure the bound
+	// exists for - and, because this goroutine is shared by every subscription
+	// on the instance, the stall the inline-park path was removed for causing.
+	start := time.Now()
 	select {
 	case d.parkRetry <- &parkRetry{s: s, it: it, reason: reason}:
 	case <-ctx.Done():
 		// Shutdown: nobody will park it in this process. The offset stays
 		// uncommitted and the record is replayed after the restart.
+	}
+	if d.instruments != nil {
+		d.instruments.parkHandoff.Record(context.Background(), time.Since(start).Seconds())
 	}
 	return false
 }

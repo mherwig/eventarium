@@ -46,6 +46,23 @@ type instruments struct {
 	// that is always hit is not a bound, it is a queue.
 	revokeDrain     metric.Float64Histogram
 	revokeAbandoned metric.Int64Counter
+	// parkQueueDepth and parkHandoff exist to answer one question: does a full
+	// park queue stall the shared poll goroutine?
+	//
+	// parkOrRetry hands a park to a bounded channel, and a send on a full
+	// channel blocks the caller - which is the poll goroutine, the one that
+	// every subscription on this instance shares. That is deliberate
+	// backpressure when PostgreSQL is genuinely unreachable, and it is the
+	// same blast radius the inline-park path had when it was removed for
+	// stalling exactly that goroutine. The difference is only what fills up:
+	// one slow INSERT, or 4,096 pending + 1,024 queued parks.
+	//
+	// Depth says how close that is; handoff says how long the poll loop
+	// actually waited, which is the quantity that would have to explain a
+	// tail measured in seconds. A p50 at zero with a fat upper tail is the
+	// signature of intermittent stalls rather than steady slowness.
+	parkQueueDepth metric.Int64ObservableGauge
+	parkHandoff    metric.Float64Histogram
 }
 
 // newInstruments builds them all. An error here is a programming error in the
@@ -103,6 +120,18 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
+	parkQueueDepth, err := meter.Int64ObservableGauge("pubsub.dispatch.park_queue_depth",
+		metric.WithDescription("Parks waiting for the background parker: buffered in the hand-off channel. park_retry_queue (1024) is the blocking bound - a value near it means the poll goroutine is about to wait."))
+	if err != nil {
+		return nil, err
+	}
+	parkHandoff, err := meter.Float64Histogram("pubsub.dispatch.park_handoff.duration",
+		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
+		metric.WithDescription("Time spent handing a park to the background parker. A non-trivial tail means a full channel stalled the shared poll goroutine, which every subscription on this instance depends on."))
+	if err != nil {
+		return nil, err
+	}
 	return &instruments{
 		outcome:         outcome,
 		attempt:         attempt,
@@ -113,6 +142,8 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 		parked:          parked,
 		revokeDrain:     revokeDrain,
 		revokeAbandoned: revokeAbandoned,
+		parkQueueDepth:  parkQueueDepth,
+		parkHandoff:     parkHandoff,
 	}, nil
 }
 
@@ -196,15 +227,14 @@ func (d *Dispatcher) setupInstruments(m *otelmetric.Metrics) error {
 	// Every instrument observeGauges writes to must appear here, or OTel
 	// silently never produces it: the callback's instruments are the set it is
 	// allowed to fill. Missing one costs nothing visible - no error, no log -
-	// just a series that never exists. parked was missing, so the inbox
-	// backlog gauge had never reported since it was written, and the
-	// dashboard's panel for it read as "no backlog" rather than "never
-	// reported" - which is exactly the misreading the gauge's own comment
-	// says reporting nothing is meant to avoid.
+	// just a series that never exists. Two were missing: parked, which meant
+	// the dashboard's inbox-backlog panel had been empty since the day it was
+	// written and read as "no backlog" rather than "never reported", and the
+	// park-queue depth added alongside the hand-off histogram.
 	_, err = m.Meter().RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		d.observeGauges(o)
 		return nil
-	}, instr.queueDepth, instr.offsetsInFlight, instr.parked)
+	}, instr.queueDepth, instr.offsetsInFlight, instr.parked, instr.parkQueueDepth)
 	return err
 }
 
@@ -248,6 +278,10 @@ func (d *Dispatcher) observeGauges(o metric.Observer) {
 	// Outside the mutex: Pending takes the gate's own lock, and there is no
 	// reason to hold two while reading a counter.
 	o.ObserveInt64(d.instruments.offsetsInFlight, int64(d.gate.Pending()))
+	// len() on a channel needs no lock and is safe concurrently. This is the
+	// number that decides whether the blocking send in parkOrRetry has been
+	// doing its job as backpressure or getting in the way.
+	o.ObserveInt64(d.instruments.parkQueueDepth, int64(len(d.parkRetry)))
 }
 
 // record counts an outcome once, in the heartbeat's counter and in the metric.

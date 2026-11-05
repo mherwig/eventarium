@@ -67,6 +67,7 @@ from the duration histogram first — the counters still say *who* is failing.
 | Router processed per second? | `pubsub_router_records_total{direction}` → `rate()` |
 | Is the router slow, and where? | `pubsub_router_stage_duration_seconds{stage}` — `kafka_wait`, `process`, `produce_sync`, `produce_end`, `poll`, `cycle` |
 | Is there a backlog? | `pubsub_dispatch_queue_depth{class}` (split by rate limit), `pubsub_dispatch_offsets_in_flight`, `pubsub_dispatch_parked{subscription_id}` |
+| Is parking about to stall the whole instance? | `pubsub_dispatch_park_queue_depth` (bound is 1024), `pubsub_dispatch_park_handoff_duration_seconds` |
 | Is a handover stalling? | `pubsub_rebalance_drain_duration_seconds`, `pubsub_rebalance_drain_abandoned_total` |
 | Open SSE connections | `pubsub_sse_connections` (this node — sum across instances), `pubsub_sse_presence` (every node) |
 | Is the registry going stale? | `pubsub_registry_reloads_total{result}`, `pubsub_registry_reload_duration_seconds` |
