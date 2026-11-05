@@ -98,8 +98,8 @@ are excluded from the latency columns — they take minutes by design.
 | --- | --- | --- | --- | --- |
 | `unordered` | webhook | **202–246 ms** | 0.29–0.41 s | 0.38–0.75 s |
 | `unordered` | SSE | **229–291 ms** | 0.34–0.49 s | 0.43–0.88 s |
-| `key_ordered` | webhook | **516.8 ms** | 5.45 s | 10.96 s |
-| `key_ordered` | SSE | **542.0 ms** | 0.92 s | 1.21 s |
+| `key_ordered` | webhook | **225 ms** | 0.37 s | 0.60 s |
+| `key_ordered` | SSE | **263 ms** | 0.43 s | 0.68 s |
 
 The `unordered` rows are ranges across **seven identical runs of the current
 build**, 40 s of publish each, rather than single numbers: the host does not
@@ -118,13 +118,19 @@ carry (328–383 ms and 8.3–10.0 s) came from two 60 s publishes taken before
 the dispatcher stopped parking on its poll loop; at the same 60 s duration
 today that tail reads 1.38 s, so most of what those numbers recorded is gone.
 
-The `key_ordered` rows are a single earlier run and have **not** been re-taken
-on this build: read them as the order of magnitude strict mode costs, not as
-cells comparable with the rows above. That cost is worth seeing — `key_ordered`
-webhook sits at p90 **5.45 s** while its SSE half sits at **0.92 s** — the
-webhook side queues far deeper than the SSE side under per-key ordering at the
-same offered load, which is a further reason not to mix the strict mode into a
-throughput measurement.
+The `key_ordered` rows are one run at the same rate and the same
+`max_in_flight=8` as the `unordered` rows above. Strict mode now costs
+**nothing measurable** against it — webhook p50 225 ms against 202–246 ms,
+p90 372 ms against 294–407 ms — where this row used to read p90 **5.45 s**,
+an order of magnitude worse, with its SSE half at 0.92 s. That figure was not
+reproduced on this build.
+
+Before reading anything into a mode-to-mode difference, read
+[Choosing the delivery modes](#choosing-the-delivery-modes): the default seed
+cycles `ordered,key_ordered,unordered`, and `ordered` pins `max_in_flight` to
+1, so a run that leaves it in the mix reports that subscription's ceiling
+rather than the platform's — and a row labelled `key_ordered` taken from such
+a run describes `ordered` instead.
 
 ### Where those milliseconds go
 
@@ -428,8 +434,10 @@ Beyond the load and chaos runs, the following are covered by scenarios that
 end `missing=0 unexpected=0 duplicates=0` client-side:
 
 - All three delivery modes (unordered, per-shard ordered, key-ordered) with
-  attribute filters, data filters and projections, at 50 ev/s (p50 22 ms /
-  p99 28 ms) and at 1,000 ev/s.
+  attribute filters, data filters and projections, at 50 ev/s and at
+  1,000 ev/s. Latency for the first two of those modes is in the table above;
+  the 50 ev/s run is asserted for correctness only, since its figures have not
+  been re-taken.
 - Dispatcher fault injection: circuit breaker with receiver outage, hard kill
   and restart, restart with a parked backlog.
 - SSE gateway restart, graceful SIGTERM and hard SIGKILL with a live client.
