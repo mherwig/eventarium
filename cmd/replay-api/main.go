@@ -86,7 +86,12 @@ func main() {
 	// The subscription registry is the existence and ownership oracle for the
 	// API and the source of the *current* projection for the worker (spike
 	// deviation of section 6.1, refreshed from PostgreSQL).
-	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn))
+	metrics, err := otelmetric.New("replay-api")
+	if err != nil {
+		slog.Error("replay-api: metrics", "err", err)
+		os.Exit(1)
+	}
+	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn), registry.WithMetrics(metrics))
 	for {
 		if err := reg.Reload(ctx); err == nil {
 			break
@@ -135,11 +140,6 @@ func main() {
 			return reg.Check(config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter))
 		},
 	)
-	metrics, err := otelmetric.New("replay-api")
-	if err != nil {
-		slog.Error("replay-api: metrics", "err", err)
-		os.Exit(1)
-	}
 	defer metrics.Shutdown(context.Background())
 	health.SetMetrics(metrics.Handler())
 	mux := http.NewServeMux()

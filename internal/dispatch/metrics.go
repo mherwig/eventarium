@@ -35,6 +35,17 @@ type instruments struct {
 	// meaningful at the moment of a log line would be useless to graph.
 	queueDepth      metric.Int64ObservableGauge
 	offsetsInFlight metric.Int64ObservableGauge
+	// parked is the inbox backlog per subscription: rows parked because the
+	// subscription was failing or over its rate limit, waiting to drain. The
+	// number that answers "is my subscription backed up?" without a psql.
+	parked metric.Int64ObservableGauge
+	// revokeDrain and revokeAbandoned watch the handover: how long a revoke
+	// held the group, and how often it gave up with deliveries still
+	// outstanding. The bound exists to keep one slow delivery from stalling a
+	// rebalance, so both halves of that trade have to be visible - a bound
+	// that is always hit is not a bound, it is a queue.
+	revokeDrain     metric.Float64Histogram
+	revokeAbandoned metric.Int64Counter
 }
 
 // newInstruments builds them all. An error here is a programming error in the
@@ -73,6 +84,22 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
+	parked, err := meter.Int64ObservableGauge("pubsub.dispatch.parked",
+		metric.WithDescription("Rows in the PostgreSQL inbox for a subscription, waiting to drain."))
+	if err != nil {
+		return nil, err
+	}
+	revokeDrain, err := meter.Float64Histogram("pubsub.rebalance.drain.duration",
+		metric.WithUnit("s"),
+		metric.WithDescription("How long a revoke waited for the departing partitions' deliveries before handing them over."))
+	if err != nil {
+		return nil, err
+	}
+	revokeAbandoned, err := meter.Int64Counter("pubsub.rebalance.drain.abandoned",
+		metric.WithDescription("Revokes that reached the bound with deliveries still outstanding; those may be delivered again by the new owner."))
+	if err != nil {
+		return nil, err
+	}
 	return &instruments{
 		outcome:         outcome,
 		attempt:         attempt,
@@ -80,6 +107,9 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 		bytes:           bytes,
 		queueDepth:      queueDepth,
 		offsetsInFlight: offsetsInFlight,
+		parked:          parked,
+		revokeDrain:     revokeDrain,
+		revokeAbandoned: revokeAbandoned,
 	}, nil
 }
 
@@ -176,10 +206,18 @@ func (d *Dispatcher) observeGauges(o metric.Observer) {
 	}
 	var limited, unlimited int
 	d.mu.Lock()
-	for _, s := range d.subs {
+	for id, s := range d.subs {
 		sd := 0
 		for _, q := range s.qs {
 			sd += len(q)
+		}
+		// Not Ready means the count has never been seeded from PostgreSQL
+		// since this process started: reporting nothing is more honest than
+		// reporting zero, which would read as "no backlog" when it is really
+		// "unknown".
+		if s.parked.Ready() {
+			o.ObserveInt64(d.instruments.parked, s.parked.Total(),
+				metric.WithAttributes(attribute.String("subscription_id", id)))
 		}
 		// Split by rate limit, as the heartbeat does: the rate-limited
 		// subscriptions are meant to queue, so a total that cannot tell them
@@ -210,4 +248,19 @@ func (d *Dispatcher) observeGauges(o metric.Observer) {
 func (d *Dispatcher) record(msg *delivery.Message, counter *atomic.Uint64, outcome string) {
 	counter.Add(1)
 	d.observeOutcome(msg, outcome)
+}
+
+// observeRevoke records the handover's cost. Both numbers matter: the
+// duration shows how long the group was held up, and the abandoned count
+// shows how often the bound won - which is the trade the bound exists to
+// make, and the thing worth alerting on if it ever becomes routine.
+func (d *Dispatcher) observeRevoke(took time.Duration, left int) {
+	if d.instruments == nil {
+		return
+	}
+	ctx := context.Background()
+	d.instruments.revokeDrain.Record(ctx, took.Seconds())
+	if left > 0 {
+		d.instruments.revokeAbandoned.Add(ctx, 1)
+	}
 }

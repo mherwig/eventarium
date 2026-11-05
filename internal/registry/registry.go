@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"log/slog"
 	"sync"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"pubsub/internal/filter"
+	"pubsub/internal/otelmetric"
 )
 
 // NotifyChannel is the PostgreSQL notification channel the trigger of
@@ -120,6 +123,9 @@ type Registry struct {
 
 	reloadMu sync.Mutex // serialises the ticker and the listener's Reload
 
+	// metrics is nil unless WithMetrics was given; observeReload checks.
+	metrics *otelmetric.Metrics
+
 	mu      sync.RWMutex
 	types   map[string]EventType // owner + "\x00" + name
 	byType  map[string][]*Entry  // owner + "\x00" + event type
@@ -153,6 +159,12 @@ type Option func(*Registry)
 // The DSN is used verbatim; an empty one disables the listener.
 func WithNotify(dsn string) Option {
 	return func(r *Registry) { r.notifyDSN = dsn }
+}
+
+// WithMetrics supplies the meter the reload instruments are built from. Nil
+// means none, which is what every test passes.
+func WithMetrics(m *otelmetric.Metrics) Option {
+	return func(r *Registry) { r.metrics = m }
 }
 
 // New builds a registry over a source, refreshed at the given interval.
@@ -278,7 +290,13 @@ func (r *Registry) listenOnce(ctx context.Context) error {
 }
 
 // Reload pulls the control data and swaps the index.
-func (r *Registry) Reload(ctx context.Context) error {
+func (r *Registry) Reload(ctx context.Context) (err error) {
+	// Recorded on the way out rather than at each return: this function has
+	// two exits - the two queries it makes - and a metric that only counted
+	// one of them would report a healthy registry while the other failed.
+	start := time.Now()
+	defer func() { r.observeReload(err, time.Since(start)) }()
+
 	// The ticker and the notification listener can reload at the same time.
 	// Both build their maps before touching r.mu, so neither can corrupt the
 	// index, but serialising them stops a slow reload from overwriting a
@@ -335,6 +353,35 @@ func (r *Registry) Reload(ctx context.Context) error {
 
 // failed records a reload that did not reach the index and returns the error
 // unchanged, so callers keep reporting it.
+// observeReload records one reload. A reload happens every poll interval and
+// on every NOTIFY, so the interesting numbers are the failures and the
+// duration: a registry that stops refreshing is what /readyz is there to
+// catch, and a reload that takes seconds is why.
+func (r *Registry) observeReload(err error, took time.Duration) {
+	if r.metrics == nil {
+		return
+	}
+	m, merr := r.metrics.Meter().Int64Counter("pubsub.registry.reloads",
+		metric.WithDescription("Registry reloads by result."))
+	if merr != nil {
+		return
+	}
+	ctx := context.Background()
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	m.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+
+	d, derr := r.metrics.Meter().Float64Histogram("pubsub.registry.reload.duration",
+		metric.WithUnit("s"),
+		metric.WithDescription("Time to reload the registry index."))
+	if derr != nil {
+		return
+	}
+	d.Record(ctx, took.Seconds())
+}
+
 func (r *Registry) failed(err error) error {
 	r.mu.Lock()
 	r.failures++

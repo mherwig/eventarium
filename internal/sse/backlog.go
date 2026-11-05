@@ -219,6 +219,7 @@ fetch:
 				g.log.Error("sse backlog: rendering event", "err", err, "connection", conn.id)
 				continue
 			}
+			g.observeSent(o.msg)
 			if err := write(frame); err != nil {
 				g.log.Info("sse backlog: write failed", "connection", conn.id,
 					"subscription", subID, "err", err, "sent", len(written))

@@ -53,6 +53,7 @@ import (
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
 	"pubsub/internal/offsetgate"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/registry"
 	"pubsub/internal/status"
 	"pubsub/internal/store"
@@ -76,6 +77,9 @@ type Options struct {
 	// /readyz fails (REGISTRY_STALE_AFTER, default registry.DefaultStaleAfter).
 	RegistryStaleAfter time.Duration
 	Drainer            bool // run the inbox drainer on this node (SSE_DRAINER)
+	// Metrics supplies the meter the instruments are built from. Nil means
+	// none, which is what every test passes.
+	Metrics *otelmetric.Metrics
 }
 
 // Gateway is the running service: HTTP server, presence view, delivery stage,
@@ -133,6 +137,7 @@ type Gateway struct {
 	// delivery stage that works off a frozen snapshot resolves channels it
 	// should skip and skips ones it should take.
 	health *httpx.Health
+	instr  *metrics // nil when no meter was supplied
 
 	shutdown chan struct{}
 }
@@ -187,7 +192,7 @@ func New(opts Options) (*Gateway, error) {
 	}
 	// The NOTIFY listener (migration 003) is what makes a subscription created
 	// just now reachable without waiting out the poll interval.
-	g.reg = registry.New(g.store, opts.RegistryPoll, registry.WithNotify(opts.PGDSN))
+	g.reg = registry.New(g.store, opts.RegistryPoll, registry.WithNotify(opts.PGDSN), registry.WithMetrics(opts.Metrics))
 	// Load before anything consumes (as publish-api, router and replay-api
 	// do): the delivery stage decides ownership through the registry, and an
 	// empty index resolves an unknown subscription to its stamped channel -
@@ -259,6 +264,10 @@ func New(opts Options) (*Gateway, error) {
 		func(ctx context.Context) error { return g.store.Pool.Ping(ctx) },
 		func(context.Context) error { return g.reg.Check(g.opts.RegistryStaleAfter) },
 	)
+	if err := g.setupMetrics(g.opts.Metrics); err != nil {
+		cleanup()
+		return nil, err
+	}
 	return g, nil
 }
 
@@ -611,6 +620,7 @@ func (g *Gateway) handleSSE(w http.ResponseWriter, r *http.Request) {
 			// Only once the bytes are on the wire does the connection remember
 			// the delivery, so an ack can be answered honestly.
 			conn.appendSent(out)
+			g.observeSent(out.msg)
 		}
 	}
 }

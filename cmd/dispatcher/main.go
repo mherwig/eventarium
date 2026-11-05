@@ -61,7 +61,7 @@ func main() {
 	// Spike deviation per docs/contracts.md: the registry reads PostgreSQL, and a
 	// NOTIFY from migration 003 refreshes the policy the moment it changes.
 	// REGISTRY_POLL (one second by default) is the safety net underneath.
-	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn))
+	reg := registry.New(st, config.Duration("REGISTRY_POLL", time.Second), registry.WithNotify(dsn), registry.WithMetrics(metrics))
 	// Load before consuming, like publish-api, router and replay-api do: the
 	// first gate a delivery meets is its channel, and an index that is not
 	// loaded yet would resolve every unknown subscription to its stamped

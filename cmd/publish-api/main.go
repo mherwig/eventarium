@@ -69,7 +69,11 @@ func main() {
 	// NOTIFY trigger (migration 003) refreshes the index within milliseconds
 	// of an event type or subscription changing; REGISTRY_POLL is the safety
 	// net for notifications missed while the listener was down (section 6.1).
-	reg := registry.New(st, config.Duration("REGISTRY_POLL", 2*time.Second), registry.WithNotify(dsn))
+	metrics, err := otelmetric.New("publish-api")
+	if err != nil {
+		fatal("metrics", err)
+	}
+	reg := registry.New(st, config.Duration("REGISTRY_POLL", 2*time.Second), registry.WithNotify(dsn), registry.WithMetrics(metrics))
 	if err := reg.Reload(ctx); err != nil {
 		slog.Warn("initial registry load failed", "err", err)
 	}
@@ -123,10 +127,6 @@ func main() {
 	// /healthz stays answering while they are down - restarting the process
 	// would not fix a database - but /readyz then fails, so a rolling update
 	// does not add a replica that cannot serve (section: docs/contracts.md).
-	metrics, err := otelmetric.New("publish-api")
-	if err != nil {
-		fatal("metrics", err)
-	}
 	// Deferred rather than closed on the shutdown path below: a failure to
 	// bind the listener still leaves a process that should flush its metrics.
 	defer func() {

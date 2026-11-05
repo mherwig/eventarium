@@ -283,6 +283,7 @@ func (d *Dispatcher) onRevoked(ctx context.Context, cl *kgo.Client, revoked map[
 	// Stop tracking before committing: from here a settle for these partitions
 	// is a no-op, which is what stops this member from committing an offset
 	// somebody else now owns.
+	d.observeRevoke(drainTook, left)
 	d.gate.Drop(revoked)
 
 	// This replaces franz-go's default revoke, which with AutoCommitMarks is a

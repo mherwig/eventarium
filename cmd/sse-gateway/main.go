@@ -44,6 +44,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	metrics, err := otelmetric.New("sse-gateway")
+	if err != nil {
+		slog.Error("sse-gateway: metrics", "err", err)
+		os.Exit(1)
+	}
+	defer metrics.Shutdown(context.Background())
 	g, err := sse.New(sse.Options{
 		HTTPAddr:           config.Str("HTTP_ADDR", ":8082"),
 		NodeID:             config.Str("NODE_ID", hostname()),
@@ -57,17 +63,12 @@ func main() {
 		RegistryPoll:       config.Duration("REGISTRY_POLL", time.Second),
 		RegistryStaleAfter: config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter),
 		Drainer:            config.Bool("SSE_DRAINER", true),
+		Metrics:            metrics,
 	})
 	if err != nil {
 		slog.Error("starting", "err", err)
 		os.Exit(1)
 	}
-	metrics, err := otelmetric.New("sse-gateway")
-	if err != nil {
-		slog.Error("sse-gateway: metrics", "err", err)
-		os.Exit(1)
-	}
-	defer metrics.Shutdown(context.Background())
 	g.SetMetrics(metrics.Handler())
 
 	if err := g.Run(ctx); err != nil {

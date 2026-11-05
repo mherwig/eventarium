@@ -35,6 +35,7 @@ records what is already decided in code and what each service must implement.
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
 | `PROPAGATE_HEADERS` | unset — nothing is propagated | publish-api. Allow-list of inbound request headers forwarded as CloudEvent extensions |
 | `SCHEMA_VALIDATION` | `off` | publish-api. `off`/`warn`/`enforce` for the publish-time schema gate |
+| `METRICS_ENABLED` | `true` | every service. `GET /metrics` in Prometheus exposition format |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api (upper bound for `max_events`) |
 | `REGISTRY_POLL` | `1s` (`2s` in publish-api) — the safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `LOG_LEVEL` | `info` | everything |
