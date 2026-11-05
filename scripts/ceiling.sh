@@ -88,10 +88,18 @@ for RATE in "$@"; do
   if [ "$A" != "-" ] && [ "$B" != "-" ]; then
     # >30% growth between the two samples, and well above the ~23-record
     # baseline the group sits at when idle.
+    #
+    # This reports what the lag did, not what it means. It used to print
+    # "GROWING (above ceiling)" / "flat (at/below ceiling)" as though lag
+    # located the knee, and it no longer does: after the park fix lag falls
+    # at rates well above it - measured 1,976 -> 1,691 at 2,500 ev/s, where
+    # p90 is 47 s - so the old label called the clearest failure in the
+    # sweep "at/below ceiling". The knee is read from the p90 tail instead
+    # (docs/performance.md); this line is context for it.
     if [ "$B" -gt $((A * 13 / 10)) ] && [ "$B" -gt 100 ]; then
-      VERDICT="GROWING (above ceiling)"
+      VERDICT="lag grew ${A} -> ${B}"
     else
-      VERDICT="flat (at/below ceiling)"
+      VERDICT="lag flat/falling ${A} -> ${B} (not a ceiling signal on its own)"
     fi
   fi
   {
