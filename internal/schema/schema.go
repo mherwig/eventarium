@@ -92,16 +92,34 @@ func Compile(raw []byte) (*Schema, error) {
 // Violation is one reason the data did not match: where it failed and why.
 type Violation struct {
 	// Path is a JSON Pointer into the data member, "" for the document root.
-	Path string
+	Path string `json:"path"`
 	// Message is the schema's own complaint, e.g. `got string, want integer`.
-	Message string
+	Message string `json:"message"`
 }
 
-func (v *Violation) Error() string {
+func (v Violation) Error() string {
 	if v.Path == "" {
 		return v.Message
 	}
 	return v.Path + ": " + v.Message
+}
+
+// Violations is every reason the data did not match, in the order the schema
+// reported them. An empty value means the data matched.
+//
+// Plural because the schema will happily report several at once - two
+// properties of the wrong type, a missing property alongside them, one bad
+// element after another in an array - and a publisher who is shown one at a
+// time has to fix, republish and discover the next. That loop is the whole
+// reason this is returned rather than a single error.
+type Violations []Violation
+
+func (vs Violations) Error() string {
+	parts := make([]string, len(vs))
+	for i, v := range vs {
+		parts[i] = v.Error()
+	}
+	return strings.Join(parts, "; ")
 }
 
 // printer renders a schema's own message. The library builds the same one for
@@ -125,35 +143,51 @@ func jsonPointer(tokens []string) string {
 	return b.String()
 }
 
-// Validate checks an already-decoded data member against the schema.
+// Validate checks an already-decoded data member against the schema, returning
+// every reason it did not match - empty when it did.
 //
 // The caller has usually parsed the data already - publish-api does, for the
 // JSON-object check it already performs - so this takes the decoded value
 // rather than bytes and does not parse a second time.
-func (s *Schema) Validate(v any) error {
-	if err := s.sch.Validate(v); err != nil {
-		return toViolation(err)
+func (s *Schema) Validate(v any) Violations {
+	err := s.sch.Validate(v)
+	if err == nil {
+		return nil
 	}
-	return nil
-}
-
-// toViolation turns the library's error tree into one line naming the
-// innermost failing location.
-//
-// The tree is nested for the compositional keywords: an anyOf failure sits at
-// the instance where the choice was attempted and carries each branch's
-// complaint underneath. Reporting the top level alone would say "anyOf failed"
-// at "/" and nothing about which property was wrong, so the deepest cause is
-// the one a publisher can act on.
-func toViolation(err error) error {
 	var ve *jsonschema.ValidationError
 	if !errors.As(err, &ve) {
-		return err
+		// Not the shape the library documents; still a failure, and the
+		// rendered form at least says something.
+		return Violations{{Message: err.Error()}}
 	}
-	for len(ve.Causes) > 0 {
-		ve = ve.Causes[0]
+	return toViolations(ve)
+}
+
+// toViolations flattens the library's error tree into one entry per leaf.
+//
+// The tree is nested for the compositional keywords - an anyOf failure sits at
+// the instance where the choice was attempted and carries each branch's
+// complaint underneath - so the top level alone would say "anyOf failed" at
+// "/" and name nothing useful. Every leaf is a concrete place and a concrete
+// complaint, and a document can produce several of them at once: two
+// properties of the wrong type, a missing property beside them, one bad
+// element after another in an array.
+//
+// A node with no causes is itself the leaf, which is where a single failure
+// such as `required` or a root-level `type` lands.
+func toViolations(ve *jsonschema.ValidationError) Violations {
+	if len(ve.Causes) == 0 {
+		return Violations{leafViolation(ve)}
 	}
-	v := &Violation{Path: jsonPointer(ve.InstanceLocation)}
+	var out Violations
+	for _, cause := range ve.Causes {
+		out = append(out, toViolations(cause)...)
+	}
+	return out
+}
+
+func leafViolation(ve *jsonschema.ValidationError) Violation {
+	v := Violation{Path: jsonPointer(ve.InstanceLocation)}
 	if ve.ErrorKind != nil {
 		v.Message = ve.ErrorKind.LocalizedString(printer)
 	}

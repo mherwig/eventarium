@@ -221,7 +221,7 @@ Whether it *enforces* is a deployment decision rather than a per-request one:
 | `SCHEMA_VALIDATION` | when the data does not match |
 | --- | --- |
 | `off` (default) | not checked; no schema is even read |
-| `warn` | logged with its path, the event is accepted |
+| `warn` | accepted, with every violation in the response |
 | `enforce` | `422`, the whole batch rejected before anything is produced |
 
 ```sh
@@ -240,6 +240,26 @@ SCHEMA_VALIDATION=enforce
 The path is a JSON Pointer into `data`, so a client can locate the offending
 field instead of parsing prose. A missing required property reads
 `missing property 'total'`.
+
+In `warn` mode the event is still accepted, and the violations come back in
+the response rather than only in the platform's log — the publisher is the one
+who can fix them, and having to read someone else's logs to discover your own
+data was wrong is not much of an advisory. The field is absent when the data
+matches, so a clean `201` is byte-for-byte what it was before the gate:
+
+```json
+{"event_ref":"22fa5ec5-...","event_type":"orders.created","retention_class":"short",
+ "expires_at":"2026-11-05T12:10:40Z",
+ "schema_violations":[
+   {"path":"/total","message":"got string, want number"},
+   {"path":"/note","message":"got number, want string"}]}
+```
+
+**Every** violation is reported, not just the first — a schema will happily
+find several at once (two properties of the wrong type, a missing property
+beside them, one bad element after another in an array), and showing them one
+per round trip would be a fix-republish-discover loop. The `422` in `enforce`
+lists them the same way.
 
 Rules worth knowing:
 

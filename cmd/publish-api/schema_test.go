@@ -219,3 +219,60 @@ func TestTypeWithoutSchemaIsNeverValidated(t *testing.T) {
 		}
 	}
 }
+
+// The violations belong in the response, not only in the log: the publisher is
+// the one who can fix them, and asking them to read the platform's logs to
+// discover their own data was wrong is not much of an advisory.
+func TestWarnModeReportsViolationsInTheResponse(t *testing.T) {
+	// Two independent problems, so a response carrying only the first would
+	// start the fix-republish-discover loop the plural form exists to avoid.
+	a, _, tok := gateAPI(t, schemaWarn, orderSchema)
+	rec := publish(t, a, tok, `{"total":"free","note":123}`)
+
+	if rec.Code != 201 {
+		t.Fatalf("status = %d, want 201 (warn accepts): %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"schema_violations", "/total", "/note"} {
+		if !contains(body, want) {
+			t.Errorf("response does not mention %q: %s", want, body)
+		}
+	}
+}
+
+// A clean publish must be byte-identical to what it was before the gate: the
+// field is omitempty for the same reason the existing warning is.
+func TestCleanPublishHasNoViolationsField(t *testing.T) {
+	for _, mode := range []schemaMode{schemaOff, schemaWarn, schemaEnforce} {
+		a, _, tok := gateAPI(t, mode, orderSchema)
+		rec := publish(t, a, tok, `{"order_id":"o-1","total":9.9}`)
+		if rec.Code != 201 {
+			t.Errorf("mode %v: status = %d, want 201", mode, rec.Code)
+		}
+		if contains(rec.Body.String(), "schema_violations") {
+			t.Errorf("mode %v: a clean publish carries violations: %s",
+				mode, rec.Body.String())
+		}
+	}
+}
+
+// Enforce must report every violation in the 422, not just the first - the
+// publisher fixes them in one pass rather than one per round trip.
+func TestEnforceReportsEveryViolation(t *testing.T) {
+	a, _, tok := gateAPI(t, schemaEnforce, orderSchema)
+	rec := publish(t, a, tok, `{"total":"free","note":123}`)
+
+	if rec.Code != 422 {
+		t.Fatalf("status = %d, want 422: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"/total", "/note"} {
+		if !contains(body, want) {
+			t.Errorf("422 body does not mention %q: %s", want, body)
+		}
+	}
+}
+
+func contains(haystack, needle string) bool {
+	return strings.Contains(haystack, needle)
+}

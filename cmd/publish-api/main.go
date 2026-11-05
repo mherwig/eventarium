@@ -339,12 +339,16 @@ func (c *schemaCache) get(raw json.RawMessage) (*schema.Schema, error) {
 // which is what lets the caller tell "the data is wrong" (a 422 the publisher
 // can fix) apart from "the schema is broken" (a 500 nobody but an operator
 // can fix).
-func (a *publishAPI) checkData(obj map[string]any, raw json.RawMessage) error {
+// It returns two different failures on purpose: violations (the data is
+// wrong, a 422 the publisher can fix) and an error (the schema itself will
+// not compile, a 500 only an operator can fix). Collapsing them into one
+// error would make a broken row look like a publisher's mistake.
+func (a *publishAPI) checkData(obj map[string]any, raw json.RawMessage) (schema.Violations, error) {
 	s, err := a.schemas.get(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return s.Validate(obj)
+	return s.Validate(obj), nil
 }
 
 // publishResult is one entry of the 201 response (section 6.1).
@@ -356,6 +360,12 @@ type publishResult struct {
 	// Warning is absent unless nothing will be delivered (see
 	// noSubscriberWarning). The normal response is therefore unchanged.
 	Warning string `json:"warning,omitempty"`
+	// SchemaViolations is present only in warn mode, and only for an event
+	// whose data did not match its schema - the advisory counterpart of the
+	// 422 enforce answers with. It is per event rather than one field for the
+	// batch, because each event carries its own data and therefore its own
+	// violations. Absent otherwise, so the normal response is unchanged.
+	SchemaViolations schema.Violations `json:"schema_violations,omitempty"`
 }
 
 // noSubscriberWarning tells a publisher that an event type nobody is
@@ -417,6 +427,9 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 		if e.DataContentType == "" {
 			e.DataContentType = et.ContentType
 		}
+		// Filled in below when warn mode finds the data does not match, and
+		// carried into this event's entry in the response.
+		var schemaViolations schema.Violations
 		if et.IsJSON() && e.HasData() {
 			// Section 5: a JSON event type must carry a JSON object as data.
 			var obj map[string]any
@@ -430,37 +443,37 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 			// "validate everything before producing anything" loop, so a
 			// violation rejects the whole batch and nothing is half-written.
 			if a.schemaMode != schemaOff && len(et.DataSchema) > 0 {
-				if err := a.checkData(obj, et.DataSchema); err != nil {
-					var v *schema.Violation
-					if errors.As(err, &v) {
-						if a.schemaMode == schemaEnforce {
-							httpx.Error(w, http.StatusUnprocessableEntity,
-								fmt.Sprintf("data of event type %q does not match its schema: %s",
-									e.Type, v))
-							return
-						}
-						// Warn mode exists to answer "what would break?", so
-						// the violation is logged with its path and the event
-						// is accepted exactly as it would have been before.
-						// No continue here: warn accepts the event, so
-						// control has to fall through to the record building
-						// below exactly as it did before the gate existed.
-						slog.Warn("publish-api: data does not match schema (not enforced)",
-							"owner", owner, "event_type", e.Type, "violation", v.Error())
-					} else {
-						// Not a violation: the schema itself cannot be
-						// compiled. Registration compiles every schema, so
-						// this means the row was written without going
-						// through the API, and a gate that cannot run must
-						// not quietly pass.
-						slog.Error("publish-api: registered schema does not compile",
-							"owner", owner, "event_type", e.Type, "err", err)
-						if a.schemaMode == schemaEnforce {
-							httpx.Error(w, http.StatusInternalServerError,
-								"the schema registered for this event type does not compile")
-							return
-						}
+				vs, err := a.checkData(obj, et.DataSchema)
+				switch {
+				case err != nil:
+					// The schema itself cannot be compiled. Registration compiles
+					// every schema, so this means the row was written without going
+					// through the API, and a gate that cannot run must not quietly
+					// pass.
+					slog.Error("publish-api: registered schema does not compile",
+						"owner", owner, "event_type", e.Type, "err", err)
+					if a.schemaMode == schemaEnforce {
+						httpx.Error(w, http.StatusInternalServerError,
+							"the schema registered for this event type does not compile")
+						return
 					}
+				case len(vs) > 0:
+					if a.schemaMode == schemaEnforce {
+						httpx.Error(w, http.StatusUnprocessableEntity,
+							fmt.Sprintf("data of event type %q does not match its schema: %s",
+								e.Type, vs.Error()))
+						return
+					}
+					// No continue here: warn accepts the event, so control has to
+					// fall through to the record building below exactly as it did
+					// before the gate existed. The violations also travel to the
+					// publisher in the response, not only to the log: the publisher
+					// is the one who can fix them, and asking them to read the
+					// platform's logs to learn their own data was wrong is not much
+					// of an advisory.
+					slog.Warn("publish-api: data does not match schema (not enforced)",
+						"owner", owner, "event_type", e.Type, "violations", vs.Error())
+					schemaViolations = vs
 				}
 			}
 		}
@@ -488,11 +501,12 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 			),
 		})
 		results = append(results, publishResult{
-			EventRef:       eventRef,
-			EventType:      e.Type,
-			RetentionClass: et.RetentionClass,
-			ExpiresAt:      expiresAt.Format(time.RFC3339),
-			Warning:        noSubscriberWarning(a.registry, owner, e.Type),
+			EventRef:         eventRef,
+			EventType:        e.Type,
+			RetentionClass:   et.RetentionClass,
+			ExpiresAt:        expiresAt.Format(time.RFC3339),
+			Warning:          noSubscriberWarning(a.registry, owner, e.Type),
+			SchemaViolations: schemaViolations,
 		})
 	}
 

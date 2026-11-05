@@ -49,10 +49,10 @@ func decode(t *testing.T, data string) any {
 
 func TestValidDataPasses(t *testing.T) {
 	s := mustCompile(t, orderSchema)
-	err := s.Validate(decode(t,
+	vs := s.Validate(decode(t,
 		`{"order_id":"o-1","total":99.9,"items":[{"sku":"a","qty":2}]}`))
-	if err != nil {
-		t.Fatalf("valid data rejected: %v", err)
+	if len(vs) != 0 {
+		t.Fatalf("valid data rejected: %v", vs)
 	}
 }
 
@@ -78,16 +78,12 @@ func TestViolationNamesTheFailingLocation(t *testing.T) {
 		{`{"order_id":"o-1","total":1,"placed_at":"yesterday"}`,
 			"/placed_at", "date-time"},
 	} {
-		err := s.Validate(decode(t, tc.data))
-		if err == nil {
+		vs := s.Validate(decode(t, tc.data))
+		if len(vs) == 0 {
 			t.Errorf("%s: accepted, want a violation", tc.data)
 			continue
 		}
-		v, ok := err.(*Violation)
-		if !ok {
-			t.Errorf("%s: got %T, want *Violation", tc.data, err)
-			continue
-		}
+		v := vs[0]
 		if v.Path != tc.path {
 			t.Errorf("%s: path = %q, want %q (message %q)", tc.data, v.Path, tc.path, v.Message)
 		}
@@ -100,14 +96,76 @@ func TestViolationNamesTheFailingLocation(t *testing.T) {
 	}
 }
 
+// Every leaf, not just the first. A publisher shown one violation at a time has
+// to fix, republish and discover the next - and the schema reports them all in
+// one pass anyway.
+func TestValidateReportsEveryViolation(t *testing.T) {
+	s := mustCompile(t, `{
+	  "type": "object",
+	  "required": ["a", "b"],
+	  "properties": {"a": {"type": "string"}, "b": {"type": "integer"}}
+	}`)
+
+	vs := s.Validate(decode(t, `{"a": 1, "b": "x"}`))
+	if len(vs) != 2 {
+		t.Fatalf("got %d violations (%v), want 2: a missing-required and a wrong type each",
+			len(vs), vs)
+	}
+
+	got := map[string]string{}
+	for _, v := range vs {
+		got[v.Path] = v.Message
+	}
+	if !strings.Contains(got["/a"], "string") {
+		t.Errorf("/a message = %q, want the expected type", got["/a"])
+	}
+	if !strings.Contains(got["/b"], "integer") {
+		t.Errorf("/b message = %q, want the expected type", got["/b"])
+	}
+
+	// Missing properties are reported by the required keyword as one entry
+	// naming all of them, which is still the right answer.
+	missing := s.Validate(decode(t, `{}`))
+	if len(missing) != 1 {
+		t.Fatalf("got %d violations for two missing properties (%v), want 1", len(missing), missing)
+	}
+	if !strings.Contains(missing[0].Message, "a") || !strings.Contains(missing[0].Message, "b") {
+		t.Errorf("message %q does not name both missing properties", missing[0].Message)
+	}
+
+	// One entry per bad element, each with its own index.
+	arrays := mustCompile(t,
+		`{"type":"object","properties":{"n":{"type":"array","items":{"type":"integer"}}}}`)
+	bad := arrays.Validate(decode(t, `{"n":["x","y"]}`))
+	if len(bad) != 2 {
+		t.Fatalf("got %d violations for two bad elements (%v), want 2", len(bad), bad)
+	}
+	if bad[0].Path != "/n/0" || bad[1].Path != "/n/1" {
+		t.Errorf("paths = %q, %q, want /n/0 and /n/1", bad[0].Path, bad[1].Path)
+	}
+}
+
+// The joined form is what goes into a 422 body.
+func TestViolationsErrorJoinsThem(t *testing.T) {
+	vs := Violations{
+		{Path: "/a", Message: "got number, want string"},
+		{Path: "", Message: "missing property 'c'"},
+	}
+	got := vs.Error()
+	want := "/a: got number, want string; missing property 'c'"
+	if got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
 // Formats are asserted rather than treated as annotations. A quality gate
 // that lets "date-time" pass as a comment is not much of a gate.
 func TestFormatIsAsserted(t *testing.T) {
 	s := mustCompile(t, `{"type":"object","properties":{"at":{"type":"string","format":"date-time"}}}`)
-	if err := s.Validate(decode(t, `{"at":"2026-11-05T10:00:00Z"}`)); err != nil {
-		t.Errorf("a real timestamp rejected: %v", err)
+	if vs := s.Validate(decode(t, `{"at":"2026-11-05T10:00:00Z"}`)); len(vs) != 0 {
+		t.Errorf("a real timestamp rejected: %v", vs)
 	}
-	if err := s.Validate(decode(t, `{"at":"soon"}`)); err == nil {
+	if vs := s.Validate(decode(t, `{"at":"soon"}`)); len(vs) == 0 {
 		t.Error("a non-timestamp accepted despite format: date-time")
 	}
 }
@@ -120,15 +178,15 @@ func TestLocalRefResolves(t *testing.T) {
 	  "properties": {"a": {"$ref": "#/$defs/positive"}},
 	  "$defs": {"positive": {"type": "integer", "minimum": 1}}
 	}`)
-	if err := s.Validate(decode(t, `{"a": 5}`)); err != nil {
-		t.Errorf("local $ref rejected valid data: %v", err)
+	if vs := s.Validate(decode(t, `{"a": 5}`)); len(vs) != 0 {
+		t.Errorf("local $ref rejected valid data: %v", vs)
 	}
-	err := s.Validate(decode(t, `{"a": 0}`))
-	if err == nil {
+	vs := s.Validate(decode(t, `{"a": 0}`))
+	if len(vs) == 0 {
 		t.Fatal("local $ref did not apply: 0 accepted")
 	}
-	if v, ok := err.(*Violation); !ok || v.Path != "/a" {
-		t.Errorf("violation = %v, want path /a", err)
+	if vs[0].Path != "/a" {
+		t.Errorf("violation path = %q, want /a", vs[0].Path)
 	}
 }
 
@@ -155,17 +213,10 @@ func TestCompileRejectsWhatRegistrationShouldCatch(t *testing.T) {
 		{"empty", "", "empty"},
 		{"not JSON", "{oops", "not valid JSON"},
 		{"not an object", `[1,2,3]`, "JSON object"},
-		{"unknown keyword is fine", `{"type":"nonsense"}`, ""}, // library's problem, not ours
-		{"broken ref", `{"$ref": "#/$defs/missing"}`, ""},
 		{"oversized", strings.Repeat(" ", MaxSchemaBytes+1), "at most"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Compile([]byte(tc.raw))
-			if tc.want == "" {
-				// Either outcome is defensible for these; what matters is
-				// that they do not panic.
-				return
-			}
 			if err == nil {
 				t.Fatalf("accepted (%s)", tc.raw)
 			}
