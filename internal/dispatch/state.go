@@ -167,7 +167,7 @@ func (s *subState) attemptLoop(ctx context.Context, it *item, drain bool) outcom
 				attempt++
 				if attempt >= uint16(s.d.maxAttempts) {
 					s.d.emitStatus(it, status.Dropped, reasonMaxAttempts, attempt, 0, 0)
-					s.d.count.dropped.Add(1)
+					s.d.record(it.msg, &s.d.count.dropped, "dropped")
 					return outcomeDropped
 				}
 				if !sleepCtx(ctx, backoff(attempt)) {
@@ -210,23 +210,25 @@ func (s *subState) attemptLoop(ctx context.Context, it *item, drain bool) outcom
 		attempt++
 		s.d.emitStatus(it, status.InFlight, "", attempt, 0, 0)
 		res := s.d.send(ctx, s.policy(), it, attempt)
+		s.d.observeAttempt(it.msg, res.latency)
 		switch res.kind {
 		case attemptOK:
 			s.d.emitStatus(it, status.Delivered, "", attempt, res.code, res.latency)
 			s.breaker.success()
-			s.d.count.delivered.Add(1)
+			s.d.observeE2E(it.msg)
+			s.d.record(it.msg, &s.d.count.delivered, "delivered")
 			return outcomeDelivered
 		case attemptGone:
 			// 410 Gone: the receiver said stop. The endpoint is alive, so this
 			// is not a breaker failure.
 			s.d.emitStatus(it, status.DeadLettered, reasonGone, attempt, res.code, res.latency)
 			s.breaker.success()
-			s.d.count.deadLettered.Add(1)
+			s.d.record(it.msg, &s.d.count.deadLettered, "dead_lettered")
 			return outcomeDead
 		case attempt429:
 			s.pause(res.retryAfter)
 			s.d.emitStatus(it, status.Retrying, reasonHTTP429, attempt, res.code, res.latency)
-			s.d.count.retrying.Add(1)
+			s.d.record(it.msg, &s.d.count.retrying, "retrying")
 			attempt-- // not an attempt: the event is retried after the pause
 		case attemptFailure:
 			reason := res.reason
@@ -242,15 +244,15 @@ func (s *subState) attemptLoop(ctx context.Context, it *item, drain bool) outcom
 			}
 			s.d.emitStatus(it, status.Retrying, reason, attempt, res.code, res.latency)
 			s.breaker.failure()
-			s.d.count.retrying.Add(1)
+			s.d.record(it.msg, &s.d.count.retrying, "retrying")
 			if attempt >= uint16(s.d.maxAttempts) {
 				if live {
 					s.d.emitStatus(it, status.Dropped, reasonMaxAttempts, attempt, res.code, res.latency)
-					s.d.count.dropped.Add(1)
+					s.d.record(it.msg, &s.d.count.dropped, "dropped")
 					return outcomeDropped
 				}
 				s.d.emitStatus(it, status.DeadLettered, reasonMaxAttempts, attempt, res.code, res.latency)
-				s.d.count.deadLettered.Add(1)
+				s.d.record(it.msg, &s.d.count.deadLettered, "dead_lettered")
 				return outcomeDead
 			}
 			if !sleepCtx(ctx, backoff(attempt)) {

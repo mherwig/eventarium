@@ -28,6 +28,7 @@ import (
 	"pubsub/internal/delivery"
 	"pubsub/internal/kafkautil"
 	"pubsub/internal/offsetgate"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/registry"
 	"pubsub/internal/status"
 	"pubsub/internal/store"
@@ -42,6 +43,10 @@ type Config struct {
 	SigningSecret string // WEBHOOK_SIGNING_SECRET, empty = no signature
 	AllowPrivate  bool   // ALLOW_PRIVATE_WEBHOOKS; true in the spike so the
 	// local harness can receive webhooks on loopback
+	// Metrics supplies the meter the instruments are built from. Nil means
+	// none, which is what every test passes: METRICS_ENABLED=false reaches the
+	// same place through a noop meter, so call sites never branch on it.
+	Metrics *otelmetric.Metrics
 }
 
 const (
@@ -163,6 +168,9 @@ type Dispatcher struct {
 	// offset joins it when the poll returns the record, and is released only
 	// when the delivery reached a durable outcome (internal/offsetgate).
 	gate *offsetgate.Gate
+	// instruments is nil when Metrics was not supplied; every observe method
+	// checks, so the send path never branches on a feature flag.
+	instruments *instruments
 	// parkRetry hands deliveries whose park failed to the background worker
 	// that keeps trying until the store takes them.
 	parkRetry chan *parkRetry
@@ -233,6 +241,11 @@ func New(cfg Config) (*Dispatcher, error) {
 	}
 	d.cl = cl
 
+	// Instruments last: the scrape-time gauges read d.subs and d.gate,
+	// and both exist by now.
+	if err := d.setupInstruments(cfg.Metrics); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -463,7 +476,7 @@ func (d *Dispatcher) handleRecord(rec *kgo.Record) {
 		slog.Warn("dispatcher: unknown subscription, delivery dropped",
 			"subscription", msg.SubscriptionID, "delivery", msg.DeliveryID)
 		d.emitStatus(it, status.Dropped, reasonUnknownSub, 0, 0, 0)
-		d.count.dropped.Add(1)
+		d.record(msg, &d.count.dropped, "dropped")
 		d.settle(rec.Partition, rec.Offset)
 		return
 	}
@@ -492,7 +505,7 @@ func (d *Dispatcher) handleRecord(rec *kgo.Record) {
 		}
 	case acceptDropQueue:
 		d.emitStatus(it, status.Dropped, reason, 0, 0, 0)
-		d.count.dropped.Add(1)
+		d.record(msg, &d.count.dropped, "dropped")
 		d.settle(rec.Partition, rec.Offset)
 	}
 }
@@ -736,14 +749,14 @@ func (d *Dispatcher) park(ctx context.Context, s *subState, it *item, reason str
 	}
 	if s.parked.OverCap(int64(s.policy().backlogMax)) {
 		d.emitStatus(it, status.Dropped, reasonBacklogMax, 0, 0, 0)
-		d.count.dropped.Add(1)
+		d.record(it.msg, &d.count.dropped, "dropped")
 		return true
 	}
 	payload, err := it.msg.Encode()
 	if err != nil {
 		slog.Warn("dispatcher: encoding parked payload failed", "err", err)
 		d.emitStatus(it, status.Dropped, reasonParkFailed, 0, 0, 0)
-		d.count.dropped.Add(1)
+		d.record(it.msg, &d.count.dropped, "dropped")
 		return true
 	}
 	row := store.InboxRow{
@@ -760,7 +773,7 @@ func (d *Dispatcher) park(ctx context.Context, s *subState, it *item, reason str
 	}
 	s.parked.Add(1) // local delta until the drainer's next count replaces it
 	d.emitStatus(it, status.Pending, reason, 0, 0, 0)
-	d.count.parked.Add(1)
+	d.record(it.msg, &d.count.parked, "parked")
 	return true
 }
 

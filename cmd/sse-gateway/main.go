@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"pubsub/internal/config"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/registry"
 	"pubsub/internal/sse"
 )
@@ -61,6 +62,14 @@ func main() {
 		slog.Error("starting", "err", err)
 		os.Exit(1)
 	}
+	metrics, err := otelmetric.New("sse-gateway")
+	if err != nil {
+		slog.Error("sse-gateway: metrics", "err", err)
+		os.Exit(1)
+	}
+	defer metrics.Shutdown(context.Background())
+	g.SetMetrics(metrics.Handler())
+
 	if err := g.Run(ctx); err != nil {
 		slog.Error("running", "err", err)
 		os.Exit(1)

@@ -29,6 +29,7 @@ import (
 	"pubsub/internal/config"
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/status"
 )
 
@@ -115,6 +116,13 @@ func main() {
 	// consumer is set up; the check pings ClickHouse, because a writer that
 	// cannot insert is not ready however alive it looks.
 	health := httpx.NewHealth(func(ctx context.Context) error { return conn.Ping(ctx) })
+	metrics, err := otelmetric.New("status-writer")
+	if err != nil {
+		slog.Error("status-writer: metrics", "err", err)
+		os.Exit(1)
+	}
+	defer metrics.Shutdown(context.Background())
+	health.SetMetrics(metrics.Handler())
 	go health.Serve(ctx, config.Str("HTTP_ADDR", ":8087"))
 
 	slog.Info("status-writer: started", "group", consumerGroup, "topic", kafkautil.TopicStatus)

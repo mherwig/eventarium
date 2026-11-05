@@ -297,6 +297,7 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 			SrcPartition:   rec.Partition,
 			SrcOffset:      rec.Offset,
 			CreatedAt:      time.Now().UTC(),
+			IngestedAt:     ingested,
 			// For live-class events ingested + retention is already in
 			// the past; that is intended (publish-api stamps it so).
 			ExpiresAt: expires,

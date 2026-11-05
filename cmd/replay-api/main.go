@@ -34,6 +34,7 @@ import (
 	"pubsub/internal/chstore"
 	"pubsub/internal/config"
 	"pubsub/internal/httpx"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/registry"
 	"pubsub/internal/replay"
 	"pubsub/internal/store"
@@ -134,6 +135,13 @@ func main() {
 			return reg.Check(config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter))
 		},
 	)
+	metrics, err := otelmetric.New("replay-api")
+	if err != nil {
+		slog.Error("replay-api: metrics", "err", err)
+		os.Exit(1)
+	}
+	defer metrics.Shutdown(context.Background())
+	health.SetMetrics(metrics.Handler())
 	mux := http.NewServeMux()
 	health.Register(mux)
 	server.Register(mux)

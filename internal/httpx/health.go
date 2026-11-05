@@ -31,10 +31,29 @@ type Health struct {
 	ready    atomic.Bool
 	checksMu sync.RWMutex
 	checks   []Check
+	// metrics is read per request rather than captured when the mux is built,
+	// so SetMetrics can be called at any point before the first scrape and no
+	// service has to get the ordering right.
+	metricsMu sync.RWMutex
+	metrics   http.Handler
 }
 
 // NewHealth builds the endpoints. The checks are probed by /readyz only.
 func NewHealth(checks ...Check) *Health { return &Health{checks: checks} }
+
+// SetMetrics attaches the handler that answers /metrics. Every service gets
+// the endpoint by calling this once; leaving it unset answers 404, which is
+// how METRICS_ENABLED=false looks from outside.
+//
+// It is on Health rather than registered by each service because the two ways
+// a service serves HTTP both come through here: the five APIs call Register on
+// their own mux, and the three that serve only health go through Mux. One
+// place means a new service cannot forget it.
+func (h *Health) SetMetrics(handler http.Handler) {
+	h.metricsMu.Lock()
+	h.metrics = handler
+	h.metricsMu.Unlock()
+}
 
 // AddCheck registers another readiness dependency. It exists for the services
 // that can answer liveness before every dependency object exists - the router
@@ -72,13 +91,30 @@ func (h *Health) Register(mux *http.ServeMux) {
 		JSON(w, http.StatusOK, map[string]any{"status": "ok", "ready": h.ready.Load()})
 	})
 	mux.HandleFunc("GET /readyz", h.readyz)
+	h.registerMetrics(mux)
 }
 
 // RegisterReady adds only /readyz, for a service that already answers
 // /healthz with a body of its own (sse-gateway reports its connection counts
-// there) and must not lose it.
+// there) and must not lose it. It adds /metrics too, for the same reason
+// Register does: this is the other door into the same mux.
 func (h *Health) RegisterReady(mux *http.ServeMux) {
 	mux.HandleFunc("GET /readyz", h.readyz)
+	h.registerMetrics(mux)
+}
+
+// registerMetrics adds /metrics, dispatching to whatever SetMetrics attached.
+func (h *Health) registerMetrics(mux *http.ServeMux) {
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		h.metricsMu.RLock()
+		handler := h.metrics
+		h.metricsMu.RUnlock()
+		if handler == nil {
+			http.NotFound(w, r)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
 }
 
 func (h *Health) readyz(w http.ResponseWriter, r *http.Request) {

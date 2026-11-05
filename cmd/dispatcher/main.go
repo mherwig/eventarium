@@ -17,6 +17,7 @@ import (
 	"pubsub/internal/dispatch"
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/registry"
 	"pubsub/internal/status"
 	"pubsub/internal/store"
@@ -43,6 +44,12 @@ func main() {
 	// and the consume loop has started: a dispatcher that has not joined the
 	// group delivers nothing, however healthy PostgreSQL looks.
 	health := httpx.NewHealth(func(ctx context.Context) error { return st.Pool.Ping(ctx) })
+	metrics, err := otelmetric.New("dispatcher")
+	if err != nil {
+		fail("metrics", err)
+	}
+	defer metrics.Shutdown(context.Background())
+	health.SetMetrics(metrics.Handler())
 	go health.Serve(ctx, config.Str("HTTP_ADDR", ":8086"))
 
 	producer, err := status.NewProducer(kafkautil.Bootstrap())
@@ -90,6 +97,7 @@ func main() {
 		// harness (harness recv) listens on loopback; set it to 0 in real
 		// deployments to enable the SSRF guard of spec 6.4.
 		AllowPrivate: config.Bool("ALLOW_PRIVATE_WEBHOOKS", true),
+		Metrics:      metrics,
 	})
 	if err != nil {
 		fail("creating the dispatcher", err)

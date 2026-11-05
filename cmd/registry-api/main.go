@@ -40,6 +40,7 @@ import (
 	"pubsub/internal/filter"
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/project"
 	"pubsub/internal/registry"
 	"pubsub/internal/schema"
@@ -81,6 +82,12 @@ func main() {
 	// Readiness needs PostgreSQL (every endpoint reads it directly) - the
 	// migrations above already proved it once, /readyz proves it again.
 	health := httpx.NewHealth(func(ctx context.Context) error { return st.Pool.Ping(ctx) })
+	metrics, err := otelmetric.New("registry-api")
+	if err != nil {
+		fatal("metrics", err)
+	}
+	defer metrics.Shutdown(context.Background())
+	health.SetMetrics(metrics.Handler())
 	mux := newMux(api, health)
 	health.SetReady(true)
 

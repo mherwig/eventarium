@@ -35,6 +35,7 @@ import (
 	"pubsub/internal/config"
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/registry"
 	"pubsub/internal/schema"
 	"pubsub/internal/store"
@@ -122,12 +123,30 @@ func main() {
 	// /healthz stays answering while they are down - restarting the process
 	// would not fix a database - but /readyz then fails, so a rolling update
 	// does not add a replica that cannot serve (section: docs/contracts.md).
+	metrics, err := otelmetric.New("publish-api")
+	if err != nil {
+		fatal("metrics", err)
+	}
+	// Deferred rather than closed on the shutdown path below: a failure to
+	// bind the listener still leaves a process that should flush its metrics.
+	defer func() {
+		shctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := metrics.Shutdown(shctx); err != nil {
+			slog.Warn("shutting down metrics", "err", err)
+		}
+	}()
+
 	health := httpx.NewHealth(
 		func(ctx context.Context) error { return st.Pool.Ping(ctx) },
 		func(context.Context) error {
 			return reg.Check(config.Duration("REGISTRY_STALE_AFTER", registry.DefaultStaleAfter))
 		},
 	)
+	health.SetMetrics(metrics.Handler())
+	if err := api.setupPublishMetrics(metrics); err != nil {
+		fatal("metrics", err)
+	}
 	mux := http.NewServeMux()
 	health.Register(mux)
 	mux.HandleFunc("POST /v1/events", api.handleEvents)
@@ -240,6 +259,9 @@ type publishAPI struct {
 	// schemaMode and schemas implement the publish-time schema gate.
 	schemaMode schemaMode
 	schemas    schemaCache
+	// publishMetrics is nil when no meter was supplied; every method on
+	// publishMetrics checks for it, so the handler never branches.
+	publishMetrics *publishMetrics
 }
 
 // schemaMode is what SCHEMA_VALIDATION does with a data member that does not
@@ -389,12 +411,15 @@ func noSubscriberWarning(reg *registry.Registry, owner, eventType string) string
 // handleEvents implements POST /v1/events: one event in binary or structured
 // mode, or many in batch mode (section 5).
 func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	claims, ok := a.auth.Authorize(w, r, auth.ScopePublish)
 	if !ok {
+		a.countPublish("", "unauthorized")
 		return
 	}
 	events, err := cloudevents.Read(r, a.maxBytes)
 	if err != nil {
+		a.countPublish("", "invalid_request")
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -402,6 +427,7 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// cannot be propagated should be visible to the publisher rather than
 	// published without the correlation id it was meant to carry.
 	if err := applyPropagatedHeaders(r.Header, events, a.propagateHeaders); err != nil {
+		a.countPublish("", "invalid_request")
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -416,10 +442,15 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// is rejected as a whole.
 	records := make([]*kgo.Record, 0, len(events))
 	results := make([]publishResult, 0, len(events))
+	// Data-member sizes, appended alongside results so the two stay aligned
+	// by index: a batch shares one round trip, so the per-event cost has to be
+	// attributed from the record rather than from the request.
+	payloadSizes := make([]int, 0, len(events))
 	for _, e := range events {
 		et, ok := a.registry.EventType(owner, e.Type)
 		if !ok {
 			// F20: no auto-registration, the whole request is rejected.
+			a.countPublish(e.Type, "unknown_event_type")
 			httpx.Error(w, http.StatusUnprocessableEntity,
 				fmt.Sprintf("unknown event type %q", e.Type))
 			return
@@ -434,6 +465,7 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 			// Section 5: a JSON event type must carry a JSON object as data.
 			var obj map[string]any
 			if err := decodeJSONObject(e.Data, &obj); err != nil {
+				a.countPublish(e.Type, "invalid_data")
 				httpx.Error(w, http.StatusUnprocessableEntity,
 					fmt.Sprintf("data of JSON event type %q must be a JSON object: %v", e.Type, err))
 				return
@@ -452,12 +484,14 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 					// pass.
 					slog.Error("publish-api: registered schema does not compile",
 						"owner", owner, "event_type", e.Type, "err", err)
+					a.countPublish(e.Type, "schema_broken")
 					if a.schemaMode == schemaEnforce {
 						httpx.Error(w, http.StatusInternalServerError,
 							"the schema registered for this event type does not compile")
 						return
 					}
 				case len(vs) > 0:
+					a.countPublish(e.Type, "schema_violation")
 					if a.schemaMode == schemaEnforce {
 						httpx.Error(w, http.StatusUnprocessableEntity,
 							fmt.Sprintf("data of event type %q does not match its schema: %s",
@@ -508,6 +542,7 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 			Warning:          noSubscriberWarning(a.registry, owner, e.Type),
 			SchemaViolations: schemaViolations,
 		})
+		payloadSizes = append(payloadSizes, len(e.Data))
 	}
 
 	// F19: publish is not deduplicated. Publishing the same message again is
@@ -517,8 +552,15 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// mean nothing of the request was written — see writeBatch.
 	if err := a.write(r.Context(), records); err != nil {
 		slog.Error("producing event", "err", err, "events", len(records))
+		a.countPublish("", "kafka_error")
 		httpx.Error(w, http.StatusInternalServerError, writeFailure(len(records), err))
 		return
+	}
+	// Only now: an event that was not written was not published, so counting
+	// before the produce would report rejections and outages as ingest.
+	for i, res := range results {
+		a.countEvent(res.EventType, payloadSizes[i])
+		a.countPublish(res.EventType, "ok")
 	}
 	for _, res := range results {
 		slog.Debug("event accepted", "owner", owner, "ref", res.EventRef,
@@ -527,9 +569,14 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	// A batch request is answered with an array, single events with one object.
 	if isBatch(r) {
+		// One round trip for the whole batch: attributing it to each type
+		// would multiply one measurement by the batch size, so the batch is
+		// labelled as itself.
+		a.observePublishDuration(time.Since(start), "batch")
 		httpx.JSON(w, http.StatusCreated, results)
 		return
 	}
+	a.observePublishDuration(time.Since(start), results[0].EventType)
 	httpx.JSON(w, http.StatusCreated, results[0])
 }
 

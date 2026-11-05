@@ -144,6 +144,7 @@ func (d *Dispatcher) send(ctx context.Context, pol policy, it *item, attempt uin
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		d.observeBytes(msg.Channel, len(body))
 		return attemptResult{kind: attemptOK, code: resp.StatusCode, latency: latency}
 	case resp.StatusCode == http.StatusGone:
 		return attemptResult{kind: attemptGone, code: resp.StatusCode, latency: latency}

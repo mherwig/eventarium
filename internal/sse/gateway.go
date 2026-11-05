@@ -262,6 +262,11 @@ func New(opts Options) (*Gateway, error) {
 	return g, nil
 }
 
+// SetMetrics attaches the handler that answers /metrics. The gateway builds
+// its own mux rather than going through httpx.Register, so it needs the
+// same door in that it would otherwise be the one service without metrics.
+func (g *Gateway) SetMetrics(handler http.Handler) { g.health.SetMetrics(handler) }
+
 // Run starts every goroutine and the HTTP server, then blocks until ctx is
 // cancelled or the listener fails, and shuts down gracefully.
 func (g *Gateway) Run(ctx context.Context) error {

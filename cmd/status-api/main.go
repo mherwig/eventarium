@@ -38,6 +38,7 @@ import (
 	"pubsub/internal/chstore"
 	"pubsub/internal/config"
 	"pubsub/internal/httpx"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/store"
 )
 
@@ -88,6 +89,13 @@ func main() {
 		func(ctx context.Context) error { return conn.Ping(ctx) },
 		func(ctx context.Context) error { return pg.Pool.Ping(ctx) },
 	)
+	metrics, err := otelmetric.New("status-api")
+	if err != nil {
+		slog.Error("status-api: metrics", "err", err)
+		os.Exit(1)
+	}
+	defer metrics.Shutdown(context.Background())
+	health.SetMetrics(metrics.Handler())
 
 	mux := http.NewServeMux()
 	health.Register(mux)

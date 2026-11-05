@@ -41,8 +41,15 @@ type Message struct {
 	SrcPartition   int32     `json:"src_partition"` // partition of the events topic
 	SrcOffset      int64     `json:"src_offset"`    // offset in the events topic
 	CreatedAt      time.Time `json:"created_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	Projected      bool      `json:"projected"`
+	// IngestedAt is when publish-api stamped the event, carried here so a
+	// delivery can measure how long the whole platform took rather than only
+	// its own part of it. CreatedAt is the router's clock and says nothing
+	// about what happened before the router; this is the number the harness's
+	// publish-to-receipt measurement approximates, minus the publisher's own
+	// network hop.
+	IngestedAt time.Time `json:"ingested_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Projected  bool      `json:"projected"`
 	// Event is held as the bytes it was written with rather than as a parsed
 	// CloudEvent. Stages that only route need the envelope above and nothing
 	// else: the dispatcher decides which subscription owns a record before it

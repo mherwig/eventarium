@@ -41,6 +41,7 @@ import (
 	"pubsub/internal/config"
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
+	"pubsub/internal/otelmetric"
 	"pubsub/internal/registry"
 	"pubsub/internal/routing"
 	"pubsub/internal/store"
@@ -75,6 +76,13 @@ func main() {
 	// router has no subscription index and would commit events it cannot
 	// match anything for.
 	health := httpx.NewHealth(func(ctx context.Context) error { return st.Pool.Ping(ctx) })
+	metrics, err := otelmetric.New("router")
+	if err != nil {
+		slog.Error("router: metrics", "err", err)
+		os.Exit(1)
+	}
+	defer metrics.Shutdown(context.Background())
+	health.SetMetrics(metrics.Handler())
 	go health.Serve(ctx, config.Str("HTTP_ADDR", ":8085"))
 	// REGISTRY_POLL is only the safety net: the NOTIFY trigger of migration
 	// 003 wakes the registry the moment a subscription changes.
@@ -117,7 +125,12 @@ func main() {
 	defer sess.Close()
 
 	health.SetReady(true)
-	if err := run(ctx, sess, routing.New(reg)); err != nil {
+	rm, err := setupRouterMetrics(metrics)
+	if err != nil {
+		slog.Error("router: metrics", "err", err)
+		os.Exit(1)
+	}
+	if err := run(ctx, sess, routing.New(reg), rm); err != nil {
 		slog.Error("router: stopped", "err", err)
 		os.Exit(1)
 	}
@@ -228,7 +241,7 @@ func fatalTxnErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "fatal, unrecoverable error")
 }
 
-func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router) error {
+func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router, rm *routerMetrics) error {
 	slog.Info("router: ready", "group", group)
 	// Read once for the abort diagnosis below: franz-go returns
 	// (committed=false, nil) for every abort and its own reason is logged at a
@@ -454,6 +467,19 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router)
 		// Committed: account for this batch. These three are the router's
 		// share of publish-to-pending; the generator and publish-api are
 		// measured separately, so the four together explain the whole figure.
+		// Recorded where the stage timings are logged rather than on every
+		// attempt, so a metric and the log line it is named after cannot
+		// disagree about what a cycle cost.
+		rm.addBatch()
+		rm.addRecords("in", len(recs))
+		rm.addRecords("out", len(out))
+		rm.observeStage("kafka_wait", kafkaWait)
+		rm.observeStage("process", procDur)
+		rm.observeStage("produce_sync", syncDur)
+		rm.observeStage("produce_end", endDur)
+		rm.observeStage("poll", pollDur)
+		rm.observeStage("cycle", cycle)
+
 		batches++
 		if batches == 1 {
 			waitMinAll, waitMaxAll = waitMin, waitMax
