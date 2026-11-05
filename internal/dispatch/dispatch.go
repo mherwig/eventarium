@@ -75,6 +75,12 @@ const (
 	// speed and again every retry tick, so one line per attempt would drown the
 	// log exactly while the store is down.
 	parkLogEvery = 30 * time.Second
+	// parkBatchTimeout bounds one batch's round trip. Larger than a single
+	// insert needs because a batch is up to parkRetryMax rows in chunks of
+	// 200; a timeout is safe rather than expensive - store.Park writes with
+	// ON CONFLICT DO NOTHING, so whatever landed is skipped when the batch
+	// retries, and nothing is counted durable until it returns success.
+	parkBatchTimeout = 5 * time.Second
 
 	// revokeDrain bounds how long a revoke waits for the deliveries this member
 	// is still holding for the partitions it is giving up. Waiting is what
@@ -616,16 +622,15 @@ func (d *Dispatcher) parkRetryLoop() {
 		if d.ctx.Err() != nil {
 			return // the items are not durable; their offsets stay uncommitted
 		}
-		kept, left := pending[:0], 0
-		for _, p := range pending {
-			if d.park(d.ctx, p.s, p.it, p.reason) {
-				d.settle(p.it.seq.Partition, p.it.seq.Offset)
-				continue
-			}
-			kept = append(kept, p)
-			left++
+		// One round trip for the whole batch rather than one per item - see
+		// parkBatch for why that distinction decides whether this loop can
+		// keep up with a burst.
+		done, failed := d.parkBatch(d.ctx, pending)
+		for _, p := range done {
+			d.settle(p.it.seq.Partition, p.it.seq.Offset)
 		}
-		pending = kept
+		pending = failed
+		left := len(failed)
 		switch {
 		case left > 0 && !warned:
 			slog.Warn("dispatcher: parking is failing, retries queued",
@@ -739,52 +744,150 @@ func (d *Dispatcher) newStateLocked(sub *registry.Subscription, pol policy) *sub
 // hands the item to the background retry (parkOrRetry) instead of releasing
 // its offset, because a record that is neither delivered nor parked must stay
 // uncommitted.
-func (d *Dispatcher) park(ctx context.Context, s *subState, it *item, reason string) bool {
-	if !it.msg.ExpiresAt.IsZero() && !time.Now().Before(it.msg.ExpiresAt) {
-		d.emitStatus(it, status.Expired, reasonExpired, 0, 0, 0)
-		return true
+// parkBatch parks a group of items in one round trip rather than one each.
+//
+// Why this is a batch instead of a loop over the single-item path: a park cost
+// 6.896 ms end to end when measured across 6,273 parks, and 99.98% of that -
+// 6.885 ms - was the single-row insert. The parker's service rate was
+// therefore 145 parks/s against a burst arrival of 164-182 parks/s: it fell
+// behind, pending grew to parkRetryMax, the parker stopped draining,
+// parkRetryQueue filled, and the blocking send in parkOrRetry stalled the
+// shared poll goroutine for 7-18 s. Every subscription on that instance then
+// showed a pending -> in_flight tail of 12-21 s where the run without parks
+// showed 752 ms - one subscription's overflow becoming everyone's problem,
+// which is the same thing the inline park was removed for causing.
+//
+// store.Park already chunks at 200, so batching is caller-side: the inbox key
+// is (subscription_id, part, off, expires_at) and the insert uses ON CONFLICT
+// DO NOTHING, so a retry after a partial failure writes nothing twice.
+//
+// Durability is not decided any earlier than before. An item comes back as
+// done only once its row is in the table, or when it is terminal for another
+// reason (expired, over the cap, unencodable); the caller releases offsets for
+// those and only those.
+func (d *Dispatcher) parkBatch(ctx context.Context, batch []*parkRetry) (done, retry []*parkRetry) {
+	if len(batch) == 0 {
+		return nil, nil
 	}
-	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkBatchTimeout)
 	defer cancel()
-	// Spec 16: the backlog cap trades guaranteed delivery for bounded storage;
-	// without it the inbox grows without bound, with it dropped appears.
-	// The check reads the cached counter (store.ParkCounter) instead of
-	// counting the inbox per delivery: a count over a full inbox costs about
-	// 10 ms, and parking runs at ingestion speed for as long as the endpoint
-	// is down. Until the cache knows the rows it inherited there is no cap -
-	// the same degradation a failed count had.
-	if err := s.parked.Ensure(pctx, d.st, s.id); err != nil {
-		slog.Warn("dispatcher: counting parked rows for the cap failed",
-			"subscription", s.id, "err", err)
+
+	type slot struct {
+		p   *parkRetry
+		row store.InboxRow
 	}
-	if s.parked.OverCap(int64(s.policy().backlogMax)) {
-		d.emitStatus(it, status.Dropped, reasonBacklogMax, 0, 0, 0)
-		d.record(it.msg, &d.count.dropped, "dropped")
-		return true
+	var (
+		ready []slot
+		// capped holds items that would exceed backlog_max once the rows being
+		// written actually land. They cannot be dropped at check time: if the
+		// insert fails the counter never advances, they are still eligible,
+		// and dropping them would lose deliveries the cap had room for.
+		capped []*parkRetry
+		// The cap resolved once per subscription per batch. OverCap is
+		// max > 0 && Ready && Total() >= max, so an unready counter or a max
+		// of 0 means no cap at all - 'limited' records which have one.
+		avail    = make(map[*subState]int64, 4)
+		limited  = make(map[*subState]bool, 4)
+		resolved = make(map[*subState]bool, 4)
+	)
+
+	for _, p := range batch {
+		it := p.it
+		// Terminal without I/O: an expired event is never parked, exactly as
+		// the single-item path reported it.
+		if !it.msg.ExpiresAt.IsZero() && !time.Now().Before(it.msg.ExpiresAt) {
+			d.emitStatus(it, status.Expired, reasonExpired, 0, 0, 0)
+			done = append(done, p)
+			continue
+		}
+		s := p.s
+		if !resolved[s] {
+			resolved[s] = true
+			// Spec 16: the backlog cap trades guaranteed delivery for bounded
+			// storage; without it the inbox grows without bound, with it
+			// dropped appears. The check reads the cached counter
+			// (store.ParkCounter) instead of counting the inbox per delivery:
+			// a count over a full inbox costs about 10 ms, and parking runs at
+			// ingestion speed for as long as the endpoint is down. Until the
+			// cache knows the rows it inherited there is no cap - the same
+			// degradation a failed count had.
+			tCount := time.Now()
+			if err := s.parked.Ensure(pctx, d.st, s.id); err != nil {
+				slog.Warn("dispatcher: counting parked rows for the cap failed",
+					"subscription", s.id, "err", err)
+			}
+			d.observeParkStage("count", time.Since(tCount))
+			if max := int64(s.policy().backlogMax); max > 0 && s.parked.Ready() {
+				limited[s] = true
+				avail[s] = max - s.parked.Total()
+			}
+		}
+		if limited[s] && avail[s] <= 0 {
+			capped = append(capped, p)
+			continue
+		}
+		tEncode := time.Now()
+		payload, err := it.msg.Encode()
+		d.observeParkStage("encode", time.Since(tEncode))
+		if err != nil {
+			slog.Warn("dispatcher: encoding parked payload failed", "err", err)
+			d.emitStatus(it, status.Dropped, reasonParkFailed, 0, 0, 0)
+			d.record(it.msg, &d.count.dropped, "dropped")
+			done = append(done, p)
+			continue
+		}
+		if limited[s] {
+			avail[s]-- // reserve, so this batch cannot overshoot the cap
+		}
+		ready = append(ready, slot{p: p, row: store.InboxRow{
+			SubscriptionID: s.id,
+			Part:           it.seq.Partition,
+			Offset:         it.seq.Offset,
+			Payload:        payload,
+			Reason:         p.reason,
+			ExpiresAt:      it.msg.ExpiresAt,
+		}})
 	}
-	payload, err := it.msg.Encode()
-	if err != nil {
-		slog.Warn("dispatcher: encoding parked payload failed", "err", err)
-		d.emitStatus(it, status.Dropped, reasonParkFailed, 0, 0, 0)
-		d.record(it.msg, &d.count.dropped, "dropped")
-		return true
+
+	if len(ready) > 0 {
+		rows := make([]store.InboxRow, len(ready))
+		for i, r := range ready {
+			rows[i] = r.row
+		}
+		tInsert := time.Now()
+		err := d.st.Park(pctx, rows)
+		// Amortised over the rows it carried, so all three stages mean "per
+		// park" and stay comparable with the single-item measurements.
+		d.observeParkStage("insert", time.Since(tInsert)/time.Duration(len(rows)))
+		if err != nil {
+			first := ready[0]
+			d.logParkFailure(first.p.s.id, first.p.it.seq, err)
+			// Nothing that needed a write is durable. Rows that did land are
+			// skipped by ON CONFLICT on the retry, and no counter advanced, so
+			// the reservations are void and the capped items are eligible too.
+			for _, r := range ready {
+				retry = append(retry, r.p)
+			}
+			return done, append(retry, capped...)
+		}
+		// Counters only now that the rows exist: the cap must not advance for
+		// an insert that did not happen.
+		for _, r := range ready {
+			r.p.s.parked.Add(1)
+			d.emitStatus(r.p.it, status.Pending, r.p.reason, 0, 0, 0)
+			d.record(r.p.it.msg, &d.count.parked, "parked")
+			done = append(done, r.p)
+		}
 	}
-	row := store.InboxRow{
-		SubscriptionID: s.id,
-		Part:           it.seq.Partition,
-		Offset:         it.seq.Offset,
-		Payload:        payload,
-		Reason:         reason,
-		ExpiresAt:      it.msg.ExpiresAt,
+	// Over-cap items are durable once the rows that reached the cap landed -
+	// and when nothing was pending to reach it with, Total() is already at the
+	// limit, so they are over the cap now either way.
+	for _, p := range capped {
+		d.emitStatus(p.it, status.Dropped, reasonBacklogMax, 0, 0, 0)
+		d.record(p.it.msg, &d.count.dropped, "dropped")
+		done = append(done, p)
 	}
-	if err := d.st.Park(pctx, []store.InboxRow{row}); err != nil {
-		d.logParkFailure(s.id, it.seq, err)
-		return false
-	}
-	s.parked.Add(1) // local delta until the drainer's next count replaces it
-	d.emitStatus(it, status.Pending, reason, 0, 0, 0)
-	d.record(it.msg, &d.count.parked, "parked")
-	return true
+	return done, retry
 }
 
 // heartbeat logs the per-stage counters every 10 seconds.

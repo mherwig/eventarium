@@ -63,6 +63,15 @@ type instruments struct {
 	// signature of intermittent stalls rather than steady slowness.
 	parkQueueDepth metric.Int64ObservableGauge
 	parkHandoff    metric.Float64Histogram
+	// parkStage splits park() into where its time actually goes, because the
+	// obvious fix - batching the insert, which store.Park already chunks at
+	// 200 - only helps if "insert" is the cost. Three stages cover the work:
+	// count is the cached inbox lookup (free after the first call, so any
+	// weight here means the cache is not holding), encode is CPU on the
+	// payload, insert is the PostgreSQL round trip. Splitting them stops
+	// "the parker is slow" from being a guess about which of three things it
+	// is, and park() is not a path to change on a guess: it owns the offsets.
+	parkStage metric.Float64Histogram
 }
 
 // newInstruments builds them all. An error here is a programming error in the
@@ -132,6 +141,13 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
+	parkStage, err := meter.Float64Histogram("pubsub.dispatch.park_stage.duration",
+		metric.WithUnit("s"),
+		otelmetric.WithDurationBuckets(),
+		metric.WithDescription("Where one park spends its time: count (cached inbox lookup), encode (payload to JSON), insert (the PostgreSQL round trip). Splits the parker's cost so a fix targets the stage that is actually slow."))
+	if err != nil {
+		return nil, err
+	}
 	return &instruments{
 		outcome:         outcome,
 		attempt:         attempt,
@@ -144,6 +160,7 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 		revokeAbandoned: revokeAbandoned,
 		parkQueueDepth:  parkQueueDepth,
 		parkHandoff:     parkHandoff,
+		parkStage:       parkStage,
 	}, nil
 }
 
@@ -236,6 +253,16 @@ func (d *Dispatcher) setupInstruments(m *otelmetric.Metrics) error {
 		return nil
 	}, instr.queueDepth, instr.offsetsInFlight, instr.parked, instr.parkQueueDepth)
 	return err
+}
+
+// observeParkStage records where one park spent its time. A nil instruments
+// (no meter) is the no-op case, so park() never branches on the feature.
+func (d *Dispatcher) observeParkStage(stage string, took time.Duration) {
+	if d.instruments == nil {
+		return
+	}
+	d.instruments.parkStage.Record(context.Background(), took.Seconds(),
+		metric.WithAttributes(attribute.String("stage", stage)))
 }
 
 // observeGauges reads the backlog at scrape time. A backlog is a state rather
