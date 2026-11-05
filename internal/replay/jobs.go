@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/otel/metric"
 	"time"
 
 	"github.com/google/uuid"
@@ -68,10 +69,25 @@ type Job struct {
 // JobStore owns the replay_jobs control data (migration 002).
 type JobStore struct {
 	pool *pgxpool.Pool
+	// instr is nil when no meter was supplied (tests); every method on it
+	// checks, so the store never branches on a feature flag.
+	instr *jobMetrics
 }
 
-// NewJobStore wraps the pgx pool of the shared PostgreSQL store.
-func NewJobStore(pool *pgxpool.Pool) *JobStore { return &JobStore{pool: pool} }
+// NewJobStore wraps the pgx pool of the shared PostgreSQL store. A nil meter
+// leaves the store uninstrumented rather than panicking on first use.
+func NewJobStore(pool *pgxpool.Pool, meter metric.Meter) (*JobStore, error) {
+	s := &JobStore{pool: pool}
+	if meter == nil {
+		return s, nil
+	}
+	instr, err := newJobMetrics(meter)
+	if err != nil {
+		return nil, err
+	}
+	s.instr = instr
+	return s, nil
+}
 
 // Create inserts a new job. When the caller sent an Idempotency-Key that this
 // owner already used, the existing job is returned with created=false and
@@ -106,6 +122,7 @@ func (s *JobStore) Create(ctx context.Context, owner, subscriptionID, idempotenc
 		VALUES ($1::uuid, $2, $3::uuid, NULLIF($4, ''), $5, $6, $7)`,
 		job.ID, job.Owner, job.SubscriptionID, job.IdempotencyKey, selectorJSON, job.DryRun, StatusPending)
 	if err == nil {
+		s.instr.observeJob(StatusPending)
 		return job, true, nil
 	}
 	var pge *pgconn.PgError
@@ -189,6 +206,9 @@ func (s *JobStore) Claim(ctx context.Context, id string) (*Job, bool, error) {
 	if errors.Is(err, ErrNotFound) {
 		return nil, false, nil
 	}
+	if err == nil {
+		s.instr.observeJob(StatusRunning)
+	}
 	return job, err == nil, err
 }
 
@@ -226,6 +246,8 @@ func (s *JobStore) Finish(ctx context.Context, id, status string, matched, enque
 	if err != nil {
 		return fmt.Errorf("replay: finishing job: %w", err)
 	}
+	s.instr.observeJob(status)
+	s.instr.observeEvents(enqueued, notReplayable)
 	return nil
 }
 

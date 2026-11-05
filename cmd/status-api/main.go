@@ -106,9 +106,21 @@ func main() {
 	mux.HandleFunc("GET /v1/subscriptions/{id}/deliveries", a.subscriptionDeliveries)
 	mux.HandleFunc("GET /v1/subscriptions/{id}/status-summary", a.statusSummary)
 
+	// This is a read API, so its business metric is the transport one: which
+	// endpoint is slow, and which is erroring. The four routes cost very
+	// different amounts - status-summary aggregates, the delivery list
+	// paginates with a keyset cursor - so a single total would hide the one
+	// that regressed. Registered after the mux so the middleware can ask it
+	// for the route pattern.
+	mw, err := httpx.Metrics(mux, metrics.Meter())
+	if err != nil {
+		slog.Error("status-api: metrics", "err", err)
+		os.Exit(1)
+	}
+
 	addr := config.Str("HTTP_ADDR", ":8081")
 	health.SetReady(true)
-	srv := &http.Server{Addr: addr, Handler: httpx.AccessLog(mux)}
+	srv := &http.Server{Addr: addr, Handler: httpx.AccessLog(mw(mux))}
 	go func() {
 		slog.Info("status-api: listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

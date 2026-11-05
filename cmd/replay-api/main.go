@@ -121,7 +121,11 @@ func main() {
 	}
 	defer producer.Close()
 
-	jobs := replay.NewJobStore(st.Pool)
+	jobs, err := replay.NewJobStore(st.Pool, metrics.Meter())
+	if err != nil {
+		slog.Error("replay-api: metrics", "err", err)
+		os.Exit(1)
+	}
 	worker := replay.NewWorker(jobs, conn, reg, replay.NewEventReader(), producer, maxEvents)
 	workerDone := make(chan struct{})
 	go func() {

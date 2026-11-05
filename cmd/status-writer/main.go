@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -127,6 +128,14 @@ func main() {
 
 	slog.Info("status-writer: started", "group", consumerGroup, "topic", kafkautil.TopicStatus)
 	w := &writer{conn: conn, cl: cl}
+	// After w exists: the depth gauge reads w's own atomic, so the writer has
+	// to be built first and the instruments hung off it.
+	instr, err := setupStatusMetrics(metrics, &w.depth)
+	if err != nil {
+		slog.Error("status-writer: metrics", "err", err)
+		os.Exit(1)
+	}
+	w.instr = instr
 	health.SetReady(true)
 	if err := w.run(ctx); err != nil {
 		slog.Error("status-writer: exiting with error", "err", err)
@@ -149,6 +158,12 @@ type writer struct {
 	buf            []entry       // parsed records waiting for the insert
 	toCommit       []*kgo.Record // inserted records waiting for the offset commit
 	commitFailures int
+
+	// instr is nil when no meter was supplied; every method on it checks.
+	instr *statusMetrics
+	// depth mirrors len(buf) so the scrape-time gauge can read it without
+	// racing the single goroutine that owns buf.
+	depth atomic.Int64
 }
 
 // run consumes until ctx is cancelled, then flushes what is left. A failed
@@ -192,6 +207,7 @@ func (w *writer) run(ctx context.Context) error {
 			for _, r := range fetched {
 				if e, ok := parse(r); ok {
 					w.buf = append(w.buf, e)
+					w.depth.Store(int64(len(w.buf)))
 				}
 			}
 			if len(w.buf) >= flushRows && time.Now().After(notBefore) {
@@ -237,13 +253,18 @@ func (w *writer) poll(ctx context.Context, out chan<- []*kgo.Record) {
 // (section 15.3) and are retried with backoff.
 func (w *writer) flushOnce(ctx context.Context) error {
 	if len(w.buf) > 0 {
+		n := len(w.buf)
+		start := time.Now()
 		if err := w.insert(ctx); err != nil {
+			w.instr.observeInsertFailure(n)
 			return err
 		}
+		w.instr.observeInserted(n, time.Since(start))
 		for i := range w.buf {
 			w.toCommit = append(w.toCommit, w.buf[i].src)
 		}
 		w.buf = w.buf[:0]
+		w.depth.Store(0)
 		slog.Debug("status-writer: inserted", "rows", len(w.toCommit))
 	}
 	if len(w.toCommit) > 0 {
