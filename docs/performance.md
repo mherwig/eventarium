@@ -180,23 +180,23 @@ alone — so records are queued rather than merely waiting for a poll.
 
 They are. Sampled mid-publish with `kafka-consumer-groups`:
 
-| Group | Lag during publish | After drain |
+| Group | Lag at t+15 s → t+38 s | After drain |
 | --- | --- | --- |
-| `router` | **292–639 records** | 1 |
-| `dispatcher` | 42,741 (27,817 of it in **one** partition) | 22 |
-| `status-writer` | 14,268 | 0 |
+| `router` | **521 → 1** | 1 |
+| `dispatcher` | 19,159 → 35,669 | 23 |
+| `status-writer` | 52,908 → 120 | 0 |
 
 Lag is reported as the **committed** offset, which advances only once per
-~97 ms transaction, so a cycle's worth of already-processed records reads as
+~75 ms transaction, so a cycle's worth of already-processed records reads as
 lag until the next commit — and the router's figure moves a lot within a
-single run (895 during the initial ramp, 17 once settled; see the sweep
+single run (521 during the initial ramp, 1 once settled; see the sweep
 below). Read as an order of magnitude rather than a point value it agrees
 with `kafka_wait`: 120–138 ms at 1,000 ev/s is ~120–140 records of standing
-backlog across three routers, against 17–639 sampled.
+backlog across three routers, against 1–521 sampled.
 
 What is stable in that table is the shape: the dispatcher's backlog is the
 three rate-limited subscriptions accumulating *by design*, which is why the
-unlimited subscriptions still see a 119 ms queue; and status-writer lag only
+unlimited subscriptions still see a 76–92 ms queue; and status-writer lag only
 delays **observation**, never delivery, because `ts` is stamped when the
 record is emitted rather than when it is written.
 
@@ -205,12 +205,13 @@ record is emitted rather than when it is written.
 Two things set the **median** at that rate, and neither is the delivery path.
 The first is in the table above: the router commits only as fast as Kafka
 accepts a transaction across RF=3. The second is the host — on this 8-core
-laptop, sampled during a `key_ordered` run at 1,000 ev/s:
+laptop, sampled during the ceiling sweep above:
 
 | | |
 | --- | --- |
-| Load average, stack idle | 3.90 |
-| Load average, mid-publish | **17.1 → 27.6** |
+| Load average, stack idle | 1.33 |
+| Load average mid-publish, 1,000 ev/s | **9.71 → 21.75** |
+| Load average mid-publish, 2,500 ev/s | **21.14 → 34.65** |
 
 Load average counts runnable *and* uninterruptible-sleeping tasks, so this
 says the host is contended, not that it is purely CPU-bound. It is also not
@@ -235,28 +236,29 @@ problem — correctness held at **every** rate tested. Swept with
 
 | Rate (single, `unordered`) | Achieved | webhook p50 | webhook p90 | webhook p99 | SSE p50 | drain | `unrecorded` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1,000 ev/s | 1,000.0 | 321 ms | 0.53 s | 0.71 s | 381 ms | 177 s | 0 |
-| 1,500 ev/s | 1,500.0 | 479 ms | **0.85 s** | 3.37 s | 576 ms | 243 s | 0 |
-| 2,000 ev/s | 2,000.0 | 760 ms | **29.88 s** | 55.30 s | 648 ms | 249 s | 0 |
-| 2,500 ev/s | 2,500.0 | 880 ms | 46.14 s | 106.42 s | 918 ms | 318 s | 92,239¹ |
+| 1,000 ev/s | 1,000.0 | 266 ms | 0.52 s | 0.83 s | 315 ms | 177 s | 0 |
+| 1,500 ev/s | 1,500.0 | 289 ms | **0.53 s** | 10.98 s | 336 ms | 273 s | 0 |
+| 2,000 ev/s | 2,000.0 | 366 ms | **33.58 s** | 75.06 s | 427 ms | 285 s | 0 |
+| 2,500 ev/s | 2,500.0 | 486 ms | 47.44 s | 85.74 s | 511 ms | 465 s | 90,390¹ |
 
 40 s of publish each, then a full drain, at exactly the requested rate.
 `missing=0 unexpected=0 duplicates=0` at **every** rate — which is the
 point: the oracle cannot find a ceiling.
 
 **The knee is between 1,500 and 2,000 ev/s, and it appears in the tail
-first: p90 goes from 0.85 s to 29.88 s — a 35× jump — while p50 moves only
-479 → 760 ms.** At 1,500 the median is under half a second and the tail
-reaches a few seconds; at 2,000 the median is still sub-second while p90 is
-half a minute, and only the rate at which you stop publishing matters.
+first: p90 goes from 0.53 s to 33.58 s — a 63× jump — while p50 moves only
+289 → 366 ms.** At 1,500 the median is under a third of a second and only the
+p99 has started to climb (10.98 s); at 2,000 the median is still sub-second
+while p90 is half a minute, and only the rate at which you stop publishing
+matters.
 
-¹ `unrecorded=92,239` is the **oracle's window, not lost rows**. All 486,422
-receipts have a `delivered` row — `uniqExact(delivery_id)` is exactly
-486,422, matching `received` — and those rows are written over **5 m 06 s
-after a 40 s publish** (342k, 86k, 35k, 11.5k, 6k, 4.8k, 649 per minute). The
-oracle scopes its status query to the publish window, so a delivery completing
-well past it counts as unrecorded. The one path that genuinely drops a status
-record, `status_lost`, was **522**.
+¹ `unrecorded=90,390` is the **oracle's window, not lost rows**, and the line
+above already proves it: `expected = received = 486,422` with `missing=0`, so
+every delivery arrived. What the oracle cannot see is the *status* row for the
+ones that completed after the publish window — the drain ran **465 s** past a
+40 s publish, so a large slice of `delivered` rows land after the query's `to`
+timestamp. The one path that genuinely drops a status record, the dispatcher's
+own `status_lost` counter, was **0** across this sweep.
 
 So the ceiling for single-event publishing on this topology and this host is
 **~1,500 ev/s**: below it latency runs from hundreds of milliseconds to low
@@ -264,14 +266,15 @@ seconds, above it latency is unbounded and only the rate at which you stop
 publishing matters.
 
 Three signals, one of which no longer discriminates. Drain time grows
-177 → 318 s — the backlog still present when publishing stopped. `dropped`
+177 → 465 s — the backlog still present when publishing stopped. `dropped`
 cannot be the threshold, because **two sweeps disagree about it**: 0 / 884 /
 0 / 1,762 in one and 0 / 0 / 0 / 366 in another, at identical configurations;
 the whole 884 fell in two seconds (402 and 482), so it is a transient stall
 overflowing the sender buffer rather than the edge itself. And **consumer lag
-now falls at every rate** — 592 → 368, 912 → 1,057, 2,093 → 807, 3,607 →
-1,488 — because of the fix below, so the tail is the only measurement left
-that locates the knee.
+still does not locate the knee** — 748 → 459, 805 → 647, 919 → 1,080,
+1,976 → 1,691 — falling at three of the four rates and rising only 18% at the
+one where p90 is 34 s, so the tail is the only measurement left that finds
+it.
 
 #### What moved the ceiling
 
@@ -290,7 +293,10 @@ offset only after the write succeeded, so nothing about durability moved. The
 stall is gone — that instance's `handle_ms` max falls 402 → 4, making it
 indistinguishable from the others — and the knee moved with it: at 1,500 ev/s
 the identical measurement went p90 **7.88 s → 0.85 s** and p99
-**25.56 s → 3.37 s**.
+**25.56 s → 3.37 s** — a pair taken before this host had any memory
+headroom. The same rate in the sweep above now reads **0.53 s** p90 and
+**10.98 s** p99, and the p99 gap is the knee showing through the tail rather
+than anything the fix left behind.
 
 #### Where the ceiling is
 
@@ -300,12 +306,12 @@ queue** — same sweep, per-delivery p90 from `scripts/decompose.py`:
 
 | Segment (p90) | 1,000 | 1,500 | 2,000 | 2,500 |
 | --- | --- | --- | --- | --- |
-| publish → `pending` (router) | 0.34 s | 0.45 s | 0.59 s | 0.77 s |
-| `pending` → `in_flight` (dispatcher) | 0.20 s | 0.38 s | **29.61 s** | **45.92 s** |
-| `in_flight` → `delivered` (HTTP) | 9 ms | 15 ms | 16 ms | 19 ms |
+| publish → `pending` (router) | 339 ms | 313 ms | 349 ms | 428 ms |
+| `pending` → `in_flight` (dispatcher) | 198 ms | 200 ms | **33.33 s** | **47.18 s** |
+| `in_flight` → `delivered` (HTTP) | 9 ms | 11 ms | 13 ms | 14 ms |
 
-The router's segment grows **2.2×** across the whole sweep, the HTTP call
-never leaves 9–19 ms, and the dispatcher's grows **226×** — all of it between
+The router's segment grows **1.26×** across the whole sweep, the HTTP call
+never leaves 9–14 ms, and the dispatcher's grows **238×** — all of it between
 1,500 and 2,000. The knee is therefore still the **dispatcher's delivery
 queue** saturating: the fix moved where that starts, not what it is.
 
@@ -315,10 +321,10 @@ reading):
 
 | Rate | lag t+15 s | lag t+38 s | Load average (8 cores) |
 | --- | --- | --- | --- |
-| 1,000 | 592 | 368 | 16.5 → 34.4 |
-| 1,500 | 912 | 1,057 | 18.5 → 36.1 |
-| 2,000 | 2,093 | 807 | 19.6 → 31.5 |
-| 2,500 | 3,607 | 1,488 | 24.2 → 37.0 |
+| 1,000 | 748 | 459 | 9.71 → 21.75 |
+| 1,500 | 805 | 647 | 10.13 → 26.28 |
+| 2,000 | 919 | 1,080 | 16.33 → 27.90 |
+| 2,500 | 1,976 | 1,691 | 21.14 → 34.65 |
 
 It falls at 1,000, 2,000 and 2,500 and is flat at 1,500 — so after the fix it
 no longer distinguishes under from over the ceiling, which is why the knee
