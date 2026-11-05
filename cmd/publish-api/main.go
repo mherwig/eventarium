@@ -36,6 +36,7 @@ import (
 	"pubsub/internal/httpx"
 	"pubsub/internal/kafkautil"
 	"pubsub/internal/registry"
+	"pubsub/internal/schema"
 	"pubsub/internal/store"
 )
 
@@ -47,6 +48,12 @@ func main() {
 	// explicitly so that every environment read of this binary goes via config.
 	brokers := splitBrokers(config.Str("KAFKA_BROKERS", "localhost:9092"))
 	maxBytes := int64(config.Int("MAX_EVENT_BYTES", cloudevents.DefaultMaxBytes))
+	// Named schemaGate rather than schemaMode: the latter is the type, and a
+	// variable of the same name would shadow it for the rest of main.
+	schemaGate, err := parseSchemaMode(config.Str("SCHEMA_VALIDATION", "off"))
+	if err != nil {
+		fatal("configuration", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -105,6 +112,7 @@ func main() {
 		},
 		maxBytes:         maxBytes,
 		propagateHeaders: parseHeaderAllowList(config.Str("PROPAGATE_HEADERS", "")),
+		schemaMode:       schemaGate,
 	}
 	// Deliberately api.closeTxn and not txnClient.Close: a latched client may
 	// have been replaced since, and this closes whichever one is current.
@@ -147,7 +155,8 @@ func main() {
 	// connected; from here on, readiness is only about the dependencies.
 	health.SetReady(true)
 	slog.Info("publish-api listening", "addr", addr, "brokers", brokers, "max_event_bytes", maxBytes,
-		"propagate_headers", strings.Join(api.propagateHeaders, ","))
+		"propagate_headers", strings.Join(api.propagateHeaders, ","),
+		"schema_validation", schemaGate)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fatal("serving http", err)
 	}
@@ -228,6 +237,114 @@ type publishAPI struct {
 	// the consumer as Ce-... headers on a webhook and as a field in the SSE
 	// data member. Empty means the feature is off.
 	propagateHeaders []string
+	// schemaMode and schemas implement the publish-time schema gate.
+	schemaMode schemaMode
+	schemas    schemaCache
+}
+
+// schemaMode is what SCHEMA_VALIDATION does with a data member that does not
+// match its event type's registered schema.
+type schemaMode int
+
+const (
+	// schemaOff does not validate at all, and never even reads a schema:
+	// the default, so a deployment that has not asked for the gate sees no
+	// change and pays no cost.
+	schemaOff schemaMode = iota
+	// schemaWarn reports the violation and accepts the event anyway. It is
+	// for finding out what a schema would break before it starts breaking it.
+	schemaWarn
+	// schemaEnforce rejects the request, whole batch, before anything is
+	// produced - the same rule the JSON-object check already follows.
+	schemaEnforce
+)
+
+func (m schemaMode) String() string {
+	switch m {
+	case schemaWarn:
+		return "warn"
+	case schemaEnforce:
+		return "enforce"
+	default:
+		return "off"
+	}
+}
+
+// parseSchemaMode reads SCHEMA_VALIDATION. An unknown value is a configuration
+// error rather than a silent fallback to off: someone who typed "enabled" has
+// asked for a gate and must not be told they have one while every event sails
+// through.
+func parseSchemaMode(v string) (schemaMode, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "off":
+		return schemaOff, nil
+	case "warn":
+		return schemaWarn, nil
+	case "enforce":
+		return schemaEnforce, nil
+	default:
+		return schemaOff, fmt.Errorf("SCHEMA_VALIDATION must be off, warn or enforce, got %q", v)
+	}
+}
+
+// schemaResult caches one compilation outcome, including the failure: a schema
+// that does not compile must not be recompiled on every publish, or a broken
+// row becomes a per-request cost.
+type schemaResult struct {
+	s   *schema.Schema
+	err error
+}
+
+// schemaCache memoises compiled schemas by their document.
+//
+// Keyed by content rather than by event type or by a reload generation.
+// Reloading the registry happens every one to two seconds and on any change to
+// it - including subscriptions, which have nothing to do with schemas - so
+// invalidating on reload would recompile a large schema every couple of
+// seconds for no reason. Content keying makes a no-op reload free, stays
+// correct across change -> revert -> change (a generation counter would not),
+// and two event types that share a schema share the compiled form too.
+type schemaCache struct {
+	mu sync.RWMutex
+	m  map[string]schemaResult
+}
+
+func (c *schemaCache) get(raw json.RawMessage) (*schema.Schema, error) {
+	key := string(raw)
+	c.mu.RLock()
+	r, ok := c.m[key]
+	c.mu.RUnlock()
+	if ok {
+		return r.s, r.err
+	}
+	s, err := schema.Compile(raw)
+	c.mu.Lock()
+	if c.m == nil {
+		c.m = make(map[string]schemaResult, 1)
+	}
+	// First writer wins. Compiling twice is harmless and lets the lock be
+	// released rather than held across a compile of a document that may be
+	// large.
+	if _, exists := c.m[key]; !exists {
+		c.m[key] = schemaResult{s: s, err: err}
+	}
+	c.mu.Unlock()
+	return s, err
+}
+
+// checkData validates an already-decoded data member against a registered
+// schema, compiling it on first use and caching the outcome by content.
+//
+// A compile failure is returned as an ordinary error rather than a Violation,
+// which is what lets the caller tell "the data is wrong" (a 422 the publisher
+// can fix) apart from "the schema is broken" (a 500 nobody but an operator
+// can fix).
+func (a *publishAPI) checkData(obj map[string]any, raw json.RawMessage) error {
+	s, err := a.schemas.get(raw)
+	if err != nil {
+		return err
+	}
+	return s.Validate(obj)
 }
 
 // publishResult is one entry of the 201 response (section 6.1).
@@ -307,6 +424,44 @@ func (a *publishAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusUnprocessableEntity,
 					fmt.Sprintf("data of JSON event type %q must be a JSON object: %v", e.Type, err))
 				return
+			}
+			// The schema gate. obj is already decoded, so validation does not
+			// parse the payload a second time. It runs inside the same
+			// "validate everything before producing anything" loop, so a
+			// violation rejects the whole batch and nothing is half-written.
+			if a.schemaMode != schemaOff && len(et.DataSchema) > 0 {
+				if err := a.checkData(obj, et.DataSchema); err != nil {
+					var v *schema.Violation
+					if errors.As(err, &v) {
+						if a.schemaMode == schemaEnforce {
+							httpx.Error(w, http.StatusUnprocessableEntity,
+								fmt.Sprintf("data of event type %q does not match its schema: %s",
+									e.Type, v))
+							return
+						}
+						// Warn mode exists to answer "what would break?", so
+						// the violation is logged with its path and the event
+						// is accepted exactly as it would have been before.
+						// No continue here: warn accepts the event, so
+						// control has to fall through to the record building
+						// below exactly as it did before the gate existed.
+						slog.Warn("publish-api: data does not match schema (not enforced)",
+							"owner", owner, "event_type", e.Type, "violation", v.Error())
+					} else {
+						// Not a violation: the schema itself cannot be
+						// compiled. Registration compiles every schema, so
+						// this means the row was written without going
+						// through the API, and a gate that cannot run must
+						// not quietly pass.
+						slog.Error("publish-api: registered schema does not compile",
+							"owner", owner, "event_type", e.Type, "err", err)
+						if a.schemaMode == schemaEnforce {
+							httpx.Error(w, http.StatusInternalServerError,
+								"the schema registered for this event type does not compile")
+							return
+						}
+					}
+				}
 			}
 		}
 

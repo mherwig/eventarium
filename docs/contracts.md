@@ -34,6 +34,7 @@ records what is already decided in code and what each service must implement.
 | `WEBHOOK_SIGNING_SECRET` | unset (no signature) | dispatcher |
 | `MAX_EVENT_BYTES` | `1048576` | publish-api |
 | `PROPAGATE_HEADERS` | unset — nothing is propagated | publish-api. Allow-list of inbound request headers forwarded as CloudEvent extensions |
+| `SCHEMA_VALIDATION` | `off` | publish-api. `off`/`warn`/`enforce` for the publish-time schema gate |
 | `REPLAY_MAX_EVENTS` | `10000` | replay-api (upper bound for `max_events`) |
 | `REGISTRY_POLL` | `1s` (`2s` in publish-api) — the safety net under the NOTIFY trigger of migration 003 | publish-api, router, dispatcher, replay-api, sse-gateway |
 | `LOG_LEVEL` | `info` | everything |
@@ -188,6 +189,15 @@ publish API. A delivery record additionally carries `pubsub-channel`.
 
 - `POST/GET/DELETE /v1/event-types` and `/v1/event-types/{name}` (scope
   `publish` for writes, owner scoped).
+- An event type may carry `data_schema`, a JSON Schema for its `data`
+  member. It is compiled at registration, so a document that will not
+  compile, a schema on a non-JSON `content_type`, one over 1 MB, or one
+  holding a remote `$ref` is refused there rather than at the first publish.
+  Re-POSTing the same event type replaces it — the insert is an upsert, so
+  `created_at` survives a schema change — and the migration 003 NOTIFY fires
+  on that UPDATE, so publishers pick the new one up within milliseconds.
+  Enforcement is `SCHEMA_VALIDATION` on publish-api; nothing else reads the
+  column. Events already published are never re-validated.
 - `POST/GET/DELETE /v1/subscriptions` and `/v1/subscriptions/{id}` (scope
   `subscribe`).
 - `PUT /v1/subscriptions/{id}` replaces a subscription (full replace, not a

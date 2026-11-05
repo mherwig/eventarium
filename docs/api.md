@@ -202,6 +202,66 @@ Four rules, in the order they tend to surprise people:
   dropped or truncated. A truncated correlation id looks valid and is not, and
   a dropped one disappears without the publisher ever finding out.
 
+### Validating against a schema
+
+A JSON event type can carry a JSON Schema for its `data` member, checked at
+publish as a quality gate. Register it with the type:
+
+```sh
+curl -s -X POST localhost:8083/v1/event-types -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"orders.created","retention_class":"short",
+       "content_type":"application/json",
+       "data_schema":{"type":"object","required":["total"],
+                      "properties":{"total":{"type":"number"}}}}'
+```
+
+Whether it *enforces* is a deployment decision rather than a per-request one:
+
+| `SCHEMA_VALIDATION` | when the data does not match |
+| --- | --- |
+| `off` (default) | not checked; no schema is even read |
+| `warn` | logged with its path, the event is accepted |
+| `enforce` | `422`, the whole batch rejected before anything is produced |
+
+```sh
+SCHEMA_VALIDATION=enforce
+```
+
+```text
+{"specversion":"1.0","id":"v1","source":"/s","type":"orders.created","data":{"total":99.9}}
+  -> 201
+
+{"specversion":"1.0","id":"b1","source":"/s","type":"orders.created","data":{"total":"free"}}
+  -> 422 {"error":"data of event type \"orders.created\" does not match its
+           schema: /total: got string, want number"}
+```
+
+The path is a JSON Pointer into `data`, so a client can locate the offending
+field instead of parsing prose. A missing required property reads
+`missing property 'total'`.
+
+Rules worth knowing:
+
+- **JSON event types only.** A schema on a non-JSON `content_type` is refused
+  at registration rather than stored where it would look like a guarantee it
+  never provides. `data` must be a JSON object, as it always has been.
+- **Local `$ref` only.** A reference to an external URL is refused at
+  registration: fetching it would be an SSRF vector and would make validation
+  depend on a server nobody controls. Inline the definition instead.
+- **Size is capped** at 1 MB and refused at registration, the way
+  `MAX_EVENT_BYTES` refuses a payload.
+- **Changing a schema** means re-POSTing the same event type — the insert is
+  an upsert — so `created_at` survives. Events already published are never
+  re-validated; the gate only ever looks at new publishes.
+- **Formats are asserted**, not treated as annotations: `"format":"date-time"`
+  is enforced. Stricter than a naive validator expects, and the point of
+  asking for one.
+- **A schema that cannot compile is a `500`, not a `422`** in `enforce` mode:
+  registration compiles every schema, so reaching that state means the row did
+  not come through the API. It is an operator problem, not a publisher's, and a
+  gate that cannot run does not quietly pass.
+
 ## Receive on the webhook
 
 The dispatcher POSTs the event — binary binding by default, with delivery
