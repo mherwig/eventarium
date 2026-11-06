@@ -113,6 +113,8 @@ Full docs, searchable: **[mherwig.github.io/eventarium](https://mherwig.github.i
 | [HTTP API](https://mherwig.github.io/eventarium/docs/api) | Register, subscribe, publish, receive, replay |
 | [Reliability](https://mherwig.github.io/eventarium/docs/reliability) | Statuses, circuit breaker, dead letters |
 | [Performance](https://mherwig.github.io/eventarium/docs/performance) | Load tests, chaos runs, failover |
+| [Monitoring](https://mherwig.github.io/eventarium/docs/monitoring) | Metrics, PromQL to copy, the Grafana dashboard |
+| [Operating](https://mherwig.github.io/eventarium/docs/operations) | Deploying, chaos scenarios, inspecting state |
 | [Architecture](https://mherwig.github.io/eventarium/docs/architecture) | Services, stores, transactional boundaries |
 | [Configuration](https://mherwig.github.io/eventarium/docs/configuration) | Every environment variable |
 | [Specification](https://mherwig.github.io/eventarium/docs/spec) | The document this implements |

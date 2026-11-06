@@ -107,6 +107,81 @@ Two details worth knowing before building a panel:
   them into a non-monotonic series. Narrow the range until the window starts
   after the restart. It looks exactly like broken metrics and is not.
 
+### Queries worth copying
+
+The table above names the instruments; these are the expressions that use them.
+All of them run against the provisioned Prometheus on `:9091`, or through
+Grafana's Prometheus data source. Buckets are in **seconds**, so quantiles come
+back in seconds — `2.5` is two and a half seconds, not milliseconds.
+
+**Is anything failing to report?** A target that is down looks exactly like a
+quiet metric otherwise:
+
+```promql
+up == 0
+```
+
+**What is being published, and what is happening to it?**
+
+```promql
+sum by (event_type) (rate(pubsub_publish_events_total[5m]))
+sum by (outcome)    (rate(pubsub_delivery_outcome_total[5m]))
+```
+
+The outcome set is `delivered`, `retrying`, `parked`, `dropped` and
+`dead_lettered`. `delivered` climbing alongside `retrying` is ordinary retry
+churn; `delivered` flat while the others climb means the receivers are the
+problem, not the platform.
+
+**How slow, end to end?**
+
+```promql
+histogram_quantile(0.50, sum by (le) (rate(pubsub_e2e_duration_seconds_bucket[5m])))
+histogram_quantile(0.99, sum by (le) (rate(pubsub_e2e_duration_seconds_bucket[5m])))
+```
+
+**Which subscription is having the problem?** This is the question the labels
+exist for — `subscription_id` is functionally dependent on `owner`, so
+splitting by it costs no extra series beyond the ones already there:
+
+```promql
+topk(5, sum by (subscription_id)
+  (rate(pubsub_delivery_outcome_total{outcome="retrying"}[5m])))
+```
+
+**Is anything backed up?** All three fall back to zero when the platform is
+caught up. Subscriptions with a rate limit are the expected exception — they
+hold a backlog by design:
+
+```promql
+sum(pubsub_dispatch_queue_depth)
+pubsub_dispatch_offsets_in_flight
+sum(pubsub_dispatch_parked)
+```
+
+**Where does the router spend its cycle?** `stage` splits the serial
+`poll → process → transaction → poll` loop into the parts that point at
+different problems:
+
+```promql
+histogram_quantile(0.5, sum by (le, stage)
+  (rate(pubsub_router_stage_duration_seconds_bucket[5m])))
+```
+
+**Runtime** — a goroutine count growing with no matching traffic is a leak, and
+a step change in resident memory after a deploy is worth explaining:
+
+```promql
+sum by (job) (go_goroutine_count)
+sum by (job) (process_memory_rss_bytes)
+```
+
+Four caveats, all hit while writing this page rather than predicted, are in
+the list above: a counter that has never recorded has no series, `route` must
+be the registered pattern rather than the URL, `histogram_quantile` returns
+NaN across a restart that changed bucket boundaries, and a gauge whose
+callback never registered it reports nothing at all.
+
 ## Dashboard
 
 `deploy/grafana/dashboards/eventarium.json` is provisioned at startup — 19

@@ -20,6 +20,15 @@ go run ./cmd/admin all        # topics + PostgreSQL migrations + ClickHouse tabl
 ```
 
 `admin` is idempotent; run it again whenever you add a migration or a topic.
+The stages can also be run alone — useful when only one of them has changed:
+
+| command | what it does |
+| --- | --- |
+| `admin topics` | create the platform topics (`EnsureTopics`) |
+| `admin migrate` | apply the PostgreSQL migrations |
+| `admin ch` | create the ClickHouse database and `delivery_status` table |
+| `admin all` | all three, in that order |
+
 Ports: Kafka `9092`, PostgreSQL `5432`, ClickHouse `8123` (HTTP) / `9000`
 (native). Both databases use user/password `pubsub`.
 
