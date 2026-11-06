@@ -438,3 +438,49 @@ func TestSubscriptionDeleteIsSoft(t *testing.T) {
 		t.Errorf("SubscriptionExists for a foreign owner = %v, %v; want false, nil", exists, err)
 	}
 }
+
+// TestSubscriptionDefaultMaxInFlight pins the concurrency a subscription gets
+// when the request does not name one.
+//
+// It is here because this default sat at 1 while policy.go's defaultMaxInFlight
+// said 8, and that one only fires on a stored 0 — which this table never
+// writes, so whatever is here is what runs. The effect was invisible rather
+// than loud: an ordinary subscription delivered one event at a time, so
+// `unordered` behaved exactly like `ordered` (the ceiling §7 gives `unordered`
+// as the default to avoid), and a single hanging endpoint blocked the whole
+// subscription for request_timeout_ms. Nothing failed because nothing asserted
+// it — the harness passed -max-in-flight 8 to work around it, so every
+// throughput figure ever taken was measured at 8 while the default was 1.
+//
+// The explicit value stays accepted, including serial: asking for 1 still
+// stores 1, because min is 1.
+func TestSubscriptionDefaultMaxInFlight(t *testing.T) {
+	a := newTestAPI(t)
+	a.createEventType(t, "mif.default")
+	a.createEventType(t, "mif.serial")
+
+	created := a.createSubscription(t, map[string]any{
+		"event_type":   "mif.default",
+		"channel":      "webhook",
+		"callback_url": "https://example.test/hook",
+	})
+	if created.MaxInFlight != 8 {
+		t.Errorf("max_in_flight omitted: got %d, want the default 8 — a lower "+
+			"store makes an ordinary subscription deliver one event at a time",
+			created.MaxInFlight)
+	}
+	// What a client reads back is what the dispatcher will run with.
+	if got := a.get(t, created.ID).MaxInFlight; got != 8 {
+		t.Errorf("GET max_in_flight = %d, want 8", got)
+	}
+
+	serial := a.createSubscription(t, map[string]any{
+		"event_type":    "mif.serial",
+		"channel":       "webhook",
+		"callback_url":  "https://example.test/hook",
+		"max_in_flight": 1,
+	})
+	if serial.MaxInFlight != 1 {
+		t.Errorf("explicit max_in_flight: stored %d, want 1", serial.MaxInFlight)
+	}
+}

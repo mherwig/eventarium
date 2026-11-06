@@ -543,7 +543,17 @@ func (a *api) buildSubscription(ctx context.Context, w http.ResponseWriter, owne
 		min  int
 	}{
 		{"max_connections", &sub.MaxConnections, req.MaxConnections, 3, 1},
-		{"max_in_flight", &sub.MaxInFlight, req.MaxInFlight, 1, 1},
+		// 8, not 1. This has to agree with policy.go's defaultMaxInFlight, and
+		// that one only fires on a stored 0 - which this table never writes,
+		// so whatever is here is what runs. It was 1 from the first commit
+		// while policy.go said 8, which meant an ordinary subscription
+		// delivered one event at a time: the exact ceiling §7 gives `unordered`
+		// as the default to avoid, and one hanging endpoint then blocked the
+		// whole subscription for request_timeout_ms. The harness had to pass
+		// -max-in-flight 8 for its throughput numbers to mean anything but
+		// serial delivery. min stays 1, so a subscription that wants one
+		// delivery at a time still asks for it.
+		{"max_in_flight", &sub.MaxInFlight, req.MaxInFlight, 8, 1},
 		{"rate_limit_per_s", &sub.RateLimitPerS, req.RateLimitPerS, 0, 0},
 		{"burst", &sub.Burst, req.Burst, 0, 0},
 		{"drain_rate_per_s", &sub.DrainRatePerS, req.DrainRatePerS, 200, 0},
