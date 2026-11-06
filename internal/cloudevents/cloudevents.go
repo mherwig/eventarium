@@ -124,7 +124,14 @@ func Parse(data []byte) (*Event, error) {
 		e.Time = &t
 	}
 	if v, ok := get("data"); ok {
-		e.Data = append(json.RawMessage(nil), v...)
+		// Aliased rather than copied: v already is a private copy - the map
+		// unmarshal above copies every member's bytes into its RawMessage and
+		// nothing else holds m after this returns - so the second copy only
+		// cost a second allocation and a second memcpy of a payload that is
+		// 1 KiB in the harness and can be up to MAX_EVENT_BYTES. Projection
+		// replaces cp.Data rather than writing through it, and MarshalJSON
+		// only reads, so nothing mutates this buffer.
+		e.Data = v
 	}
 	if e.DataBase64, err = str("data_base64"); err != nil {
 		return nil, err

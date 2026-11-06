@@ -217,11 +217,33 @@ func (r *Router) Process(rec *kgo.Record) ([]*kgo.Record, Stages) {
 	projMemo := make(map[string]*cloudevents.Event, 2)
 	rawMemo := make(map[*cloudevents.Event]json.RawMessage, 2)
 
+	// The event exactly as publish-api wrote it, so an unprojected
+	// subscription - every subscription without a projection shares this one
+	// pointer - takes these bytes instead of re-encoding a struct that was
+	// parsed out of them. MarshalJSON rebuilds a map and does eight separate
+	// string marshals to reproduce bytes already in hand: measured at 9.4 us
+	// and 44 allocations per event, 21% of the uncontended fan-out.
+	//
+	// This changes bytes, not meaning. Parse keeps unknown members as
+	// extensions and MarshalJSON writes them back, and data and data_base64
+	// are RawMessage on both sides, so the JSON stays equivalent - it keeps
+	// the publisher's key order rather than going alphabetical, and stops
+	// re-normalising time to RFC3339Nano. Webhooks and SSE deliver these
+	// bytes verbatim (dispatch/sender.go, sse/connection.go), so a consumer
+	// that compares bodies byte for byte sees a change; one that parses them
+	// does not.
+	rawMemo[e] = rec.Value
+
 	// base is the status record every emission of this event starts from:
 	// the platform metadata of section 9, copied per candidate and given its
 	// delivery ID, status and reason.
+	// One clock read per event rather than one per status record and one per
+	// delivery: both timestamps are the router's own for this event, so they
+	// may as well be the same instant - and time.Now() was being read ~2,930
+	// times per batch for two distinct moments.
+	now := time.Now().UTC()
 	base := status.Record{
-		TS:             time.Now().UTC(),
+		TS:             now,
 		Owner:          owner,
 		EventRef:       eventRef,
 		Attempt:        0,
@@ -345,7 +367,7 @@ func (r *Router) Process(rec *kgo.Record) ([]*kgo.Record, Stages) {
 			OrderingKey:    orderingKey,
 			SrcPartition:   rec.Partition,
 			SrcOffset:      rec.Offset,
-			CreatedAt:      time.Now().UTC(),
+			CreatedAt:      now,
 			IngestedAt:     ingested,
 			// For live-class events ingested + retention is already in
 			// the past; that is intended (publish-api stamps it so).
