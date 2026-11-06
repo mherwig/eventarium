@@ -75,6 +75,41 @@ type Router struct {
 // New builds a router over an in-memory registry.
 func New(reg *registry.Registry) *Router { return &Router{reg: reg} }
 
+// Stages is where one Process call spent its time. The caller sums these over
+// a poll batch and records them against the router's stage histogram, so every
+// stage in that metric means the same thing - one batch - and the sub-stages
+// of process are comparable with it rather than with a per-record figure.
+//
+// The sub-stages exist because process is the largest single term at full
+// batches (50-52 ms of a 104-117 ms cycle, ~43%) and a total does not say what
+// to change. They are summed rather than recorded per event deliberately:
+// recording per event would put ~2,500 histogram observations and as many
+// attribute sets into every batch, which is allocation on the path being
+// measured.
+type Stages struct {
+	// Parse is cloudevents.Parse of the record's value.
+	Parse time.Duration
+	// Index is header reads, the attribute index, the ordering key (which may
+	// decode the data member) and the per-event setup.
+	Index time.Duration
+	// Filter is candidate matching, including the status record written for a
+	// candidate whose filter rejected the event.
+	Filter time.Duration
+	// Memo is the projection lookup and the event serialisation it memoises.
+	Memo time.Duration
+	// Encode is every delivery record and its pending status record.
+	Encode time.Duration
+}
+
+// Add folds one record's stages into a batch total.
+func (s *Stages) Add(o Stages) {
+	s.Parse += o.Parse
+	s.Index += o.Index
+	s.Filter += o.Filter
+	s.Memo += o.Memo
+	s.Encode += o.Encode
+}
+
 // Process evaluates one consumed event record and returns the records to
 // produce for it: for every matching subscription one delivery record on
 // kafkautil.TopicDeliveries followed by its pending status record on
@@ -84,15 +119,22 @@ func New(reg *registry.Registry) *Router { return &Router{reg: reg} }
 // subscription for their type yield no records; nothing here panics or
 // aborts the batch, the transactional caller commits the source offset
 // either way.
-func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
+func (r *Router) Process(rec *kgo.Record) ([]*kgo.Record, Stages) {
+	var st Stages
+	// Parse is timed on its own first: by benchmark it is 8.2 us and 57
+	// allocations of the ~44 us an event costs before contention, and it is
+	// the one per-event term that cannot be skipped - Match needs e.Type.
+	tParse := time.Now()
 	e, err := cloudevents.Parse(rec.Value)
+	st.Parse = time.Since(tParse)
 	if err != nil {
 		// Section 5: the router never crashes on a malformed record; it
 		// skips it and the offset is still committed.
 		slog.Warn("router: skipping unparsable event",
 			"topic", rec.Topic, "partition", rec.Partition, "offset", rec.Offset, "err", err)
-		return nil
+		return nil, st
 	}
+	tIndex := time.Now()
 	owner := kafkautil.HGet(rec, kafkautil.HeaderOwner)
 	class := kafkautil.HGet(rec, kafkautil.HeaderClass)
 	eventRef := kafkautil.HGet(rec, kafkautil.HeaderEventRef)
@@ -111,7 +153,7 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 
 	entries := r.reg.Match(owner, e.Type)
 	if len(entries) == 0 {
-		return nil
+		return nil, st
 	}
 
 	// Section 6.2: the filter index of lower-case CloudEvents attributes,
@@ -189,8 +231,10 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 	}
 
 	out := make([]*kgo.Record, 0, 2*len(entries))
+	st.Index = time.Since(tIndex)
 	for _, entry := range entries {
 		sub := entry.Sub
+		tFilter := time.Now()
 
 		key := matchKey{entry.AttrFilter, entry.DataFilter}
 		res, evaluated := matchMemo[key]
@@ -246,6 +290,7 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 					Value: value,
 				})
 			}
+			st.Filter += time.Since(tFilter)
 			continue
 		}
 
@@ -254,6 +299,8 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 		// Non-JSON data with a projection is rejected by the
 		// registry API (section 5), this guard is defensive - and it
 		// stays inside the miss so each subscription still reports it.
+		st.Filter += time.Since(tFilter)
+		tMemo := time.Now()
 		projKey := strings.Join(sub.Projection, "\x00")
 		ev, haveProj := projMemo[projKey]
 		if !haveProj {
@@ -285,6 +332,8 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 			rawMemo[ev] = raw
 		}
 
+		st.Memo += time.Since(tMemo)
+		tEncode := time.Now()
 		msg := &delivery.Message{
 			DeliveryID:     delivery.NewID(eventRef, sub.ID),
 			EventRef:       eventRef,
@@ -343,8 +392,9 @@ func (r *Router) Process(rec *kgo.Record) []*kgo.Record {
 			Key:   []byte(msg.DeliveryID),
 			Value: svalue,
 		})
+		st.Encode += time.Since(tEncode)
 	}
-	return out
+	return out, st
 }
 
 // OrderingKey resolves the ordering key definition of the event type

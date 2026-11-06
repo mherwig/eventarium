@@ -327,8 +327,15 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router,
 
 		out := make([]*kgo.Record, 0, len(recs)*2)
 		procStart := time.Now()
+		// fan accumulates the per-record sub-stages of process so they are
+		// recorded once per batch, like process itself - recording them per
+		// record would add thousands of histogram observations to the path
+		// being measured.
+		var fan routing.Stages
 		for _, rec := range recs {
-			out = append(out, r.Process(rec)...)
+			rs, st := r.Process(rec)
+			out = append(out, rs...)
+			fan.Add(st)
 		}
 		procDur := time.Since(procStart)
 
@@ -475,6 +482,16 @@ func run(ctx context.Context, sess *kgo.GroupTransactSession, r *routing.Router,
 		rm.addRecords("out", len(out))
 		rm.observeStage("kafka_wait", kafkaWait)
 		rm.observeStage("process", procDur)
+		// process's own sub-stages, in the same batch units as process: they
+		// are what says which part of it to change, and a total alone does not.
+		// The five sum to process plus the unmeasured remainder (record
+		// decode of headers, logging, slice growth), so a gap between them
+		// and process is itself a measurement of that remainder.
+		rm.observeStage("process.parse", fan.Parse)
+		rm.observeStage("process.index", fan.Index)
+		rm.observeStage("process.filter", fan.Filter)
+		rm.observeStage("process.memo", fan.Memo)
+		rm.observeStage("process.encode", fan.Encode)
 		rm.observeStage("produce_sync", syncDur)
 		rm.observeStage("produce_end", endDur)
 		rm.observeStage("poll", pollDur)

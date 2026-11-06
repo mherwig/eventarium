@@ -116,7 +116,7 @@ func TestProcessRecordsTheRejectedCandidate(t *testing.T) {
 	rejecting.Filter = `attributes["region"] == "us"` // the event is "eu"
 
 	reg := loadRegistry(t, webhookSub("sub-match"), rejecting)
-	out := New(reg).Process(eventRecord(t, "ref-1"))
+	out, _ := New(reg).Process(eventRecord(t, "ref-1"))
 
 	deliveries, statuses := statusRecords(t, out)
 	if len(deliveries) != 1 || len(statuses) != 2 {
@@ -167,7 +167,7 @@ func TestProcessFilterErrorIsRecorded(t *testing.T) {
 	// evaluating to false.
 	broken.Filter = `attributes['region'] == 'us'`
 
-	out := New(loadRegistry(t, broken)).Process(eventRecord(t, "ref-2"))
+	out, _ := New(loadRegistry(t, broken)).Process(eventRecord(t, "ref-2"))
 	deliveries, statuses := statusRecords(t, out)
 	if len(deliveries) != 0 || len(statuses) != 1 {
 		t.Fatalf("got %d delivery and %d status records, want 0 and 1", len(deliveries), len(statuses))
@@ -185,7 +185,7 @@ func TestProcessFilterErrorIsRecorded(t *testing.T) {
 func TestProcessWithoutCandidateSubscriptionIsSilent(t *testing.T) {
 	rec := eventRecord(t, "ref-4")
 	rec.Value = []byte(`{"specversion":"1.0","id":"4","source":"/test","type":"nobody.listens","datacontenttype":"application/json","data":{}}`)
-	out := New(loadRegistry(t, webhookSub("sub-elsewhere"))).Process(rec)
+	out, _ := New(loadRegistry(t, webhookSub("sub-elsewhere"))).Process(rec)
 	if len(out) != 0 {
 		t.Fatalf("got %d records for an event type without subscriptions, want 0", len(out))
 	}
