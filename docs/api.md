@@ -45,9 +45,29 @@ curl -s -X POST localhost:8083/v1/subscriptions -H "Authorization: Bearer $T" \
        "delivery_mode":"key_ordered","rate_limit_per_s":100}'
 ```
 
-`filter` is CEL over `attributes` and `data`; `projection` is the allowlist of
-data fields the subscriber receives. The callback may be any HTTP endpoint; the
-simulated receiver of the harness listens on `:9090/hook`:
+`filter` is CEL over the event's **attributes** — the `attributes` map plus the
+`id`, `source`, `type` and `subject` variables, and nothing else; an expression
+referring to `data` fails to compile. Filtering on the payload is the other
+field, `data_filter`, which sees `data` and none of the attribute variables:
+
+```sh
+curl -s -X POST localhost:8083/v1/subscriptions -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{"event_type":"orders.created","channel":"webhook",
+       "callback_url":"http://localhost:9090/hook",
+       "filter":"attributes[\"region\"] == \"eu\"",
+       "data_filter":"int(data.total) > 100 && data.currency == \"EUR\""}'
+```
+
+They are independent and both optional: set either or both, and a
+subscription with neither matches every event of its type. `data_filter` needs
+the payload decoded, which the attribute path never does — a subscription with
+only `filter` never asks for the body to be parsed, so it is the cheaper of the
+two to evaluate.
+
+`projection` is the allowlist of data fields the subscriber receives. The
+callback may be any HTTP endpoint; the simulated receiver of the harness
+listens on `:9090/hook`:
 
 ```sh
 ./bin/harness recv -addr :9090 -out recv.jsonl &
@@ -69,6 +89,46 @@ curl -s -X POST localhost:8083/v1/subscriptions -H "Authorization: Bearer $T" \
   -H 'Content-Type: application/json' \
   -d '{"event_type":"orders.created","channel":"sse"}'
 ```
+
+### Every field
+
+The request above sets four of them. These are the rest, with the default the
+API stores — what a `GET` returns, and what you get by omitting the field.
+`event_type` and `channel` are the only required pair; everything else is
+optional.
+
+| field | default | what it does |
+| --- | --- | --- |
+| `event_type` | — | **required.** Must already exist; an unknown type is `422`, never auto-registered |
+| `channel` | — | **required.** `webhook` or `sse` |
+| `callback_url` | — | webhook only: where deliveries are POSTed |
+| `filter` | unset | CEL over the **attributes** — `attributes`, `id`, `source`, `type`, `subject` |
+| `data_filter` | unset | CEL over the **data** member — `data` only |
+| `projection` | `[]` | allowlist of data fields the subscriber receives |
+| `webhook_format` | `binary` | `binary` (attributes in `ce-*` headers) or `structured` (whole event in the body) |
+| `delivery_mode` | `unordered` | `unordered`, `key_ordered` or `ordered`; `ordered` pins `max_in_flight` to 1 |
+| `max_connections` | `3` | SSE: connections allowed for this subscription |
+| `max_in_flight` | `1` | webhook: deliveries in flight at once. Raise this for a busy subscription — at 1 they run one at a time |
+| `rate_limit_per_s` | `0` | `0` disables the limit; otherwise a steady-state ceiling |
+| `burst` | `0` | stored as 0; effective value is `max(rate_limit_per_s, 1)` |
+| `drain_rate_per_s` | `200` | rate while draining the inbox after an outage |
+| `request_timeout_ms` | `10000` | per-attempt HTTP timeout; a stored `0` falls back to 5 s |
+| `cb_failure_threshold` | `5` | consecutive failures before the circuit breaker opens |
+| `probe_interval_s` | `300` | how often a paused subscription is probed |
+| `backlog_max` | `100000` | parked rows before further ones are `dropped` |
+| `ack_timeout_ms` | `15000` | **accepted and stored, not consulted** |
+| `ack_window` | `100` | **accepted and stored, not consulted** |
+
+About those last two, stated plainly rather than buried: they are validated
+(bounded 1–15000 and 1–100) and round-trip through `GET`, but **no delivery
+code reads them.** SSE acknowledgement is cumulative over what is still in the
+log, bounded by a fixed per-connection window of 4,096 sent deliveries — the
+subscription's `ack_window` does not change that. They exist so the field the
+specification names is accepted rather than rejected; setting them has no
+effect today.
+
+`id` is assigned by the server, and `owner` comes from the bearer token rather
+than the body, so a request cannot subscribe as somebody else.
 
 ## Update a subscription
 
@@ -152,10 +212,58 @@ moment later as [`filtered`](reliability.md#the-eleven-statuses).
 The publish API caches the registry, and so do the router, dispatcher and SSE
 gateway. Creating an event type or subscription fires a trigger (migration
 003) on `event_types`/`subscriptions`, every service `LISTEN`s for it and
-reloads as soon as the writing transaction commits — so once the
-registry-api call has returned, the type or subscription is usable; no
-settling time. `REGISTRY_POLL` (2 s for publish-api) is only the safety net
-for notifications missed while a listener was down.
+reloads as soon as the writing transaction commits — so a new type or
+subscription becomes usable almost immediately, with no fixed delay to wait
+out. There is a *brief* window rather than none: publishing to a type created
+moments earlier was measured taking one 200 ms retry to be accepted. Code that
+publishes straight after registering should tolerate one `422 unknown event
+type` and retry; a human typing commands will not notice it. `REGISTRY_POLL`
+(2 s for publish-api) is the backstop for a notification missed while a
+listener was down, and so the worst case when one is.
+
+### Publishing several events in one request
+
+The same endpoint takes a batch when the media type says so: a JSON **array**
+of CloudEvents, each with its own attributes in the body.
+
+```sh
+curl -s -X POST localhost:8080/v1/events -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/cloudevents-batch+json' \
+  -d '[{"specversion":"1.0","id":"42","source":"/orders","type":"orders.created",
+        "data":{"order_id":"o-1","total":99.9}},
+       {"specversion":"1.0","id":"43","source":"/orders","type":"orders.created",
+        "data":{"order_id":"o-2","total":149.9}}]'
+```
+
+The response is a `201` carrying **one result per event, in request order** —
+not the single object the non-batch path returns:
+
+```json
+[{"event_ref":"94453d07-...","event_type":"orders.created","retention_class":"short",
+  "expires_at":"2026-10-29T22:23:35Z"},
+ {"event_ref":"b71c9e02-...","event_type":"orders.created","retention_class":"short",
+  "expires_at":"2026-10-29T22:23:35Z"}]
+```
+
+Four things that decide how you write a client for it:
+
+- **All or nothing, twice over.** Every element is validated *before* anything
+  is produced, so one unknown event type or malformed member rejects the
+  **whole request** (`400`/`422`, nothing written). Then two or more events are
+  produced inside **one Kafka transaction**, so the batch lands completely or
+  not at all — no partial batch for a retry to duplicate. A request carrying a
+  single event skips the transaction, because it cannot be partial.
+- **The media type picks the parse.** `application/cloudevents-batch+json`
+  means an array of structured events; there are no `ce-*` headers in this
+  mode. Sending an array with the wrong media type is a `400`.
+- **One request, one correlation header.** `PROPAGATE_HEADERS` reads the HTTP
+  headers once, so a single propagated value reaches every event in the array.
+- **Schema violations are per element.** In `SCHEMA_VALIDATION=warn`, each
+  result carries its own `schema_violations` rather than one field for the
+  batch, because each event has its own data.
+
+The harness publishes this way, which is why `harness pub` reports one
+`sent=` count for hundreds of events.
 
 ### Carrying a correlation header
 
@@ -304,6 +412,60 @@ X-Pubsub-Signature: sha256=...       # only with WEBHOOK_SIGNING_SECRET
 
 {"order_id":"o-1","total":99.9}      # projection applied: "internal" is gone
 ```
+
+### Structured mode instead of binary
+
+`webhook_format` on the subscription chooses the body shape. `"binary"` is the
+default and is what the request above shows — attributes in `ce-*` headers, data
+alone in the body. `"structured"` puts the whole CloudEvent in the body and
+moves the attributes into it, leaving no `ce-*` headers:
+
+```sh
+curl -s -X POST localhost:8083/v1/subscriptions -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{"event_type":"orders.created","channel":"webhook",
+       "callback_url":"http://localhost:9090/hook","webhook_format":"structured"}'
+```
+
+```text
+POST /hook
+Content-Type: application/cloudevents+json
+pubsub-delivery-id: <event-ref>/<subscription-id>
+
+{"specversion":"1.0","id":"42","source":"/orders","type":"orders.created",
+ "region":"eu","data":{"order_id":"o-1","total":99.9}}
+```
+
+Any value other than `binary` or `structured` is a `422`. The `pubsub-*`
+delivery metadata stays in headers in both modes — only the event itself moves.
+Structured mode also costs the dispatcher less: it forwards the bytes the router
+already stored rather than decoding the event to rebuild the headers.
+
+### Verifying the signature
+
+With `WEBHOOK_SIGNING_SECRET` set, every attempt carries
+`X-Pubsub-Signature: sha256=<hex>` — an **HMAC-SHA256 over the raw body bytes
+only**. Not the headers, not a timestamp, not the `pubsub-*` metadata: exactly
+the bytes of the request body.
+
+```python
+import hmac, hashlib
+
+def valid(secret: bytes, body: bytes, header: str) -> bool:
+    want = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(want, header)
+```
+
+- `compare_digest`, never `==`: a string comparison leaks timing.
+- **Verify what you received.** The body must be passed through unchanged;
+  re-serialising it before checking changes the bytes and fails every time.
+- **There is no timestamp or nonce in the signature.** A captured body replays
+  validly forever, so a signature authenticates the source but does not stop
+  replay. If an endpoint needs that, deduplicate on `pubsub-delivery-id` (or
+  `pubsub-seq`, its position on the deliveries topic) — both are stable for one
+  delivery across retries.
+- Without `WEBHOOK_SIGNING_SECRET` no header is sent at all, and the body is
+  unauthenticated.
 
 ## Receive on SSE
 
