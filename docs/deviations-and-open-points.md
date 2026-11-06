@@ -298,6 +298,56 @@ From §16, minus what Eventarium answered:
   without risking duplicates.
 - **AuthN/Z end state** — JWT claim names, IdP setup, owner-based routing
   restrictions (§6.7). HS256 stands in.
+- **Webhook signature end state** — `WEBHOOK_SIGNING_SECRET` is one key the
+  dispatcher reads once, so every receiver of a deployment holds a
+  *signing-capable* secret: a single leaked endpoint can forge a delivery that
+  all the others will accept, and the signature therefore says "someone the
+  operator trusts" rather than "the platform, talking to you". Three further
+  gaps, all documented as-is in [the API guide](api.md#verifying-the-signature):
+  it covers the body only, so no `pubsub-*` header is authenticated and
+  deduplicating on `pubsub-delivery-id` rests on TLS rather than on the
+  signature; there is no timestamp or nonce, so a captured body replays
+  forever; and it is not encryption — the body is cleartext and HTTPS does
+  that part.
+
+  Two designs were considered and parked rather than adopted.
+
+  **Asymmetric (Ed25519).** The dispatcher holds a private key that never
+  enters the database — the subscription row carries `signing_key_id` and the
+  public key, returned by `POST`/`GET /v1/subscriptions`, so no receiver holds
+  anything forgeable: a leaked public key does nothing and the signing key
+  exists in exactly one place. Recipient binding comes free from signing
+  `pubsub-delivery-id`, which carries the subscription id, so a delivery
+  captured for one subscription fails verification at another. What it does
+  *not* give is freshness — asymmetry proves origin, not when — so a timestamp
+  must sit inside the signed material with a receiver-side window. It forces
+  three further decisions: sign a **defined subset** of headers (proxies
+  rewrite `Host` and add `X-Forwarded-For`, and signing hop-by-hop headers
+  fails behind any load balancer), carry a `key-id` so rotation is a grace
+  period instead of an outage window, and leave `pubsub-attempt` out of it —
+  it changes every retry, which would force a re-sign per attempt. Cost: ~40 µs
+  per attempt from `crypto/ed25519`, stdlib and dependency-free, which is ~29%
+  of a core at the measured peak of 1,500 ev/s × 4.86 deliveries on a host
+  already contended. To be benchmarked, not assumed free.
+
+  **Subscriber-issued OIDC token.** The dispatcher fetches a token from a
+  per-subscription `token_url` and sends `Authorization: Bearer`, so the
+  receiver holds *nothing* and validates with ordinary middleware, freshness
+  comes from `exp`, and revocation happens at their IdP. Two costs argue
+  against it as the primary mechanism: delivery would depend on **the
+  subscriber's IdP being up**, so the breaker would trip on their identity
+  infrastructure rather than their receiver and move the availability boundary
+  into every customer; and a token the platform did not issue **cannot carry a
+  commitment to the body**, because their IdP never sees the request — so
+  integrity is structurally unavailable and rests on TLS alone. It also does
+  not remove per-tenant secrets: client credentials still need storing, now on
+  the platform side.
+
+  Underneath both: **integrity and origin are different properties.** Today's
+  scheme has integrity without freshness; OIDC has origin and freshness without
+  integrity; asymmetric has integrity and tenant isolation and needs freshness
+  added. Which pair is required is a property of where these webhooks land, not
+  of which primitive is nicer — and that has not been decided.
 - **Per-target-host/tenant rate limits** — explicitly out of scope for v1
   (needs a shared counter), per §6.
 

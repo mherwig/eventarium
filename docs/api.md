@@ -461,9 +461,20 @@ def valid(secret: bytes, body: bytes, header: str) -> bool:
   re-serialising it before checking changes the bytes and fails every time.
 - **There is no timestamp or nonce in the signature.** A captured body replays
   validly forever, so a signature authenticates the source but does not stop
-  replay. If an endpoint needs that, deduplicate on `pubsub-delivery-id` (or
-  `pubsub-seq`, its position on the deliveries topic) — both are stable for one
-  delivery across retries.
+  replay.
+- **Only the body is signed.** None of the `pubsub-*` headers are covered, so
+  deduplicating on `pubsub-delivery-id` defends against an honest replay but
+  not against an on-path attacker who edits the header and leaves the body —
+  and therefore the signature — untouched. Over HTTPS the transport is the
+  integrity guarantee for the headers; over plaintext it is not, and this
+  recommendation assumes TLS.
+- **One key covers every subscription.** `WEBHOOK_SIGNING_SECRET` is read once
+  by the dispatcher and signs deliveries to *all* of them, so a receiver
+  holding it can forge a delivery that any other receiver of this deployment
+  will accept. The signature says "someone the operator trusts" — not "the
+  platform, talking to you". That is fine while every receiver is yours; it is
+  not a boundary between mutually untrusted tenants. See the open point on
+  [webhook signature end state](deviations-and-open-points.md#open-points--still-open).
 - Without `WEBHOOK_SIGNING_SECRET` no header is sent at all, and the body is
   unauthenticated.
 
