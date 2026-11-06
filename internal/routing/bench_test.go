@@ -188,3 +188,21 @@ func BenchmarkAttributes(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkDeliveryEncodeEnvelope is DeliveryEncode without the event member.
+// The difference between the two is what the RawMessage path costs - the
+// compact-and-HTML-escape pass over a ~1 KiB payload - and that difference
+// decides whether a hand-written Encode() is worth its escaping code: if the
+// envelope's 17 fields and three time.Time are the bulk, replacing the
+// marshaller cannot help much, and if the payload pass dominates, only
+// skipping or cheapening that pass could.
+func BenchmarkDeliveryEncodeEnvelope(b *testing.B) {
+	msg := benchMessage(nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := msg.Encode(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
