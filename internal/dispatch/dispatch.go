@@ -81,6 +81,31 @@ const (
 	// ON CONFLICT DO NOTHING, so whatever landed is skipped when the batch
 	// retries, and nothing is counted durable until it returns success.
 	parkBatchTimeout = 5 * time.Second
+	// deliveryMaxIdleConnsPerHost is the keep-alive pool the delivery client
+	// keeps per destination. http.DefaultTransport's is 2 - a Go constant,
+	// DefaultMaxIdleConnsPerHost - and it is what the client had by having no
+	// Transport field at all.
+	//
+	// It is too small because the pool is per host, not per subscription:
+	// defaultMaxInFlight (8) workers per subscription share one client, and
+	// subscriptions aimed at one endpoint share a host. In the load test that
+	// is ~136 concurrent requests against 2 reusable connections, so
+	// everything past the pair dials fresh - a benchmarked 21,262 ns/op
+	// against 7,493 ns/op for a pool with room, on loopback where a re-dial
+	// is at its cheapest. Against a real endpoint that handshake is a milli-
+	// seconds-scale cost paid per delivery instead of amortised.
+	//
+	// 512 covers 8 workers across 64 subscriptions on one destination. Being
+	// generous costs idle sockets and descriptors, which IdleConnTimeout
+	// reclaims 90 s after use; being tight costs a handshake every time the
+	// pool drains.
+	deliveryMaxIdleConnsPerHost = 512
+	// deliveryMaxIdleConns bounds the same pool across all destinations, so
+	// many endpoints cannot each take the per-host number. 512 against 512
+	// per host allows one busy destination to use the whole budget, which is
+	// the right trade when the alternative is throttling the busiest customer
+	// to protect a total nobody has hit yet.
+	deliveryMaxIdleConns = 512
 
 	// revokeDrain bounds how long a revoke waits for the deliveries this member
 	// is still holding for the partitions it is giving up. Waiting is what
@@ -115,6 +140,24 @@ const (
 	// took.
 	revokeDrainTick = 25 * time.Millisecond
 )
+
+// deliveryTransport returns the transport the delivery client sends with:
+// http.DefaultTransport with only the idle-pool sizes overridden.
+//
+// Clone rather than a hand-written literal, so HTTP/2, keep-alives, the
+// 90-second idle timeout and the proxy settings all keep their defaults and
+// the only thing this changes is how many connections are held open.
+//
+// It is a function rather than a package-level variable because
+// http.DefaultTransport is a process-wide singleton: sharing one mutated
+// transport across tests would let a sub-benchmark's pool size leak into the
+// next, which is exactly the confusion httpbench_test.go exists to avoid.
+func deliveryTransport() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = deliveryMaxIdleConns
+	tr.MaxIdleConnsPerHost = deliveryMaxIdleConnsPerHost
+	return tr
+}
 
 // accept is the decision of the submit path.
 type accept int
@@ -219,7 +262,12 @@ func New(cfg Config) (*Dispatcher, error) {
 		// No global timeout: every attempt gets its own context timeout
 		// (request_timeout_ms). Redirects are never followed (spec 6.4
 		// security list); a 3xx counts as an ordinary failure.
+		//
+		// Transport is set explicitly for the pool sizes above: leaving it nil
+		// silently selects http.DefaultTransport and its two idle connections
+		// per host.
 		httpc: &http.Client{
+			Transport:     deliveryTransport(),
 			Timeout:       0,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 		},
