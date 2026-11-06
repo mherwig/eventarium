@@ -22,6 +22,13 @@ const config: Config = {
   projectName: 'eventarium',
 
   onBrokenLinks: 'throw',
+  // Anchors too, not just pages. The two were configured asymmetrically, so a
+  // `#section` fragment could rot silently - which it is good at, because
+  // slugging an em dash ("Open points — still open") is not something to
+  // guess, and onBrokenMarkdownLinks does not cover in-page targets. The docs
+  // link across files to anchors often enough that the build should check
+  // them.
+  onBrokenAnchors: 'throw',
 
   markdown: {
     hooks: {
